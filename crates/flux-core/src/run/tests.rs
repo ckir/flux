@@ -9810,6 +9810,48 @@ fn a_temporary_that_is_not_the_anchor_is_removed_and_the_member_degrades() {
     assert_ne!(strong(&fs, "/p/dest/a2"), other);
 }
 
+// Mutant: `settle_link` degrades an unavailable anchor under `preserve` too (`&& why != AnchorUnavailable`).
+#[test]
+fn an_unavailable_anchor_fails_the_member_under_preserve() {
+    // 0: the anchor replaced before the first check; 1: the anchor gone before the first check; 2: the temporary is
+    // not the anchor (the anchor's name takes another identity right before the link call).
+    for case in 0..3 {
+        let fs = group_fake(&["a2"]);
+        match case {
+            0 | 1 => fs.on_nth("claim_insert", 1, move |fs| {
+                let _ = fs.remove_file(Path::new("/p/dest/a"));
+                if case == 0 {
+                    fs.write_file("/p/dest/a", b"a stranger");
+                }
+            }),
+            _ => {
+                let n = pair_nth("create_hardlink", "/p/dest/a2.flux-partial");
+                let other = ObjectId { volume: 9, index: 4242 };
+                fs.on_nth("create_hardlink", n, move |fs| {
+                    fs.set_identity("/p/dest/a", FileIdentity::Strong(other));
+                });
+            }
+        }
+        let (r, got) = run_hardlinks(&fs, flux_fs::Hardlinks::Preserve);
+        let out = ok(&r);
+        assert_eq!(got.len(), 1, "case {case}: {got:?}");
+        assert_eq!(got[0].path, PathBuf::from("a2"), "case {case}");
+        assert_eq!(code_of(&got[0]), Code::HardlinkUnavailable, "case {case}");
+        assert!(!fs.exists("/p/dest/a2"), "case {case}: the member is not created");
+        assert!(
+            !fs.exists(format!("/p/dest/a2.flux-partial.{ID}")),
+            "case {case}: no temporary is left"
+        );
+        assert_eq!(out.files_hardlinked, 0, "case {case}");
+        assert_eq!(out.hardlinks_degraded, 0, "case {case}");
+        assert!(out.hardlinks_unlinked.is_empty(), "case {case}: {:?}", out.hardlinks_unlinked);
+        assert!(
+            !calls(&fs).iter().any(|c| c.starts_with("rename_") && c.contains("/p/dest/a2")),
+            "case {case}: a2 is never published"
+        );
+    }
+}
+
 // Mutant: drop `&& !candidate` from `batching`.
 #[test]
 fn strict_durability_links_without_batching() {
@@ -9916,6 +9958,60 @@ fn a_skipped_first_member_leaves_the_next_as_anchor() {
     assert_eq!(fs.read_file("/p/dest/a").as_deref(), Some(&b"its own object"[..]));
     assert_eq!(strong(&fs, "/p/dest/a2"), strong(&fs, "/p/dest/a3"));
     assert_ne!(identity_of(&fs, "/p/dest/a"), identity_of(&fs, "/p/dest/a2"));
+}
+
+// Mutant: the skip site routes only `--skip-existing` into `skipped_member` (not `--update`).
+#[test]
+fn an_up_to_date_member_under_update_is_a_policy_split() {
+    let fs = dest_fake();
+    // The same length as the source's `A`; the source's time is unavailable, so the lengths alone decide.
+    put(&fs, "/p/dest/a", b"Z", 1_000);
+    link_names(&fs, "/src", "a", &["a2"]);
+    let (r, got) = run_tree_with(&fs, &cfg(), &with_policy(ExistingPolicy::Update));
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(out.files_skipped, 1);
+    assert_eq!(fs.read_file("/p/dest/a").as_deref(), Some(&b"Z"[..]), "a is untouched");
+    assert_eq!(fs.read_file("/p/dest/a2").as_deref(), Some(&b"A"[..]), "a2 is the new canonical");
+    assert_eq!((out.hardlinks_degraded, out.files_hardlinked), (1, 0));
+    assert_eq!(
+        out.hardlinks_unlinked[&UnlinkedWhy::PolicySplit],
+        DegradedGroup { count: 1, example: "a".into() }
+    );
+    assert_ne!(identity_of(&fs, "/p/dest/a"), identity_of(&fs, "/p/dest/a2"));
+}
+
+// Mutant: drop the `Err(e)` arm's report in `register_outcome` (`let _ = e;`).
+#[test]
+fn a_failed_anchor_insert_is_reported_under_preserve_and_counted_under_auto() {
+    for mode in [flux_fs::Hardlinks::Auto, flux_fs::Hardlinks::Preserve] {
+        let fs = group_fake(&["a2"]);
+        fs.fail_always("hardlink_index_insert", Code::IoError);
+        let (r, got) = run_hardlinks(&fs, mode);
+        let out = ok(&r);
+        // The canonical stays published and counted either way.
+        assert_eq!(fs.read_file("/p/dest/a").as_deref(), Some(&b"A"[..]), "{mode:?}");
+        // After the failed registration `a2` finds no entry and forms a group of its own: an independent copy.
+        assert_eq!(fs.read_file("/p/dest/a2").as_deref(), Some(&b"A"[..]), "{mode:?}");
+        assert_ne!(identity_of(&fs, "/p/dest/a"), identity_of(&fs, "/p/dest/a2"), "{mode:?}");
+        assert_eq!(out.files_hardlinked, 0, "{mode:?}");
+        assert!(out.files_copied >= 2, "{mode:?}: a and a2 are copied");
+        let for_a: Vec<_> = got.iter().filter(|f| f.path == Path::new("a")).collect();
+        if mode == flux_fs::Hardlinks::Preserve {
+            assert_eq!(for_a.len(), 1, "{got:?}");
+            assert_eq!(code_of(for_a[0]), Code::IoError);
+            assert!(
+                matches!(&for_a[0].cause, TreeFailureCause::Copy(e) if e.step == CopyStep::Claim)
+            );
+        } else {
+            assert!(for_a.is_empty(), "{got:?}");
+            assert!(out.hardlinks_unlinked[&UnlinkedWhy::IndexFailure].count >= 1);
+            assert_eq!(
+                out.hardlinks_unlinked[&UnlinkedWhy::IndexFailure].example,
+                PathBuf::from("a")
+            );
+        }
+    }
 }
 
 /// DEST with `a` and `a2` already one object (through the fake's `create_hardlink`) and the source group `a a2 ..`.
