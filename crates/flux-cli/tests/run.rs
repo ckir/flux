@@ -632,8 +632,17 @@ fn a_killed_large_file_without_its_log_is_recopied_whole_under_chunks_flagged_or
     a_killed_large_file_resumes_with(&["--resume-verify", "chunks"], true);
 }
 
+/// Cut 15: a resumed file under `--verify=destination` reuses its prefix and the verify counts it.
+#[test]
+fn a_killed_large_file_resumes_and_verifies() {
+    let v = a_killed_large_file_resumes_with(&["--verify=destination"], false);
+    assert_eq!(v["files_verified"], 1, "{v}");
+    assert_eq!(v["files_mismatched"], 0, "{v}");
+    assert_eq!(v["verify_level"], "destination", "{v}");
+}
+
 /// The body of the tests above: `extra` is added to the resume's arguments; `log_deleted` removes the WAL segment first.
-fn a_killed_large_file_resumes_with(extra: &[&str], log_deleted: bool) {
+fn a_killed_large_file_resumes_with(extra: &[&str], log_deleted: bool) -> serde_json::Value {
     use std::io::{Read, Write};
     const MIB: usize = 1024 * 1024;
     const LEN: usize = 70 * MIB;
@@ -716,6 +725,7 @@ fn a_killed_large_file_resumes_with(extra: &[&str], log_deleted: bool) {
     assert!(!dst.join(".flux").join("operations").join(&id).exists(), "the workspace is gone");
     assert!(!dst.join(".flux").exists(), "and the control directory");
     assert!(names(&dst).iter().all(|n| !n.contains(".flux-partial.")), "no partial remains");
+    v
 }
 
 /// Cut 9f-2, property 7.10: the model test above under `--resume-verify full`, with the checkpoint log deleted. A

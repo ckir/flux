@@ -1202,7 +1202,7 @@ item was, not only in a commit message.
 
 - [ ] **Flip the default `--verify` level to `source-stream`** (the spec's default; cut 13 shipped `none`, call C1). Do
       it after a benchmark shows the cost of hashing the source stream. Measuring needs the owner's OK first.
-- [ ] **`--resume` with `--verify`** (cut 15). Today the combination is refused. The whole-file digest of a resumed file
+- [x] **`--resume` with `--verify`** (cut 15), shipped on branch `feat/resume-verify`. The whole-file digest of a resumed file
       needs the prefix hashed from the source; BLAKE3 digests of 1 MiB chunks do not compose into it.
 - [ ] **The page-cache boundary of the `destination` re-read.** The re-read may be served by the operating system's
       cache, so a pass proves the destination returned the bytes that were written, not that they reached stable

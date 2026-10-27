@@ -624,6 +624,10 @@ pub(crate) enum Stage<W> {
 /// partial: `PartialMissing` iff it began the file, nothing otherwise (an unreadable log with no partial reports
 /// nothing). A partial that is not a regular file is `Unreadable` under both levels.
 /// Under `Hook::LogFree` it runs as `full` and, with no partial, reports nothing.
+///
+/// `prefix` is the caller's digest of the source bytes (cut 15). On `Start::Resume { offset }` the decider has fed it
+/// exactly source bytes `[0, offset)`; on `Start::Fresh` nothing; the failing chunk is never fed (it comes back as
+/// `carry`, which the caller feeds once), so the digest covers the whole file. `None` hashes nothing.
 fn plan_resume<D: DirHandle + Send + 'static, R: std::io::Read>(
     hook: Hook<'_, '_, D>,
     parent: &D,
@@ -631,6 +635,7 @@ fn plan_resume<D: DirHandle + Send + 'static, R: std::io::Read>(
     src_meta: &Metadata,
     reader: &mut R,
     beat: &Heartbeat<'_>,
+    prefix: Option<&mut flux_hash::Hasher>,
 ) -> std::result::Result<(Verdict, Option<FileIdentity>), CopyError> {
     let fresh =
         |discard| Verdict { start: Start::Fresh, carry: Vec::new(), discard, proven: Vec::new() };
@@ -688,9 +693,9 @@ fn plan_resume<D: DirHandle + Send + 'static, R: std::io::Read>(
     // `state` is `Some` exactly under `chunks`.
     let decided = match (state, partial_len, partial_reader.as_mut()) {
         (Some(state), partial_len, partial) => {
-            decide(&state, &gate, partial_len, reader, partial, &watched)
+            decide(&state, &gate, partial_len, reader, partial, &watched, prefix)
         }
-        (None, Some(len), Some(p)) => decide_full(src_meta.len, len, reader, p, &watched),
+        (None, Some(len), Some(p)) => decide_full(src_meta.len, len, reader, p, &watched, prefix),
         // `full` with no partial: the log is consulted only to choose the report (a log that began the file says
         // the partial went missing; no log at all is a plain fresh copy).
         (None, _, _) => {
@@ -848,27 +853,19 @@ pub(crate) fn stage_file<F: DestinationRoot>(
     // Cut 9f-1: a checkpointing run decides what to do with an existing partial, after the claim (a refused claim
     // reads nothing). Only a file large enough to be checkpointed can resume; every other verdict is a fresh copy.
     let ckpt_file = ckpt.filter(|c| src_meta.len >= c.min_len());
+    // Cut 13: the digest of the source bytes as they are read (C8). `None` does no hashing at all. Cut 15: created
+    // before the verdict, so the decider feeds it the resumed prefix.
+    let mut hasher = (opts.verify != VerifyLevel::None).then(flux_hash::Hasher::new);
     let (verdict, partial_identity) = match ckpt_file {
-        Some(hook) => plan_resume(hook, parent, &temp, &src_meta, &mut reader, beat)?,
+        Some(hook) => {
+            plan_resume(hook, parent, &temp, &src_meta, &mut reader, beat, hasher.as_mut())?
+        }
         None => (
             Verdict { start: Start::Fresh, carry: Vec::new(), discard: None, proven: Vec::new() },
             None,
         ),
     };
     let Verdict { start, carry, discard: why, proven } = verdict;
-    // Cut 13 (C9): a resumed file's prefix was never hashed by this run, so a digest of it would prove nothing. Refused
-    // before `open_existing`, so the partial is left exactly as the crashed run left it.
-    if opts.verify != VerifyLevel::None && matches!(start, Start::Resume { .. }) {
-        return Err(CopyError::at(
-            CopyStep::Verify,
-            FsError::new(
-                Code::CopyFailed,
-                std::io::Error::other("verification of a resumed file is not supported"),
-            ),
-        ));
-    }
-    // Cut 13: the digest of the source bytes as they are read (C8). `None` does no hashing at all.
-    let mut hasher = (opts.verify != VerifyLevel::None).then(flux_hash::Hasher::new);
     let (mut writer, reused) = match (start, partial_identity) {
         (Start::Resume { offset }, Some(identity)) => {
             // A destination mutation, so its own section 99 check. The partial is reopened for writing by the identity
@@ -5422,37 +5419,130 @@ mod tests {
         assert!(!fs.exists(TEMP) && !fs.exists("/dst"));
     }
 
-    #[test]
-    fn verifying_a_resumed_partial_is_refused_before_it_is_touched() {
-        let (fs, root, src) = resume_fixture(5 * MIB, 3);
-        fs.write_file(PARTIAL, &src[..3 * MIB]);
-        let run = run_gen(&fs, 2, Durability::Normal);
-        let fc = FileCkpt { run: &run, file_id: b"f".to_vec(), destination: b"dst".to_vec() };
-        let mark = fs.calls().len();
-        let e = stage_file(
-            &fs,
+    /// As `stage_full`, with the caller's options (cut 15: the verify level under test).
+    fn stage_logged_with(
+        fs: &FaultFs,
+        root: &Dir,
+        run: &Checkpoints<FakeDirHandle>,
+        o: &CopyOptions,
+    ) -> StageResult {
+        let fc = FileCkpt { run, file_id: b"f".to_vec(), destination: b"dst".to_vec() };
+        stage_file(
+            fs,
             Path::new("/src"),
-            &root,
+            root,
             OsStr::new("dst"),
-            &level(Destination),
+            o,
             &unguarded,
             &no_heartbeat,
             &no_before_create,
             SyncAt::Staging,
             Some(Hook::Logged(&fc)),
         )
-        .err()
-        .expect("a verified resume is refused");
-        assert_eq!((e.step, e.code()), (CopyStep::Verify, Code::CopyFailed));
-        assert_eq!(fs.read_file(PARTIAL).unwrap(), src[..3 * MIB]);
-        let after = fs.calls()[mark..].to_vec();
-        assert!(
-            after.iter().all(|c| !c.starts_with("truncate_to(")
-                && !c.starts_with("remove_file(")
-                && !c.starts_with("create_new(")),
-            "the partial is not touched: {after:?}"
-        );
+    }
+
+    /// One of the three hooks: 0 is logged under `chunks`, 1 is logged under `full`, 2 is log-free. The run, when
+    /// there is one, is abandoned before the result is returned.
+    fn stage_hook(fs: &FaultFs, root: &Dir, arm: usize, o: &CopyOptions) -> StageResult {
+        if arm == 2 {
+            return stage_log_free_with(fs, root, o, &no_heartbeat);
+        }
+        let verify = if arm == 0 {
+            crate::checkpoint::ResumeVerify::Chunks
+        } else {
+            crate::checkpoint::ResumeVerify::Full
+        };
+        let run = run_gen_as(fs, 2, Durability::Normal, verify);
+        let r = stage_logged_with(fs, root, &run, o);
         run.abandon();
+        r
+    }
+
+    #[test]
+    fn resume_verify_passes_for_every_hook_and_level() {
+        for arm in 0..3 {
+            for v in [Destination, Full] {
+                let (fs, root, src) = resume_fixture(5 * MIB, 3);
+                fs.write_file(PARTIAL, &src[..3 * MIB]);
+                let staged = staged_of(stage_hook(&fs, &root, arm, &level(v)));
+                assert_eq!(staged.reused, 3 * MIB as u64, "arm {arm} {v:?}");
+                assert!(staged.verified, "arm {arm} {v:?}");
+                assert_eq!(fs.read_file(PARTIAL).unwrap(), src, "arm {arm} {v:?}");
+            }
+        }
+        let (fs, root, src) = resume_fixture(5 * MIB, 3);
+        fs.write_file(PARTIAL, &src[..3 * MIB]);
+        let staged = staged_of(stage_hook(&fs, &root, 0, &level(SourceStream)));
+        assert_eq!(staged.reused, 3 * MIB as u64);
+        assert!(!staged.verified);
+    }
+
+    #[test]
+    fn resume_verify_passes_with_a_partial_longer_than_its_log() {
+        let (fs, root, src) = resume_fixture(5 * MIB, 3);
+        fs.write_file(PARTIAL, &src[..4 * MIB]);
+        let staged = staged_of(stage_hook(&fs, &root, 0, &level(Destination)));
+        assert_eq!(staged.reused, 3 * MIB as u64);
+        assert_eq!(staged.bytes_copied, 2 * MIB as u64);
+        assert!(staged.verified);
+        assert_eq!(fs.read_file(PARTIAL).unwrap(), src);
+    }
+
+    #[test]
+    fn a_complete_partial_is_resumed_and_verified() {
+        for arm in [1, 2] {
+            let (fs, root, src) = resume_fixture(5 * MIB, 3);
+            fs.write_file(PARTIAL, &src);
+            let staged = staged_of(stage_hook(&fs, &root, arm, &level(Destination)));
+            assert_eq!(staged.reused, 5 * MIB as u64, "arm {arm}");
+            assert_eq!(staged.bytes_copied, 0, "arm {arm}");
+            assert!(staged.verified, "arm {arm}");
+        }
+    }
+
+    #[test]
+    fn a_resumed_file_with_a_corrupted_prefix_fails_verification() {
+        // The reference run, on an identical fixture, locates the temporary's re-read among the `open_read` calls.
+        let (fs_ref, root_ref, src_ref) = resume_fixture(5 * MIB, 3);
+        fs_ref.write_file(PARTIAL, &src_ref[..3 * MIB]);
+        let staged = staged_of(stage_hook(&fs_ref, &root_ref, 0, &level(Destination)));
+        assert!(staged.verified, "the control arm");
+        let calls = fs_ref.calls();
+        let mark = calls.iter().position(|c| c == &format!("open_read({PARTIAL})")).unwrap();
+        let n = ordinal(&calls, "open_read(", &format!("open_read({PARTIAL})"), mark + 1);
+
+        let (fs, root, src) = resume_fixture(5 * MIB, 3);
+        fs.write_file(PARTIAL, &src[..3 * MIB]);
+        fs.on_nth("open_read", n, |fs| {
+            let mut b = fs.read_file(TEMP).unwrap();
+            b[10] ^= 1;
+            fs.write_file(TEMP, &b);
+        });
+        let e = stage_hook(&fs, &root, 0, &level(Destination))
+            .err()
+            .expect("the flipped prefix is caught");
+        assert_eq!(e.code(), Code::VerifyMismatch);
+        assert!(!fs.exists(PARTIAL) && !fs.exists("/dst"));
+    }
+
+    #[test]
+    fn a_mismatch_inside_the_prefix_feeds_the_carry_once() {
+        for flip in [10, MIB + 10] {
+            for arm in [0, 1, 2] {
+                let (fs, root, src) = resume_fixture(5 * MIB, 3);
+                let mut partial = src[..3 * MIB].to_vec();
+                partial[flip] ^= 1;
+                fs.write_file(PARTIAL, &partial);
+                let staged = staged_of(stage_hook(&fs, &root, arm, &level(Destination)));
+                assert!(staged.verified, "flip {flip} arm {arm}");
+                assert_eq!(fs.read_file(PARTIAL).unwrap(), src, "flip {flip} arm {arm}");
+                assert!(
+                    matches!(staged.discard, Some(Discard::MismatchAt(_))),
+                    "flip {flip} arm {arm}: {:?}",
+                    staged.discard
+                );
+            }
+        }
     }
 
     #[test]

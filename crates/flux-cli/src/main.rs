@@ -174,7 +174,7 @@ struct CopyArgs {
     /// that returns different bytes than were written; the re-read may be served by the operating system's cache and does
     /// not prove the data reached stable storage (--durability still governs syncing). `full` is `destination` plus a
     /// second read of the source, which also detects source bytes that changed or were misread during the copy. A
-    /// mismatch is reported as VERIFY_MISMATCH and counts as a failed file. Cannot be combined with --resume.
+    /// mismatch is reported as VERIFY_MISMATCH and counts as a failed file. With --resume the check covers the files this run copies or resumes; files a prior run completed are skipped, not verified by --verify.
     #[arg(long, value_enum, num_args = 0..=1, require_equals = true, default_missing_value = "destination")]
     verify: Option<VerifyArg>,
     /// The hash used by --verify.
@@ -397,12 +397,6 @@ fn copy(args: &CopyArgs) -> u8 {
     if args.resume_verify == Some(ResumeVerifyArg::Metadata) {
         err(
             "error: --resume-verify=metadata is not implemented in this version; use chunks (the default) or full",
-        );
-        return exit_code::USAGE;
-    }
-    if args.resume && args.verify.is_some_and(|v| v.level() != flux_fs::VerifyLevel::None) {
-        err(
-            "error: --resume cannot be combined with --verify in this version; verify a resumed copy afterwards, or use --restart",
         );
         return exit_code::USAGE;
     }
