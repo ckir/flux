@@ -18,7 +18,7 @@ a fresh copy.
 Goals
 - `flux copy --resume --verify[=source-stream|destination|full]` is accepted; for every file this run copies or resumes
   the guarantee per level is the same as for a fresh copy. Files a prior run completed and this run skips are NOT
-  covered (R1): the README and `--help` say so in one sentence, and a CLI test pins it (tests 9b, 9c).
+  covered (R1): the README and `--help` say so in one sentence, and tests 9b (CLI) and 9c (engine tree) pin it.
 - A resumed file's digest covers bytes `[0, offset)` of the source (the validated prefix) plus the carry plus the tail.
 - No extra source read for the prefix: the resume decision already reads those source bytes.
 - Zero cost when `--verify` is `none` (the prefix hasher is `None`).
@@ -87,7 +87,7 @@ fed later by `stage_file`, `copy.rs:932`).
 decider run feed nothing. Reborrow with `as_deref_mut()` inside the loop. Call sites the signature change touches
 (the plan's FILES clause; the compiler is the oracle, no count is pinned): the two definitions `decide.rs:72,142`, the
 two calls at `copy.rs:691,693`, the re-export at `checkpoint/mod.rs:26`, and every direct call in `decide.rs` tests and
-helpers (12 at f6bb251; `run/recover.rs` has an unrelated private `fn decide`, so grep by path); test helpers pass `None`.
+helpers (`run/recover.rs` has an unrelated private `fn decide`, so grep by path); test helpers pass `None`.
 
 5.3 `stage_file`: move `let mut hasher = (opts.verify != VerifyLevel::None).then(flux_hash::Hasher::new)` above the `plan_resume` call
 (`copy.rs:851`, the call is at 851-852); pass `hasher.as_mut()`. Delete the C9 guard `copy.rs:861-869`. Everything after is unchanged: carry
@@ -143,10 +143,7 @@ CLI (`crates/flux-cli/tests/copy.rs`):
    the resumed file is published byte-equal and `files_verified == 1`, `files_mismatched == 0`. This is the
    end-to-end test that fails if `None` is passed to `plan_resume`. It reuses the 64 MiB `Stalled` harness and is
    slow; it is one test, not a matrix (the matrix is tests 4 and 5 in the engine, at `min_len: MIB`).
-9c. `resume_verify_skipped_complete_file_is_not_counted` (engine tree tests, `run/tests.rs`, with `min_len` set small as
-   at `:5914`): a tree of one file the prior run completed (skipped by `resumed_complete`) and one half-copied file:
-   `files_verified == 1` (not 2) and `files_resumed` counts the skipped one (R1, `tree.rs:1822-1830,4233`). No existing fixture builds both kinds of file in one tree: the plan combines
-   `resumable(.., ClaimStatus::Created)` (`run/tests.rs:~3720`) with the half-copied setup of `crashed_run` (`~5990`).
+9c. `resume_verify_skipped_complete_file_is_not_counted` (engine tree tests, `run/tests.rs`): `resumable_with(&verifying(opts()), 100, b"o", 101, ClaimStatus::Created)` (`:3699`) then `run_tree_with(&fs, &resume(), &verifying(opts()))`: `/src/a` is skipped as resumed and `/src/sub/b` is copied fresh, so `files_resumed == 1`, `files_verified == 1` (not 2), `files_mismatched == 0` (R1, `tree.rs:1822-1830,4233`).
 Mutants, run by hand and each named to the test that must fail: no `update` in `decide` (1, 4); no `update` in
 `decide_full` (2, 4); stale-length `update` (1b); `None` passed to `plan_resume` (4, 5); the failing chunk fed (1, 6).
 Not claimed killable: feeding `partial_buf` for `source_buf` (equivalent, section 3).
@@ -186,8 +183,8 @@ Not claimed killable: feeding `partial_buf` for `source_buf` (equivalent, sectio
   `copy.rs` CLI fixtures cannot reach a resume (9 acceptance, 9b end-to-end in `tests/run.rs`, 9c skipped-file count),
   test 7 and section 5.5 line cites, the ROADMAP "Remaining:" clause, the `--dry-run`/exit-code change (R5), the help
   wording collision (R6). Resource Vampire: no new findings.
-- Round-3 solo (Sonnet) FINDINGS-2 and agy round 3, FOLDED: test 9b needs the helper to return its JSON, test 9c needs a
-  combined fixture, `tree.rs:4233`, `Outcome.verified`, the `flux_hash` full path (all above). agy C1 (NIT, measured TRUE):
+- Round-3 solo (Sonnet) FINDINGS-2 and agy round 3, FOLDED: test 9b needs the helper to return its JSON, test 9c uses the
+  existing two-file `fake_src`, `tree.rs:4233`, `Outcome.verified`, the `flux_hash` full path (all above). agy C1 (NIT, measured TRUE):
   when a resumed file fails the destination or second-source compare, `discard` unlinks the temporary
   (`copy.rs:239-258`), the log keeps its records, and the next `--resume` finds no partial (`plan_resume`'s no-partial
   arm, `copy.rs:696-702`) and recopies from scratch (`Discard::PartialMissing`); the orphan records are harmless and the
