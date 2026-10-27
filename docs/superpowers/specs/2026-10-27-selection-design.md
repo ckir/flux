@@ -102,15 +102,15 @@ to differ (`***`, `a**`, `**x`, `.`, `..` and `**/**` are all rejected by them).
 category Cc: U+0000-U+001F and U+007F-U+009F (NUL, newline and tab included). Sizes below are UTF-8 BYTES.
 
 Meaning
-- `*` matches zero or more characters within one component; `?` matches exactly one character within one component (a
-  Unicode scalar when the WHOLE name is valid UTF-8 (`OsStr::to_str` succeeds), a byte of its encoded form otherwise; call R2).
+- `*` matches zero or more characters within one component; `?` matches exactly one character within one component (a Unicode scalar when the component being matched is valid UTF-8 (`OsStr::to_str` succeeds), a byte of its encoded form otherwise, decided once per component; call R2).
 - A segment `**` matches whole path components. Interior or leading `**` matches ZERO or more components (`docs/**/n`
   matches `docs/n`). A TRAILING `**` matches ONE or more components, so `private/**` excludes everything inside
   `private` but not `private` itself.
 - Anchoring: a pattern with a leading `/` or an inner `/` is ANCHORED and matched against the path relative to the
-  source root (components joined by `/`). A pattern with neither is matched against the entry's own name at ANY depth
+  source root (the pattern's `/` separates its segments; the PATH is walked component by component, see 5.3). A pattern with neither is matched against the entry's own name at ANY depth
   (`*.tmp`, `foo`).
-- A trailing `/` restricts the pattern to directories; it is stripped FIRST, and the `**` rules then apply to the rest (`a/**/` is a trailing `**`, dir-only). A symlink to a directory is a symlink, not a directory, so `foo/` never matches it. A bare `**` (or `**/`) is a trailing `**`: it matches every entry.
+- A trailing `/` restricts the pattern to directories; it is stripped FIRST, and the `**` rules then apply to the rest (`a/**/` is a trailing `**`, dir-only). A symlink to a directory is a symlink, not a directory, so `foo/` never matches it. A bare `**` (or `/**`) is a trailing `**` and matches every entry; `**/` is the same pattern made dir-only, so it matches every DIRECTORY below the root (each is pruned) and leaves top-level files alone.
+- Anchoring is decided AFTER the trailing `/` is stripped, so `foo/` is unanchored and dir-only (`foo/` matches the directory `a/b/foo`, not the file). An anchored pattern must match the WHOLE relative path, not a prefix. `*` and `?` match a leading `.` (there is no hidden-file rule).
 - The entry name an unanchored pattern sees is the LAST component of its relative path.
 - Matching is case-sensitive on every platform and does no Unicode normalisation (call R1).
 - An entry is excluded when ANY pattern matches it. Order is irrelevant. A matched directory is never entered.
@@ -131,7 +131,7 @@ entered, silently (owner ruling). A symlink to a directory is `FileType::Symlink
 ### 5.3 Where it lives
 
 New `crates/flux-core/src/select.rs`: `Selection` (compiled patterns, `recursive: bool`), `Selection::compile(&[String],
-recursive) -> Result<Selection, SelectError>`, and `Selection::is_selected(&self, rel: &Path, ft: FileType) -> bool`.
+recursive) -> Result<Selection, SelectError>`, and `Selection::is_selected(&self, rel: &Path, ft: FileType) -> bool`. `rel` is the `PathBuf` that `Walk::next` builds with `join` (`walk.rs:326`): its separator is the OS one (`\` on Windows), with no prefix and no leading separator. The matcher therefore walks `rel.components()` (`Component::Normal` names) and NEVER splits the path's bytes on `/`; treating `\` as a second separator would be wrong on Linux, where a name may contain one. Per entry it decides the byte-or-scalar mode once per component, takes only `file_name()` for unanchored patterns, and returns early when there are no patterns and recursion is on (the walker then holds `None`). `Selection` stays `Sync` (Phase 3 shares it); the test-only step count comes from a counted generic entry point, not a `Cell`.
 `WalkOptions` gains an optional borrowed handle to it (`Option<&'a Selection>` keeps the struct `Copy`; the plan
 decides the lifetime plumbing). `Walk::next` calls it for every entry before `match step` and `continue`s on `false`.
 The CLI validates each `--exclude` argument with the same parser (a clap `value_parser`) so a bad pattern fails at
@@ -164,12 +164,11 @@ each source root is walked with the selection, as in copy.
   with `--help` text stating the grammar in a few lines.
 - The two tests that pin "`--exclude` is a usage error" (`main.rs:1030-1036`, `tests/verify.rs:168-175`) keep their
   `--resume` half and drop `--exclude`.
-- README option list, ROADMAP rows 3, 4 and 6, and `TODO.md:1214` are updated; the stand-downs below get TODO items.
+- Docs and tests that become false and are updated in this cut: `README.md:90` (verify synopsis) and `README.md:105-106` (option prose); the verify GUARANTEES text `crates/flux-cli/src/verify_report.rs:26-30` (a directory not entered is no longer only a mount: add the `--no-recursive` and `--exclude` guarantee that selected-out entries are not compared); ROADMAP rows 3, 4 and 6 (`ROADMAP.md:42,43,45`); `TODO.md:1214`; the two tests that pin `--exclude` as an error (`main.rs:1030-1036`, `tests/verify.rs:168-175`); clap `value_name = "PATTERN"` so `--help` shows `--exclude <PATTERN>`; the stand-downs below get TODO items.
 
 ### 5.8 Cleanup folded in
 
-The doc comments at `state.rs:164` (omits `cross_filesystems`) and `run/resume.rs:35` ("the four exact-match options",
-six are compared) are corrected where this cut edits those functions.
+The doc comments at `state.rs:164` (omits `cross_filesystems`) and `run/resume.rs:35` ("the four exact-match options", six are compared today and eight after this cut) are corrected where this cut edits those functions.
 
 ## 6. Tests (the oracle; written before the code, named)
 
@@ -180,14 +179,15 @@ Each test is pinned by a named case; the plan assigns the exact names. Matcher (
 - `*.tmp`: `cache.tmp` YES, `sub/deep/cache.tmp` YES; `sub/*.tmp`: `sub/c.tmp` YES, `other/sub/c.tmp` NO.
 - `/foo` vs `foo` YES, `a/foo` NO; `foo` vs `a/b/foo` YES.
 - `docs/**/notes.txt`: `docs/notes.txt` YES, `docs/2026/10/notes.txt` YES; `build/*` vs `build/x/y` NO.
-- `**` alone: every entry YES; `**/foo`: `foo` YES, `a/foo` YES.
+- `**` alone and `/**`: every entry YES; `**/`: directory `d` YES, file `f` NO; `**/foo`: `foo` YES, `a/foo` YES; `foo/` vs directory `a/b/foo` YES and vs file `a/b/foo` NO; `*` vs `.hidden` YES; `sub/*.tmp` vs `sub/x.tmp/y` NO (whole path, not prefix).
+- Cost: `a/**/a/**/a/**/b` against a deep non-matching path stays within the step bound (a naive recursive matcher fails it).
+- Limits accepted exactly at the cap: a 1024-byte pattern, 64 segments, 64 patterns, 16 KiB of pattern bytes.
 - `?`: `fil?` vs `filé` YES (one scalar), `fil??` vs `filé` NO; a 3-byte (`€`) and a 4-byte (emoji) scalar each match ONE `?`; `fil?` vs the non-UTF-8 name `fil\xff` YES and `??` vs the invalid pair `\xe2\x82` YES (byte mode); a name invalid anywhere is matched in byte mode as a whole.
 - Case: `README` vs `readme` NO, and `É` vs `é` NO (no Unicode folding).
 - Rejected at compile: `""`, `/`, `a//b`, `..`, `a/../b`, `./a`, `a\b`, `a!b`, `[a]`, `a**`, `***`, `**/**`, `**a`, `a*b**`, a pattern with a newline, a tab, U+0085 or NUL, a 1025-byte pattern, a 65-segment pattern, 65 patterns, 16 KiB + 1 of pattern bytes, and a pathological `a*a*a*...*b` pattern that
   still completes within a bounded step count (linearity).
 Walker (`walk.rs`): a SYMLINK and an `Other` entry are excluded by name; an excluded directory at depth 2 (not only at the root) yields no event and the `FaultFs` call log shows no `read_dir` / `metadata`
-for it; `private/**` still yields `private` and filters its children; `--no-recursive` yields only top-level
-non-directories and does NOT trip the depth cap; selection plus mounts.
+for it; `private/**` still yields `private` and filters its children; `--no-recursive` yields only top-level non-directories and does NOT trip the depth cap, and a top-level symlink to a directory is yielded as a symlink (and copied as one under `--links=copy`); an excluded directory deeper than the cap raises no depth error; the root is never filtered; selection plus mounts.
 Copy (`tree.rs` / run tests): exclusion leaves the destination without the entries; hardlink group with one excluded
 member copies the remaining member as an ordinary file (`files_hardlinked == 0`, no degradation, strict mode passes),
 two selected members still link, with one case excluding the FIRST-walked (canonical) member and another the last; `files_total` counts selected only; `--no-recursive` creates no subdirectory; dry run
@@ -196,7 +196,7 @@ Fingerprint / resume: no new option adds no line (the pre-cut fingerprint of a f
 or a different recursion mode exits 3 with `INCOMPATIBLE_STATE` naming the option (one test varies only `exclude`, one only `recursive`).
 Verify: an excluded name present at the destination is not `Extra`, and one present at the SOURCE is not `Missing`; the file-versus-directory cases of section 5.6; with `--no-recursive` the destination's
 subdirectories are not reported and exit stays 0 on a matching top level; a mismatch at the top level still exits 1.
-CLI (`tests/copy.rs`, `tests/verify.rs`): bad pattern exits 2 with the reason and creates NO state and no destination, `--recursive --no-recursive` exits 2,
+CLI (`tests/copy.rs`, `tests/verify.rs`): `--exclude=-foo` is accepted and matches a name `-foo` while `--exclude -foo` is refused; `--recursive` alone is accepted; `flux copy file.txt dst --exclude file.txt` still copies the file (R7), as does a file operand among several sources, and `verify_file` ignores the options; `--help` shows `<PATTERN>`, the grammar and the R7 note; the `INCOMPATIBLE_STATE` text names the stored and requested lists; bad pattern exits 2 with the reason and creates NO state and no destination, `--recursive --no-recursive` exits 2,
 `--exclude` works end to end for copy and verify, `--resume` without a prior still refuses as before.
 Mutants the plan must run by hand: drop the filter call; apply it to files and directories but not symlinks; drop the SOURCE-side (not only the destination-side) filter in verify; sort in `Options::of` but not in `canonical_bytes`; validate the pattern in the engine instead of at argument time; omit `#[serde(default)]` on either field; invert `dir_only`; make trailing `**` zero-or-more;
 make `?` a byte; drop `recursive=false` from `canonical_bytes`; drop the destination-side filter in verify.
@@ -227,8 +227,7 @@ make `?` a byte; drop `recursive=false` from `canonical_bytes`; drop the destina
 - Depth: an excluded-but-too-deep directory no longer raises the depth `WalkError` (the filter runs first); intended.
 - `Config::new` / `Options { .. }` literals in tests need the two new fields: the compiler names every one (FILES clause
   for the plan lists them).
-- Windows: the matcher works on `encoded_bytes` (WTF-8); no `\` is accepted in a pattern, so the separator is `/` on every
-  platform. Windows CI is the only evidence for the Windows legs.
+- Windows: the walker's `rel` uses `\`; the matcher reads `components()`, so a `/`-separated pattern segment meets a component, not a byte (section 5.3). A name with a lone surrogate fails `to_str` and is matched in byte mode on its WTF-8 form (`?` then matches one WTF-8 byte). Section 6's table fixtures build `rel` with `PathBuf::join`, and one walker test uses an anchored multi-component pattern at depth 2, so Windows CI exercises the real input; it is the only evidence for the Windows legs.
 
 ## Stand-downs
 
