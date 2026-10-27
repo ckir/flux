@@ -5528,7 +5528,7 @@ mod tests {
     #[test]
     fn a_mismatch_inside_the_prefix_feeds_the_carry_once() {
         for flip in [10, MIB + 10] {
-            for arm in [0, 1] {
+            for arm in [0, 1, 2] {
                 let (fs, root, src) = resume_fixture(5 * MIB, 3);
                 let mut partial = src[..3 * MIB].to_vec();
                 partial[flip] ^= 1;
