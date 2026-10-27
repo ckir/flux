@@ -58,7 +58,7 @@ pub fn check_capability<D: DirHandle>(dir: &D) -> LockResult<LockCapability> {
     }
 }
 
-const UNTRUSTED_DETAIL: &str = "the dead owner's record names a workspace that is missing or not one Flux trusts; Flux never deletes state it cannot read: inspect it, and remove it by hand if it is not needed";
+pub(crate) const UNTRUSTED_DETAIL: &str = "the dead owner's record names a workspace that is missing or not one Flux trusts; Flux never deletes state it cannot read: inspect it, and remove it by hand if it is not needed";
 
 /// `S21_1_refused` for a held lock: another run holds it, with its record where readable.
 pub(crate) fn busy_refusal(holder: Option<LockRecord>) -> LockError {

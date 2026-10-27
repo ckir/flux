@@ -47,7 +47,10 @@ pub(crate) enum PrefixRefusal {
         name: OsString,
         other: OsString,
     },
-    Lock(LockError),
+    Lock {
+        name: OsString,
+        error: LockError,
+    },
 }
 
 /// The prefix locks a run holds, in the order they were taken.
@@ -101,10 +104,13 @@ impl<'a, D: DirHandle> PrefixLocks<'a, D> {
         id: &PrefixId<'_>,
         held: &[(OsString, Held<'a, D>)],
     ) -> Result<(Held<'a, D>, Option<OsString>), PrefixRefusal> {
-        let site = LockSite::directory(dir, name).map_err(PrefixRefusal::Lock)?;
+        let site = LockSite::directory(dir, name)
+            .map_err(|error| PrefixRefusal::Lock { name: name.clone(), error })?;
         // Built before `obtain`: once a `Held` exists, the only fallible step left is `write_record`, so no error
         // path can leave a recordless lock file behind (`Held` has no `Drop`).
-        let complete_lock_key = site.complete_lock_key().map_err(PrefixRefusal::Lock)?;
+        let complete_lock_key = site
+            .complete_lock_key()
+            .map_err(|error| PrefixRefusal::Lock { name: name.clone(), error })?;
         match obtain(&site, cap, Mode::Plain, id.operation_id) {
             Ok(Obtained::Held { held: mut h, leftover_broken }) => {
                 let record = LockRecord {
@@ -120,7 +126,7 @@ impl<'a, D: DirHandle> PrefixLocks<'a, D> {
                 if let Err(e) = h.write_record(record) {
                     // No record landed: `discard` is the right release for a lock without one.
                     let _ = h.discard();
-                    return Err(PrefixRefusal::Lock(e));
+                    return Err(PrefixRefusal::Lock { name: name.clone(), error: e });
                 }
                 Ok((h, leftover_broken))
             }
@@ -144,9 +150,9 @@ impl<'a, D: DirHandle> PrefixLocks<'a, D> {
                         .map_or_else(|| name.clone(), |(n, _)| n.clone());
                     return Err(PrefixRefusal::Collision { name: name.clone(), other });
                 }
-                Err(PrefixRefusal::Lock(LockError::Refused(r)))
+                Err(PrefixRefusal::Lock { name: name.clone(), error: LockError::Refused(r) })
             }
-            Err(e) => Err(PrefixRefusal::Lock(e)),
+            Err(e) => Err(PrefixRefusal::Lock { name: name.clone(), error: e }),
         }
     }
 
@@ -226,7 +232,7 @@ mod tests {
                 assert_eq!(name, OsString::from("data"));
                 assert_eq!(other, OsString::from("Data"));
             }
-            Err(PrefixRefusal::Lock(e)) => panic!("expected a collision, got {e:?}"),
+            Err(PrefixRefusal::Lock { error, .. }) => panic!("expected a collision, got {error:?}"),
             Ok(_) => panic!("expected a collision"),
         }
         assert!(!fs.exists("/p/Data.flux-lock"));
@@ -240,7 +246,7 @@ mod tests {
         let y = id('b', 6);
         let (_held, _) = PrefixLocks::acquire(&d, CAP, &names(&["a"]), &x.as_ref()).unwrap();
         match PrefixLocks::acquire(&d, CAP, &names(&["a", "b"]), &y.as_ref()) {
-            Err(PrefixRefusal::Lock(LockError::Refused(r))) => {
+            Err(PrefixRefusal::Lock { error: LockError::Refused(r), .. }) => {
                 assert_eq!(r.code, LockCode::TargetLockBusy);
             }
             Err(_) => panic!("expected a busy lock"),
@@ -257,7 +263,7 @@ mod tests {
         let y = id('b', 6);
         let (_held, _) = PrefixLocks::acquire(&d, CAP, &names(&["b"]), &x.as_ref()).unwrap();
         let r = PrefixLocks::acquire(&d, CAP, &names(&["a", "b"]), &y.as_ref());
-        assert!(matches!(r, Err(PrefixRefusal::Lock(_))));
+        assert!(matches!(r, Err(PrefixRefusal::Lock { .. })));
         assert!(!fs.exists("/p/a.flux-lock"));
         assert!(fs.exists("/p/b.flux-lock"));
     }
@@ -295,7 +301,7 @@ mod tests {
         let y = id('b', 10_000_000_000_000_000_000);
         let (first, _) = PrefixLocks::acquire(&d, CAP, &names(&["a"]), &x.as_ref()).unwrap();
         match PrefixLocks::acquire(&d, CAP, &names(&["a"]), &y.as_ref()) {
-            Err(PrefixRefusal::Lock(LockError::Refused(r))) => {
+            Err(PrefixRefusal::Lock { error: LockError::Refused(r), .. }) => {
                 assert_eq!(r.code, LockCode::TargetLockBusy);
             }
             Err(_) => panic!("expected a busy lock"),

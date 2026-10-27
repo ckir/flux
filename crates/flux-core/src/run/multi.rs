@@ -138,7 +138,20 @@ impl<'p, F: DestinationRoot> MultiPlace<'p, F> {
                     name
                 ),
             ),
-            PrefixRefusal::Lock(e) => from_lock(e, RunStep::Lock, &self.tree.dest_shown, false),
+            PrefixRefusal::Lock { name, mut error } => {
+                if let LockError::Refused(r) = &mut error {
+                    match r.code {
+                        LockCode::TargetLockUncertain => {
+                            r.detail = "this prefix lock has an unreadable record; if no Flux run is active on this destination, remove that file and run again with the same flags".to_string();
+                        }
+                        LockCode::ArtifactOwnershipUncertain => {
+                            r.detail = crate::lock::UNTRUSTED_DETAIL.to_string();
+                        }
+                        _ => {}
+                    }
+                }
+                from_lock(error, RunStep::Lock, &self.lock_path(&name), false)
+            }
         }
     }
 
@@ -1550,6 +1563,57 @@ mod trees_tests {
         assert!(!fs.exists("/p/dest/.flux"), "no workspace was made");
     }
 
+    fn lock_prefix(name: &str) -> String {
+        format!("{}: ", Path::new("/p/dest").join(format!("{name}.flux-lock")).display())
+    }
+
+    #[test]
+    fn an_unreadable_prefix_lock_names_the_file_once_and_promises_no_break_lock() {
+        let fs = fake();
+        fs.create_dir(Path::new("/p/dest")).unwrap();
+        fs.write_file("/p/dest/a.flux-lock", b""); // an empty record, nobody holds it: Uncertain under Mode::Plain
+        let (r, _) = go(&fs, &["a", "b"]);
+        let detail = match &r.run.stop {
+            Some(RunError::Refused { refusal, changed: false, .. }) => {
+                assert_eq!(refusal.code, LockCode::TargetLockUncertain);
+                refusal.detail.clone()
+            }
+            other => panic!("expected TARGET_LOCK_UNCERTAIN, got {other:?}"),
+        };
+        assert!(detail.starts_with(&lock_prefix("a")), "{detail}");
+        assert_eq!(detail.matches("a.flux-lock").count(), 1, "{detail}");
+        assert!(detail.contains("the same flags") && !detail.contains("--break-lock"), "{detail}");
+        assert!(!fs.exists("/p/dest/.flux"), "nothing was created");
+    }
+
+    #[test]
+    fn an_orphan_prefix_lock_says_remove_by_hand_not_cleanup() {
+        let fs = fake();
+        fs.create_dir(Path::new("/p/dest")).unwrap();
+        // A one-source copy into DEST/a crashed (its record names operations/<id> under DEST/a), then DEST/a was removed.
+        let dest = fs.destination_root(Path::new("/p/dest")).unwrap();
+        let site = crate::lock::LockSite::directory(&dest, &OsString::from("a")).unwrap();
+        let rec = crate::lock::test_support::record(
+            &site,
+            "33333333333333333333333333333333",
+            "operations/33333333333333333333333333333333",
+        );
+        crate::lock::test_support::dead_lock(&dest, "a.flux-lock", &rec.encode());
+        let (r, _) = go(&fs, &["a", "b"]);
+        let detail = match &r.run.stop {
+            Some(RunError::Refused { refusal, .. }) => {
+                assert_eq!(refusal.code, LockCode::ArtifactOwnershipUncertain);
+                refusal.detail.clone()
+            }
+            other => panic!("expected ARTIFACT_OWNERSHIP_UNCERTAIN, got {other:?}"),
+        };
+        assert!(detail.starts_with(&lock_prefix("a")), "{detail}");
+        assert!(
+            detail.contains("remove it by hand") && !detail.contains("flux cleanup"),
+            "{detail}"
+        );
+    }
+
     #[test]
     fn a_held_prefix_lock_on_the_last_root_refuses_and_nothing_is_copied() {
         let fs = fake();
@@ -1572,6 +1636,7 @@ mod trees_tests {
         match &r.run.stop {
             Some(RunError::Refused { refusal, changed: false, .. }) => {
                 assert_eq!(refusal.code, LockCode::TargetLockBusy);
+                assert!(refusal.detail.starts_with(&lock_prefix("c")), "{}", refusal.detail);
             }
             other => panic!("expected TARGET_LOCK_BUSY with nothing changed, got {other:?}"),
         }
