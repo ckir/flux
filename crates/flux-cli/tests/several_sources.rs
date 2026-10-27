@@ -8,7 +8,8 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 fn flux() -> Command {
@@ -453,4 +454,126 @@ fn exclude_applies_to_each_source_root() {
     assert!(!out_dir.join("alpha").join("x.tmp").exists());
     assert!(!out_dir.join("beta").join("z.tmp").exists());
     assert!(!out_dir.join("beta").join("sub").join("y.tmp").exists());
+}
+
+/// A `flux copy SRC... DEST` stopped just before its `at`-th guarded mutation, holding what it holds there (the
+/// debug build's hook). Copied from `run.rs` with a several-source constructor. It is killed when dropped.
+struct Stalled(Child);
+
+impl Stalled {
+    /// `flux copy <args> <srcs...> <dst>`, stalled at the `at`-th guarded mutation. Each stalled run of one test
+    /// needs its own `marks` directory: the announcement file is named by `at` alone.
+    fn start_several(srcs: &[&Path], dst: &Path, at: u32, marks: &Path, args: &[&str]) -> Self {
+        let announced = marks.join(format!("stalled-{at}"));
+        let child = flux()
+            .arg("copy")
+            .args(args)
+            .args(srcs)
+            .arg(dst)
+            .env("FLUX_TEST_STALL_AT", at.to_string())
+            .env("FLUX_TEST_STALL_FILE", &announced)
+            // Pin the batch age to an hour: the stall indices count guard calls, which a real-clock age flush
+            // would shift.
+            .env("FLUX_TEST_BATCH_AGE_MS", "3600000")
+            // Pin the open-writer cap to its ceiling: a small host descriptor limit would flush early.
+            .env("FLUX_TEST_OPEN_WRITERS", "256")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut s = Stalled(child);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !announced.exists() {
+            if let Some(status) = s.0.try_wait().unwrap() {
+                panic!("the run exited before its stall point: {status}");
+            }
+            assert!(Instant::now() < deadline, "the run never reached its stall point");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        s
+    }
+
+    /// A crash: the process dies holding what it held.
+    fn kill(mut self) {
+        self.0.kill().unwrap();
+        self.0.wait().unwrap();
+    }
+}
+
+impl Drop for Stalled {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// The stall index for `[alpha, beta]` into `out` (measured 2026-10-27 on the debug binary, Linux): the run stops
+/// with `out/alpha/a.flux-partial.<id>`, `out/alpha.flux-lock`, `out/beta.flux-lock` and `out.flux-lock` on disk.
+const STALL_AT: u32 = 4;
+
+/// Whether some file named `a.flux-partial.*` sits directly in `dir`.
+fn has_partial_a(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .any(|e| e.unwrap().file_name().to_string_lossy().starts_with("a.flux-partial."))
+}
+
+#[test]
+fn a_killed_several_source_run_is_superseded_by_restart() {
+    let d = TempDir::new().unwrap();
+    let marks = TempDir::new().unwrap();
+    let (alpha, beta) = (folder(d.path(), "alpha"), folder(d.path(), "beta"));
+    let out = d.path().join("out");
+    Stalled::start_several(&[&alpha, &beta], &out, STALL_AT, marks.path(), &[]).kill();
+    assert!(has_partial_a(&out.join("alpha")), "{:?}", snapshot(&out).keys().collect::<Vec<_>>());
+    assert!(d.path().join("out.flux-lock").exists());
+
+    let rerun = flux()
+        .current_dir(d.path())
+        .args(["copy", "--json", "alpha", "beta", "out"])
+        .output()
+        .unwrap();
+    assert_eq!(rerun.status.code(), Some(3), "stderr: {}", stderr(&rerun));
+    assert!(stderr(&rerun).contains("--restart to supersede"), "stderr: {}", stderr(&rerun));
+    assert!(!stderr(&rerun).contains("cleanup"), "stderr: {}", stderr(&rerun));
+
+    let restart = flux()
+        .current_dir(d.path())
+        .args(["copy", "--restart", "--json", "alpha", "beta", "out"])
+        .output()
+        .unwrap();
+    assert_eq!(restart.status.code(), Some(0), "stderr: {}", stderr(&restart));
+    assert_eq!(std::fs::read(out.join("alpha/a")).unwrap(), b"A-alpha");
+    assert_eq!(std::fs::read(out.join("alpha/sub/b")).unwrap(), b"BB-alpha");
+    assert_eq!(std::fs::read(out.join("beta/a")).unwrap(), b"A-beta");
+    assert_eq!(std::fs::read(out.join("beta/sub/b")).unwrap(), b"BB-beta");
+    let residue: Vec<_> =
+        snapshot(&out).into_keys().filter(|k| k.contains(".flux-partial.")).collect();
+    assert!(residue.is_empty(), "{residue:?}");
+    assert!(control_plane_names(&out).is_empty(), "{:?}", control_plane_names(&out));
+    assert!(!d.path().join("out.flux-lock").exists());
+}
+
+/// Design 3.3, limitation L6: a several-source restart with a different source set supersedes the prior run but
+/// does not own the prior's prefix lock for a source it no longer copies, so that lock stays.
+#[test]
+fn a_killed_run_restarted_with_other_sources_keeps_the_stale_prefix_lock() {
+    let d = TempDir::new().unwrap();
+    let marks = TempDir::new().unwrap();
+    let (alpha, beta) = (folder(d.path(), "alpha"), folder(d.path(), "beta"));
+    let out = d.path().join("out");
+    Stalled::start_several(&[&alpha, &beta], &out, STALL_AT, marks.path(), &[]).kill();
+    assert!(out.join("beta.flux-lock").exists());
+    folder(d.path(), "gamma");
+
+    let restart = flux()
+        .current_dir(d.path())
+        .args(["copy", "--restart", "alpha", "gamma", "out"])
+        .output()
+        .unwrap();
+    assert_eq!(restart.status.code(), Some(0), "stderr: {}", stderr(&restart));
+    assert!(out.join("beta.flux-lock").exists(), "L6: the unused prefix's lock stays");
+    assert!(!out.join("alpha.flux-lock").exists());
+    assert!(!out.join("gamma.flux-lock").exists());
+    assert_eq!(std::fs::read(out.join("gamma/a")).unwrap(), b"A-gamma");
 }
