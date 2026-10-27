@@ -759,7 +759,7 @@ fn verify(args: &VerifyArgs) -> u8 {
         if args.json {
             let s = flux_core::verify::Summary::default();
             stdout_or_exit(&verify_report::summary_json(
-                &args.source,
+                verify_report::Sources::One(&args.source),
                 &args.dest,
                 "blake3",
                 &s,
@@ -825,7 +825,13 @@ fn verify(args: &VerifyArgs) -> u8 {
     };
     let code = exit_code::for_verify(&summary);
     let line = if args.json {
-        verify_report::summary_json(&src, &dst, "blake3", &summary, code)
+        verify_report::summary_json(
+            verify_report::Sources::One(&src),
+            &dst,
+            "blake3",
+            &summary,
+            code,
+        )
     } else {
         verify_report::summary_line(&summary)
     };
@@ -840,18 +846,9 @@ fn refusal_line(e: &VerifyError, dst: &Path) -> String {
             format!("error: {reason}")
         }
         VerifyError::RefusedRoot { name, reason } => {
-            let n = verify_report::display_path(Path::new(name));
-            format!("error: root {n}: {}/{n}: {reason}; nothing was verified", dst.display())
+            verify_report::refused_root_line(name, dst, reason)
         }
-        VerifyError::RefusedAlias { a, b } => {
-            let (a, b) = (
-                verify_report::display_path(Path::new(a)),
-                verify_report::display_path(Path::new(b)),
-            );
-            format!(
-                "error: roots {a} and {b} are one directory on this filesystem; nothing was verified"
-            )
-        }
+        VerifyError::RefusedAlias { a, b } => verify_report::refused_alias_line(a, b),
     }
 }
 
