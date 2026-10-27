@@ -11,8 +11,8 @@
 
 use crate::walk::{DEFAULT_MAX_DEPTH, MountPolicy, Walk, WalkEvent, WalkOptions, walk_with};
 use flux_fs::{
-    Code, DestinationRoot, DirHandle, FileSystem, FileType, FluxPathKey, FsError, HashAlgorithm,
-    Links, Safety,
+    Code, DestinationRoot, DirHandle, FileIdentity, FileSystem, FileType, FluxPathKey, FsError,
+    HashAlgorithm, Links, Safety,
 };
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
@@ -408,21 +408,62 @@ pub(crate) fn verify_tree_filtered<F: DestinationRoot>(
     sink: &mut dyn FnMut(Record),
 ) -> Result<Summary, VerifyError> {
     let mut out = Emitter { summary: Summary::default(), sink };
-    let dst_absent = match check_roots(fs, src, dst) {
-        Ok(absent) => absent,
-        Err(RootsCheck::Refused(reason)) => return Err(VerifyError::RefusedRoots { reason }),
-        Err(RootsCheck::Unreadable(side, e)) => {
-            return Ok(root_unreadable(out, &format!("{side}{}", e.source), e.code));
-        }
-    };
-    if dst_absent {
+    let verdict =
+        check_pair(fs, src, dst).map_err(|reason| VerifyError::RefusedRoots { reason })?;
+    if matches!(verdict, RootVerdict::Absent) {
         on_absent();
     }
+    walk_checked(fs, src, dst, opts, filter, verdict, &mut out);
+    Ok(out.summary)
+}
+
+/// What the root check decided for one source and destination pair.
+#[derive(Debug)]
+enum RootVerdict {
+    /// The destination does not exist and is to be treated as empty.
+    Absent,
+    /// A root could not be examined: the root record `.` is reported, nothing is walked.
+    Unreadable { side: &'static str, error: FsError },
+    /// The roots are distinct and both exist.
+    Checked,
+}
+
+/// The root check of one pair (design 6.2): no directory is listed. `Err(reason)` is a refusal.
+fn check_pair<F: DestinationRoot>(fs: &F, src: &Path, dst: &Path) -> Result<RootVerdict, String> {
+    match check_roots(fs, src, dst) {
+        Ok(Presence::Absent) => Ok(RootVerdict::Absent),
+        Ok(Presence::Present(_)) => Ok(RootVerdict::Checked),
+        Err(RootsCheck::Refused(reason)) => Err(reason),
+        Err(RootsCheck::Unreadable(side, error)) => Ok(RootVerdict::Unreadable { side, error }),
+    }
+}
+
+/// The walk of one checked pair (design 6.3), its records emitted through `out`.
+fn walk_checked<F: DestinationRoot>(
+    fs: &F,
+    src: &Path,
+    dst: &Path,
+    opts: &VerifyOptions,
+    filter: ControlFilter,
+    verdict: RootVerdict,
+    out: &mut Emitter<'_>,
+) {
+    let dst_absent = match verdict {
+        RootVerdict::Unreadable { side, error } => {
+            root_unreadable(out, &format!("{side}{}", error.source), error.code);
+            return;
+        }
+        RootVerdict::Absent => true,
+        RootVerdict::Checked => false,
+    };
     // The source walk is built first, then the destination's (a test pins the `read_dir` order).
     let mut a =
         match Side::new(fs, src, opts.mounts, opts.links == Links::Skip, ControlFilter::None) {
             Ok(a) => a,
-            Err(e) => return Ok(root_unreadable(out, &format!("{SOURCE}{}", e.source), e.code)),
+            Err(e) => {
+                root_unreadable(out, &format!("{SOURCE}{}", e.source), e.code);
+                return;
+            }
         };
     let mut b = if dst_absent {
         Side::empty()
@@ -430,7 +471,8 @@ pub(crate) fn verify_tree_filtered<F: DestinationRoot>(
         match Side::new(fs, dst, opts.mounts, false, filter) {
             Ok(b) => b,
             Err(e) => {
-                return Ok(root_unreadable(out, &format!("{DESTINATION}{}", e.source), e.code));
+                root_unreadable(out, &format!("{DESTINATION}{}", e.source), e.code);
+                return;
             }
         }
     };
@@ -445,20 +487,19 @@ pub(crate) fn verify_tree_filtered<F: DestinationRoot>(
         match order {
             Ordering::Less => {
                 let x = a.take().expect("peeked");
-                alone(&mut out, &x, Outcome::Missing, &mut a, &mut b);
+                alone(out, &x, Outcome::Missing, &mut a, &mut b);
             }
             Ordering::Greater => {
                 let y = b.take().expect("peeked");
-                alone(&mut out, &y, Outcome::Extra, &mut a, &mut b);
+                alone(out, &y, Outcome::Extra, &mut a, &mut b);
             }
             Ordering::Equal => {
                 let x = a.take().expect("peeked");
                 let y = b.take().expect("peeked");
-                pair(fs, (src, dst), &mut out, &mut buf, (&x, &y), (&mut a, &mut b));
+                pair(fs, (src, dst), out, &mut buf, (&x, &y), (&mut a, &mut b));
             }
         }
     }
-    Ok(out.summary)
 }
 
 /// Why the root check stopped the run.
@@ -504,9 +545,17 @@ fn sided_check<F: DestinationRoot>(
     }
 }
 
-/// The root check (design 6.1), run before any directory is listed or file opened. `Ok(true)` when the destination
-/// does not exist and is to be treated as empty.
-fn check_roots<F: DestinationRoot>(fs: &F, src: &Path, dst: &Path) -> Result<bool, RootsCheck> {
+/// What the root check found at the destination.
+enum Presence {
+    Absent,
+    /// The destination's identity; nothing reads it until the several-sources check keeps it.
+    #[allow(dead_code)]
+    Present(FileIdentity),
+}
+
+/// The root check (design 6.1), run before any directory is listed or file opened. `Presence::Absent` when the destination
+/// does not exist and is to be treated as empty, else the destination's identity.
+fn check_roots<F: DestinationRoot>(fs: &F, src: &Path, dst: &Path) -> Result<Presence, RootsCheck> {
     use crate::tree::{lexically_within, preflight};
     let d = match fs.destination_root(dst) {
         Ok(d) => d,
@@ -514,7 +563,7 @@ fn check_roots<F: DestinationRoot>(fs: &F, src: &Path, dst: &Path) -> Result<boo
             if lexically_within(dst, src) {
                 return Err(RootsCheck::Refused(REFUSED_DST_IN_SRC.to_string()));
             }
-            return Ok(true);
+            return Ok(Presence::Absent);
         }
         Err(e) => return Err(RootsCheck::Unreadable(DESTINATION, e)),
     };
@@ -534,13 +583,12 @@ fn check_roots<F: DestinationRoot>(fs: &F, src: &Path, dst: &Path) -> Result<boo
             return Err(RootsCheck::Refused(format!("{REFUSED_SRC_IN_DST}{BY_PATH_ALONE}")));
         }
     }
-    Ok(false)
+    Ok(Presence::Present(di))
 }
 
 /// The run ends at the root record `.` (design 6.6): one `unreadable`, nothing walked.
-fn root_unreadable(mut out: Emitter<'_>, detail: &str, code: Code) -> Summary {
+fn root_unreadable(out: &mut Emitter<'_>, detail: &str, code: Code) {
     out.unreadable(PathBuf::from("."), Kind::Dir, code, detail.to_string());
-    out.summary
 }
 
 /// An item present on one side only: `missing` or `extra`. When its walk failed (both sides are then pruned): a
@@ -1865,5 +1913,27 @@ mod tests {
         assert!(fs.called("metadata(/d/a)"));
         assert!(!fs.called("open_read("));
         assert_eq!((s.unreadable, s.missing, s.bytes_hashed), (1, 0, 0));
+    }
+
+    #[test]
+    fn check_pair_classifies_a_checked_an_absent_and_a_refused_pair() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[]);
+        tree(&fs, "/d", &[], &[]);
+        assert!(matches!(
+            check_pair(&fs, Path::new("/s"), Path::new("/d")),
+            Ok(RootVerdict::Checked)
+        ));
+        assert!(matches!(
+            check_pair(&fs, Path::new("/s"), Path::new("/gone")),
+            Ok(RootVerdict::Absent)
+        ));
+        tree(&fs, "/s/d", &[], &[]);
+        let reason = check_pair(&fs, Path::new("/s"), Path::new("/s/d")).unwrap_err();
+        assert!(reason.starts_with(REFUSED_DST_IN_SRC), "{reason}");
+        match check_pair(&fs, Path::new("/nosrc"), Path::new("/d")) {
+            Ok(RootVerdict::Unreadable { side, .. }) => assert_eq!(side, SOURCE),
+            _ => panic!("an absent source must be unreadable"),
+        }
     }
 }
