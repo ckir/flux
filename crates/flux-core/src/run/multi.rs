@@ -2264,10 +2264,14 @@ mod trees_tests {
         let cfg_break = RunConfig { break_lock: true, ..restart_cfg(0x25) };
         let (r, _) = go_with(&fs, ["a", "b"].map(spec).to_vec(), &opts(), &cfg_break);
         match &r.run.stop {
-            Some(RunError::Refused { refusal, .. }) => {
+            Some(RunError::Refused { refusal, changed: false, .. }) => {
                 assert_eq!(refusal.code, LockCode::TargetLockUncertain);
+                let detail = &refusal.detail;
+                assert!(detail.starts_with(&lock_prefix("a")), "{detail}");
+                assert!(detail.contains("the same flags"), "{detail}");
+                assert!(!detail.contains("--break-lock"), "{detail}");
             }
-            other => panic!("expected TARGET_LOCK_UNCERTAIN, got {other:?}"),
+            other => panic!("expected TARGET_LOCK_UNCERTAIN with nothing changed, got {other:?}"),
         }
         assert_eq!(
             fs.read_file(LOCK).as_deref(),
@@ -2345,7 +2349,7 @@ mod trees_tests {
     fn one_restart_supersedes_a_crashed_run_and_a_restart_that_crashed_before_abandoning_it() {
         let id2 = format!("{:032x}", 0x28);
         let one_source = |fs: &FaultFs| {
-            let c = RunConfig { restart: true, operation_id: format!("{:032x}", 0x28), ..cfg() };
+            let c = RunConfig { restart: true, operation_id: id2.clone(), ..cfg() };
             crate::run::tree(
                 fs,
                 Path::new("/src/a"),
@@ -2367,12 +2371,18 @@ mod trees_tests {
         let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| one_source(&fs)));
         assert!(died.is_err(), "the restart was meant to die before abandoning its prior");
         assert_eq!(manifest_of(&fs, ID).state, OpState::Transferring);
-        let _ = manifest_of(&fs, &id2);
+        // Measured: the restart died before it wrote anything past its own first manifest, which is still CREATED.
+        assert_eq!(
+            manifest_of(&fs, &id2).state,
+            OpState::Created,
+            "the restart's own workspace exists"
+        );
 
         let (r, _) = go_with(&fs, ["a", "b"].map(spec).to_vec(), &opts(), &restart_cfg(0x29));
         ok(&r);
         assert!(!fs.exists(format!("/p/dest/.flux/operations/{ID}")));
         assert!(!fs.exists(format!("/p/dest/.flux/operations/{id2}")));
         assert_eq!(fs.read_file("/p/dest/a/x").as_deref(), Some(&b"ax"[..]));
+        assert_eq!(fs.read_file("/p/dest/b/k").as_deref(), Some(&b"bk"[..]));
     }
 }
