@@ -127,6 +127,18 @@ struct Item {
 
 type RawEvent = std::result::Result<WalkEvent, crate::walk::WalkError>;
 
+/// Which of Flux's own control state a side drops from the merge (design 6.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlFilter {
+    /// Nothing is dropped (the source side).
+    None,
+    /// A destination that is itself a Flux root: the top-level `.flux` directory, the root-level `.flux-root.lock`, and
+    /// a copy's partial temporaries.
+    Root,
+    /// A destination root nested inside another: only a copy's partial temporaries; a `.flux` there is user data.
+    NestedRoot,
+}
+
 /// One root's walk, reduced to `Item`s, with one held item for the merge to look at.
 struct Side<'a, F: FileSystem> {
     walk: Option<Walk<'a, F>>,
@@ -137,8 +149,8 @@ struct Side<'a, F: FileSystem> {
     pruned: Option<PathBuf>,
     /// The SOURCE side under `Links::Skip`: symlink items are dropped (design 6.3).
     skip_links: bool,
-    /// The DEST side: Flux's own control state is dropped (design 6.4).
-    control_state: bool,
+    /// The DEST side: which of Flux's own control state is dropped (design 6.4).
+    filter: ControlFilter,
 }
 
 impl<'a, F: FileSystem> Side<'a, F> {
@@ -147,7 +159,7 @@ impl<'a, F: FileSystem> Side<'a, F> {
         root: &Path,
         mounts: MountPolicy,
         skip_links: bool,
-        control_state: bool,
+        filter: ControlFilter,
     ) -> Result<Self, FsError> {
         let walk = walk_with(fs, root, WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts })?;
         Ok(Side {
@@ -157,7 +169,7 @@ impl<'a, F: FileSystem> Side<'a, F> {
             done: false,
             pruned: None,
             skip_links,
-            control_state,
+            filter,
         })
     }
 
@@ -170,7 +182,7 @@ impl<'a, F: FileSystem> Side<'a, F> {
             done: true,
             pruned: None,
             skip_links: false,
-            control_state: false,
+            filter: ControlFilter::None,
         }
     }
 
@@ -196,9 +208,18 @@ impl<'a, F: FileSystem> Side<'a, F> {
         }
     }
 
-    /// Whether `item` is Flux's own control state (design 6.4): a top-level `.flux` directory with all it holds, the
-    /// root-level `.flux-root.lock`, and a copy's `<name>.flux-partial.<id>` temporary at any depth.
-    fn is_control_state(item: &Item) -> bool {
+    /// Whether `item` is Flux's own control state under `filter` (design 6.4). `None` drops nothing. `Root` drops a
+    /// top-level `.flux` directory with all it holds, the root-level `.flux-root.lock`, and a copy's
+    /// `<name>.flux-partial.<id>` temporary at any depth. `NestedRoot` drops only that temporary.
+    fn is_control_state(item: &Item, filter: ControlFilter) -> bool {
+        match filter {
+            ControlFilter::None => false,
+            ControlFilter::Root => Self::is_root_control_state(item),
+            ControlFilter::NestedRoot => Self::is_partial_temporary(item),
+        }
+    }
+
+    fn is_root_control_state(item: &Item) -> bool {
         let mut parts = item.path.components();
         let first = parts.next().map(|c| c.as_os_str());
         let single = parts.next().is_none();
@@ -215,6 +236,10 @@ impl<'a, F: FileSystem> Side<'a, F> {
         {
             return true;
         }
+        Self::is_partial_temporary(item)
+    }
+
+    fn is_partial_temporary(item: &Item) -> bool {
         matches!(item.kind, Kind::File | Kind::Symlink)
             && item
                 .path
@@ -259,9 +284,7 @@ impl<'a, F: FileSystem> Side<'a, F> {
                 | Ok(WalkEvent::MountSkipped { .. })
                 | Ok(WalkEvent::MountUnknown { .. }) => continue,
             };
-            if self.under_pruned(&item.path)
-                || (self.control_state && Self::is_control_state(&item))
-            {
+            if self.under_pruned(&item.path) || Self::is_control_state(&item, self.filter) {
                 continue;
             }
             return Some(item);
@@ -371,6 +394,19 @@ pub fn verify_tree_notifying<F: DestinationRoot>(
     on_absent: &mut dyn FnMut(),
     sink: &mut dyn FnMut(Record),
 ) -> Result<Summary, VerifyError> {
+    verify_tree_filtered(fs, src, dst, opts, ControlFilter::Root, on_absent, sink)
+}
+
+/// `verify_tree_notifying` with the destination side's control-state `filter` chosen by the caller.
+pub(crate) fn verify_tree_filtered<F: DestinationRoot>(
+    fs: &F,
+    src: &Path,
+    dst: &Path,
+    opts: &VerifyOptions,
+    filter: ControlFilter,
+    on_absent: &mut dyn FnMut(),
+    sink: &mut dyn FnMut(Record),
+) -> Result<Summary, VerifyError> {
     let mut out = Emitter { summary: Summary::default(), sink };
     let dst_absent = match check_roots(fs, src, dst) {
         Ok(absent) => absent,
@@ -383,14 +419,15 @@ pub fn verify_tree_notifying<F: DestinationRoot>(
         on_absent();
     }
     // The source walk is built first, then the destination's (a test pins the `read_dir` order).
-    let mut a = match Side::new(fs, src, opts.mounts, opts.links == Links::Skip, false) {
-        Ok(a) => a,
-        Err(e) => return Ok(root_unreadable(out, &format!("{SOURCE}{}", e.source), e.code)),
-    };
+    let mut a =
+        match Side::new(fs, src, opts.mounts, opts.links == Links::Skip, ControlFilter::None) {
+            Ok(a) => a,
+            Err(e) => return Ok(root_unreadable(out, &format!("{SOURCE}{}", e.source), e.code)),
+        };
     let mut b = if dst_absent {
         Side::empty()
     } else {
-        match Side::new(fs, dst, opts.mounts, false, true) {
+        match Side::new(fs, dst, opts.mounts, false, filter) {
             Ok(b) => b,
             Err(e) => {
                 return Ok(root_unreadable(out, &format!("{DESTINATION}{}", e.source), e.code));
@@ -1147,6 +1184,42 @@ mod tests {
         assert_eq!((s.missing, s.extra, s.matched), (1, 1, 0));
         assert!(s.failed());
         assert!(!fs.called("open_read("));
+    }
+
+    #[test]
+    fn a_users_dot_flux_inside_a_nested_root_is_compared_and_a_partial_temporary_is_hidden() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        fs.create_dir(Path::new("/d")).unwrap();
+        tree(&fs, "/s/a", &[".flux"], &[(".flux/x", b"x"), (".flux-root.lock", b"l"), ("f", b"f")]);
+        let partial = format!("f.flux-partial.{ZEROS}");
+        tree(
+            &fs,
+            "/d/a",
+            &[".flux"],
+            &[(".flux/x", b"x"), (".flux-root.lock", b"l"), ("f", b"f"), (partial.as_str(), b"p")],
+        );
+        let mut rows = Vec::new();
+        let s = verify_tree_filtered(
+            &fs,
+            Path::new("/s/a"),
+            Path::new("/d/a"),
+            &opts(),
+            ControlFilter::NestedRoot,
+            &mut || {},
+            &mut |r| rows.push(row(&r)),
+        )
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                rec(".flux", Outcome::Match, Kind::Dir),
+                rec(".flux/x", Outcome::Match, Kind::File),
+                rec(".flux-root.lock", Outcome::Match, Kind::File),
+                rec("f", Outcome::Match, Kind::File),
+            ]
+        );
+        assert_eq!((s.matched, s.extra, s.missing), (4, 0, 0));
     }
 
     #[test]
