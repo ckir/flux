@@ -125,7 +125,7 @@ Meaning
 ### 5.2 `--recursive` / `--no-recursive`
 
 `recursive` defaults to true. `--recursive` is an explicit synonym of the default; the two flags together are a usage
-error (clap `conflicts_with`). With `--no-recursive` the walker treats every `Dir` entry as excluded: only the regular
+error (clap `conflicts_with`). With `--no-recursive` the walker skips every `Dir` entry (`Verdict::Skipped`, section 5.3): only the regular
 files, symlinks and other entries directly inside the source root are yielded, no subdirectory is created and none is
 entered, silently (owner ruling). A symlink to a directory is `FileType::Symlink` and copies as a symlink under
 `--links=copy`, never followed. A single-file source ignores both flags. The depth cap is untouched.
@@ -152,7 +152,7 @@ single and several sources. Several sources: the patterns apply to EACH source r
 `recursive: bool`. BOTH carry `#[serde(default)]` (`exclude` defaults to empty, `recursive` through a function to `true`), because `Options` is `deny_unknown_fields`: without the default every pre-cut manifest would fail with a missing field and read as `Corrupt`. `exclude` is `skip_serializing_if` empty and `recursive` `skip_serializing_if` true. `canonical_bytes` appends one `exclude=<pattern>\n`
 line per pattern in sorted order, then `recursive=false\n`, each only when non-default, after the existing lines, so
 every state written before this cut keeps its hash. `validate` compares both and refuses with `INCOMPATIBLE_STATE`
-(exit 3) naming the option. Because a pattern can never contain a control character (section 5.1), a line cannot be forged by one. The 64-pattern / 16 KiB caps keep the manifest well under `STATE_LIMIT` (64 KiB), which nothing checks on write; a manifest the run could write but never read back would be an unresumable run. `decode` recompiles every stored pattern, and one that fails is `Corrupt`. The refusal message shows the stored and requested lists, each joined with a space. A state written with a non-default selection is unreadable by a pre-cut binary (`deny_unknown_fields`); that has precedent in cuts 10a and 10b, and a default-selection state stays byte-identical and readable by one.
+(exit 3) naming the option. Because a pattern can never contain a control character (section 5.1), a line cannot be forged by one. The 64-pattern / 16 KiB caps keep the manifest well under `STATE_LIMIT` (64 KiB), which nothing checks on write; a manifest the run could write but never read back would be an unresumable run. `decode` recompiles every stored pattern, and one that fails is `Corrupt`. `validate` compares `exclude` and then `recursive` after the existing six values, so a run that differs in both reports `exclude` first. The refusal message shows the stored and requested lists, each joined with a space. A state written with a non-default selection is unreadable by a pre-cut binary (`deny_unknown_fields`); that has precedent in cuts 10a and 10b, and a default-selection state stays byte-identical and readable by one.
 
 ### 5.6 `flux verify`
 
@@ -288,5 +288,5 @@ Rounds 1 and 2 (each: a solo Sonnet panel and the agy peer), then one negotiatio
   representation, the meaning under a failed root, count tests. agy round 3 (complete, ALIGNED) found only the same
   `Summary` literal and per-root points as minor.
 - FOLDED (round 4, solo): the count is added in `copy_tree_frames` after `walk_into` returns, with `walk_into` taking `&mut Walk` (`walk_into` drops the walk on every return); `Verdict` tri-state and R11; the `=`/`+=` and both-rules test rows; key-order pins; roots failing before the walk count 0.
-- ROUND 5 (solo): NO LIVE CHALLENGE; folded its minor items (stale `false` wording, a cross-directory sum row, the `:961` cite, pruned-subtree note).
+- ROUND 5 (solo): NO LIVE CHALLENGE; agy final round: FINDINGS-0, ALIGNED (it folded minor wording: `--no-recursive` is `Skipped` not `Excluded` in 5.2, and the validate comparison order); folded its minor items (stale `false` wording, a cross-directory sum row, the `:961` cite, pruned-subtree note).
 - OWNER DECISION (R4): one `excluded` counter (section 5.9).
