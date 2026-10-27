@@ -165,14 +165,11 @@ fn exit_2_for_a_folder_onto_a_file_an_unknown_flag_and_resume() {
     assert!(out.stdout.is_empty(), "{}", stdout(&out));
 
     let dst = d.path().join("dst");
-    for flag in [["--exclude", "x"], ["--resume", ""]] {
-        let mut c = flux();
-        c.arg("verify").arg(&src).arg(&dst);
-        c.args(flag.iter().filter(|s| !s.is_empty()));
-        let out = c.output().unwrap();
-        assert_eq!(out.status.code(), Some(2), "{flag:?}");
-        assert!(out.stdout.is_empty());
-    }
+    let mut c = flux();
+    c.arg("verify").arg(&src).arg(&dst).arg("--resume");
+    let out = c.output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "--resume");
+    assert!(out.stdout.is_empty());
 }
 
 #[test]
@@ -806,4 +803,96 @@ fn a_refused_root_check_and_a_refused_alias_exit_2_with_nothing_on_stdout() {
     );
     assert!(e.contains(&want), "{e}");
     assert!(e.trim_end().ends_with("; nothing was verified"), "{e}");
+}
+
+#[test]
+fn verify_accepts_exclude_and_ignores_excluded_names_on_both_sides() {
+    let d = TempDir::new().unwrap();
+    let (src, dst) = pair_in(d.path());
+    std::fs::write(src.join("only-src.tmp"), b"1").unwrap();
+    std::fs::write(dst.join("only-dst.tmp"), b"2").unwrap();
+    std::fs::write(src.join("sub").join("both.tmp"), b"3").unwrap();
+    std::fs::write(dst.join("sub").join("both.tmp"), b"different").unwrap();
+
+    let out = verify(&[&src, &dst]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+
+    let mut c = flux();
+    c.arg("verify").arg(&src).arg(&dst).args(["--exclude", "*.tmp"]);
+    let out = c.output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{} {}", stdout(&out), stderr(&out));
+    assert!(!stdout(&out).contains(".tmp"), "{}", stdout(&out));
+}
+
+#[test]
+fn verify_no_recursive_checks_only_the_top_level() {
+    let d = TempDir::new().unwrap();
+    let (src, dst) = pair_in(d.path());
+    std::fs::write(dst.join("sub").join("b"), b"changed").unwrap();
+    assert_eq!(verify(&[&src, &dst]).status.code(), Some(1));
+    let out = flux().arg("verify").arg(&src).arg(&dst).arg("--no-recursive").output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{} {}", stdout(&out), stderr(&out));
+}
+
+#[test]
+fn the_summary_json_has_excluded_only_when_non_zero() {
+    let d = TempDir::new().unwrap();
+    let (src, dst) = pair_in(d.path());
+    let out = flux()
+        .arg("verify")
+        .arg(&src)
+        .arg(&dst)
+        .args(["--exclude", "*.tmp", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let last = ndjson(&out).pop().unwrap();
+    let summary = &last["summary"];
+    assert!(summary.get("excluded").is_none(), "{summary}");
+    assert_eq!(keys(summary).len(), SUMMARY_KEYS.len());
+
+    std::fs::write(src.join("x.tmp"), b"1").unwrap();
+    let out = flux()
+        .arg("verify")
+        .arg(&src)
+        .arg(&dst)
+        .args(["--exclude", "*.tmp", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let last = ndjson(&out).pop().unwrap();
+    let summary = &last["summary"];
+    assert!(summary["excluded"].as_u64().unwrap() >= 1, "{summary}");
+    assert_eq!(keys(summary).len(), SUMMARY_KEYS.len() + 1);
+}
+
+#[test]
+fn verify_with_a_bad_pattern_exits_2_with_empty_stdout() {
+    let d = TempDir::new().unwrap();
+    let (src, dst) = pair_in(d.path());
+    for args in [&["--exclude", "a//b"][..], &["--exclude", "a//b", "--json"]] {
+        let out = flux().arg("verify").arg(&src).arg(&dst).args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+        assert!(out.stdout.is_empty(), "{}", stdout(&out));
+        assert!(
+            stderr(&out).contains("error:") && stderr(&out).contains("empty segment"),
+            "{}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
+fn verify_with_sixty_five_patterns_exits_2_not_101() {
+    let d = TempDir::new().unwrap();
+    let (src, dst) = pair_in(d.path());
+    let mut c = flux();
+    c.arg("verify").arg(&src).arg(&dst);
+    for _ in 0..65 {
+        c.args(["--exclude", "a"]);
+    }
+    let out = c.output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(out.stdout.is_empty(), "{}", stdout(&out));
+    assert!(stderr(&out).contains("error:"), "{}", stderr(&out));
 }
