@@ -1,6 +1,6 @@
 # Selection: `--exclude` and `--recursive` / `--no-recursive` (cut 16) - design
 
-Status: DRAFT (panel rounds 1-4 folded), 2026-10-27, branch `feat/exclude` (off main 67a03b8f6d9520e6d0cb5cdce7806bfb4b778620).
+Status: APPROVED (panel closed; rounds 1-4 folded), 2026-10-27, branch `feat/exclude` (off main 67a03b8f6d9520e6d0cb5cdce7806bfb4b778620).
 Owner decisions already taken in conversation (not open): the cut is selection through the shared walker; the `--exclude`
 grammar of section 5.1; `--recursive` is the default and `--no-recursive` copies only the top level; skipped
 subdirectories stay SILENT; ONE `excluded` counter reports what `--exclude` removed (call R4). Every other open call is the author's (section 7), for the owner to override.
@@ -141,6 +141,8 @@ argument time with exit 2; the engine receives `CopyOptions.exclude: Vec<String>
 (`flux-fs`, raw strings and a bool) and compiles once per run. `VerifyOptions` carries the same two fields or a borrowed
 `Selection`; the plan chooses, keeping `Copy` if cheap.
 
+Plan rulings (amending the three paragraphs above). P1: the matcher lives in `flux-fs`, not `flux-core`, because `CopyOptions` lives there; `CopyOptions` and `VerifyOptions` carry ONE compiled `Selection` field instead of raw strings, so the engine has no fallible compile; compilation happens in the CLI (a usage error, exit 2) and in state decode (`Corrupt`). P2: the walker takes the selection through `Walk::set_selection`, not a `WalkOptions` field, which keeps `WalkOptions` `Copy`. P3: `VerifyOptions` loses `Copy`.
+
 ### 5.4 Copy, dry run, resume
 
 All walks start in `prepare_source` (`tree.rs:418`), so passing the selection there covers live, dry and resume runs,
@@ -232,7 +234,7 @@ Verify: an excluded name present at the destination is not `Extra`, and one pres
 subdirectories are not reported and exit stays 0 on a matching top level; a mismatch at the top level still exits 1.
 CLI (`tests/copy.rs`, `tests/verify.rs`): `--exclude=-foo` is accepted and matches a name `-foo` while `--exclude -foo` is refused; `--recursive` alone is accepted; `flux copy file.txt dst --exclude file.txt` still copies the file (R7), as does a file operand among several sources, and `verify_file` ignores the options; `--help` shows `<PATTERN>`, the grammar and the R7 note; the `INCOMPATIBLE_STATE` text names the stored and requested lists; bad pattern exits 2 with the reason and creates NO state and no destination, `--recursive --no-recursive` exits 2,
 `--exclude` works end to end for copy and verify, `--resume` without a prior still refuses as before.
-Mutants the plan must run by hand: drop the filter call; apply it to files and directories but not symlinks; drop the SOURCE-side (not only the destination-side) filter in verify; sort in `Options::of` but not in `canonical_bytes`; validate the pattern in the engine instead of at argument time; omit `#[serde(default)]` on either field; invert `dir_only`; make trailing `**` zero-or-more;
+Mutants the plan must run by hand: drop the filter call; apply it to files and directories but not symlinks; drop the SOURCE-side (not only the destination-side) filter in verify; sort in `Options::of` but not in `canonical_bytes`; move the `selection_of` check below the first state or destination write; omit `#[serde(default)]` on either field; invert `dir_only`; make trailing `**` zero-or-more;
 make `?` a byte; drop `recursive=false` from `canonical_bytes`; drop the destination-side filter in verify.
 
 ## 7. Author's calls (owner may override)
@@ -249,7 +251,7 @@ make `?` a byte; drop `recursive=false` from `canonical_bytes`; drop the destina
   `private/` is therefore created at the destination.
 - R9. Specifying `--hardlinks=preserve` (strict) with an exclusion is not a failure: the spec requires topology only among
   selected members (`:1189-1197`), and a lone selected member is an ordinary copy.
-- R10. A hand-written matcher in `flux-core`, no new dependency (a ~150-line module; the matcher crates were not
+- R10. A hand-written matcher in `flux-fs`, no new dependency (a ~150-line module; the matcher crates were not
   adopted, `Cargo.toml` pin list is a candidate list only).
 
 ## 8. Self-audit (gaps and where they close)

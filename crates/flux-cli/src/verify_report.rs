@@ -27,6 +27,8 @@ pub const GUARANTEES: &str = "What a pass guarantees:
 
 - A mount point the walker did not enter (no `--cross-filesystems`) is reported `match` for its presence only; its contents were NOT compared. The summary's `not_entered` count and the notice line say so, and exit 0 does not mean those contents were verified.
 
+- Entries removed by `--exclude`, and subdirectories left out by `--no-recursive`, are not compared on either side: they are neither reported nor counted as `missing` or `extra`. A directory that was not entered is therefore not only a mount point, and exit 0 does not mean its contents were verified.
+
 - With several sources, only `DEST/<name>` for each source is compared; other entries of DEST are neither reported nor counted.";
 
 /// Append `s` with the backslash, the control characters (U+0000-U+001F, U+007F) escaped.
