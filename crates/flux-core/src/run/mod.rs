@@ -317,13 +317,14 @@ pub(crate) fn tree_with<F: DestinationRoot>(
         CopyOptions { operation_id: OperationId::new(cfg.operation_id.as_str()), ..opts.clone() };
     let mut out = TreeOutcome::default();
     // B1: the source side, then DEST and the identity pre-flight, before anything is created.
-    let source = match prepare_source(fs, src_root, dst_root, MountPolicy::of(&opts)) {
+    let mut source = match prepare_source(fs, src_root, dst_root, MountPolicy::of(&opts)) {
         Ok(s) => s,
         Err(error) => {
             run.copy = Some(Err(TreeAbort { error, outcome: out }));
             return run;
         }
     };
+    source.events.set_selection(&opts.selection);
     let located = match locate_tree(fs, src_root, dst_root, source.identity, opts.safety, &mut out)
     {
         Ok(l) => l,
