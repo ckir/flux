@@ -1216,6 +1216,61 @@ mod tests {
         assert_eq!((s.missing, s.extra), (2, 0));
     }
 
+    #[test]
+    fn an_unlistable_directory_inside_destination_control_state_is_still_ignored() {
+        // `Walk::enter` lists a directory before it yields its `Dir` event (`walk.rs:452`), so a listing fault
+        // on or under `/d/.flux` reaches the merge as a `WalkError`, which the control-state filter must drop
+        // exactly like the directory it names (test-audit gap CA-1).
+        for faulted in [".flux", ".flux/operations"] {
+            let fs = FaultFs::new();
+            tree(&fs, "/s", &["sub"], &[("sub/f", b"x")]);
+            tree(&fs, "/d", &["sub", ".flux", ".flux/operations"], &[("sub/f", b"x")]);
+            fs.fail_read_dir_of(
+                Path::new("/d").join(faulted),
+                Code::PermissionDenied,
+                std::io::ErrorKind::PermissionDenied,
+            );
+            let (rows, s) = run(&fs, "/s", "/d", &opts());
+            assert!(
+                fs.called(&format!("read_dir(/d/{faulted})")),
+                "{faulted}: the fault was not reached"
+            );
+            assert_eq!(
+                rows,
+                vec![
+                    rec("sub", Outcome::Match, Kind::Dir),
+                    rec("sub/f", Outcome::Match, Kind::File)
+                ],
+                "{faulted}"
+            );
+            assert_eq!((s.matched, s.extra, s.unreadable), (2, 0, 0), "{faulted}");
+        }
+    }
+
+    #[test]
+    fn a_directory_named_like_control_state_and_a_source_side_control_name_are_user_data() {
+        // The lock name hides only a top-level FILE and the partial pattern only a file or symlink (6.4); a
+        // directory under either name is user data, and the source walker never filters (test-audit gap AB-2).
+        let fs = FaultFs::new();
+        let a = format!("a.flux-partial.{ZEROS}");
+        let b = format!("b.flux-partial.{ZEROS}");
+        let c = format!("sub/c.flux-partial.{ZEROS}");
+        tree(&fs, "/s", &["sub"], &[(".flux-root.lock", b"s"), (b.as_str(), b"s")]);
+        tree(&fs, "/d", &[".flux-root.lock", a.as_str(), "sub", c.as_str()], &[]);
+        let (rows, s) = run(&fs, "/s", "/d", &opts());
+        assert_eq!(
+            rows,
+            vec![
+                mm(".flux-root.lock", Kind::File, "source file, destination dir"),
+                rec(a.as_str(), Outcome::Extra, Kind::Dir),
+                rec(b.as_str(), Outcome::Missing, Kind::File),
+                rec("sub", Outcome::Match, Kind::Dir),
+                rec(c.as_str(), Outcome::Extra, Kind::Dir),
+            ]
+        );
+        assert_eq!((s.mismatched, s.extra, s.missing, s.matched), (1, 2, 1, 1));
+    }
+
     const REFUSE_A: &str = "the destination is the source or lies inside it; nothing was compared";
     const REFUSE_B: &str = "the source lies inside the destination; nothing was compared";
     const DEGRADED: &str = " (decided by path alone: a root's identity could not be confirmed)";
@@ -1508,6 +1563,95 @@ mod tests {
         let (rows, s) = run(&fs, "/s", "/d", &o);
         assert_eq!(rows, vec![rec("m", Outcome::Missing, Kind::Dir)]);
         assert_eq!(s.not_entered, 0);
+    }
+
+    #[test]
+    fn a_source_file_against_a_destination_mount_point_is_a_mismatch_and_nothing_below_it_is_seen()
+    {
+        let o = VerifyOptions { mounts: MountPolicy::Stay, ..opts() };
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("m", b"m")]);
+        tree(&fs, "/d", &["m"], &[("m/x", b"x")]);
+        fs.set_mount_root("/d/m", MountRoot::Yes);
+        let (rows, s) = run(&fs, "/s", "/d", &o);
+        assert_eq!(rows, vec![mm("m", Kind::File, "source file, destination dir")]);
+        assert_eq!((s.mismatched, s.not_entered, s.extra), (1, 0, 0));
+        assert!(!fs.called("read_dir(/d/m)"));
+    }
+
+    #[test]
+    fn a_pruned_directory_does_not_hide_a_sibling_whose_name_starts_with_the_same_bytes() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &["a", "z"], &[("z/a0", &[2u8; 17])]);
+        fs.set_mount_root("/s/a", MountRoot::Yes);
+        fs.fail_read_dir_of("/s/a", Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+        fs.add_symlink_to("/s/a-b", "t", LinkKind::Unspecified);
+        tree(&fs, "/d", &["z"], &[("z/a0", &[2u8; 17])]);
+        fs.add_symlink_to("/d/a-b", "t", LinkKind::Unspecified);
+        let (rows, s) = run(&fs, "/s", "/d", &opts());
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "a".to_string(),
+                    Outcome::Unreadable,
+                    Kind::Dir,
+                    Some(Code::PermissionDenied),
+                    "permission denied".to_string()
+                ),
+                rec("a-b", Outcome::Match, Kind::Symlink),
+                rec("z", Outcome::Match, Kind::Dir),
+                rec("z/a0", Outcome::Match, Kind::File),
+            ]
+        );
+        assert_eq!((s.matched, s.unreadable, s.bytes_hashed), (3, 1, 34));
+    }
+
+    #[test]
+    fn two_mount_points_not_entered_in_one_run_each_keep_their_own_prune() {
+        let o = VerifyOptions { mounts: MountPolicy::Stay, ..opts() };
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &["a-b", "a0"], &[("a0/a-b", b"")]);
+        fs.set_mount_root("/s/a-b", MountRoot::Yes);
+        fs.set_mount_root("/s/a0", MountRoot::Yes);
+        tree(&fs, "/d", &["a-b", "a0"], &[("a-b/x", b""), ("a0/a-b", b"")]);
+        fs.set_mount_root("/d/a-b", MountRoot::Unknown);
+        let (rows, s) = run(&fs, "/s", "/d", &o);
+        let not_entered = |p: &str| {
+            (p.to_string(), Outcome::Match, Kind::Dir, None, MOUNT_NOT_ENTERED.to_string())
+        };
+        assert_eq!(rows, vec![not_entered("a-b"), not_entered("a0")]);
+        assert_eq!((s.matched, s.not_entered), (2, 2));
+    }
+
+    #[test]
+    fn a_directory_faulted_on_both_sides_reports_the_source_code() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &["b", "b/a-b", "b/a.txt"], &[]);
+        fs.set_mount_root("/s/b/a-b", MountRoot::Yes);
+        fs.fail_read_dir_of("/s/b/a-b", Code::IoError, std::io::ErrorKind::Other);
+        tree(&fs, "/d", &["b", "b/a-b", "b/a.txt"], &[]);
+        fs.fail_read_dir_of(
+            "/d/b/a-b",
+            Code::PermissionDenied,
+            std::io::ErrorKind::PermissionDenied,
+        );
+        let (rows, s) = run(&fs, "/s", "/d", &opts());
+        assert_eq!(
+            rows,
+            vec![
+                rec("b", Outcome::Match, Kind::Dir),
+                (
+                    "b/a-b".to_string(),
+                    Outcome::Unreadable,
+                    Kind::Dir,
+                    Some(Code::IoError),
+                    "other error".to_string()
+                ),
+                rec("b/a.txt", Outcome::Match, Kind::Dir),
+            ]
+        );
+        assert_eq!((s.matched, s.unreadable), (2, 1));
     }
 
     #[test]

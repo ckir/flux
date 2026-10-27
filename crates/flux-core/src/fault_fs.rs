@@ -54,6 +54,8 @@ struct Inner {
     canonical: HashMap<PathBuf, PathBuf>,
     /// directory snapshot path -> the fault `canonical_path` raises on that one directory, every time
     canonical_faults: HashMap<PathBuf, (Code, std::io::ErrorKind)>,
+    /// directory snapshot path -> the fault `read_dir` raises on that one directory, every time
+    read_dir_faults: HashMap<PathBuf, (Code, std::io::ErrorKind)>,
     times: HashMap<PathBuf, Option<SystemTime>>,
     /// path -> a hard-link count a test set; follows the object like `times`. `Some(n)` is `set_link_count`,
     /// `None` is `set_link_count_unknown` (`Metadata::nlink` unavailable). Absent: the DYNAMIC count, the number
@@ -815,7 +817,7 @@ impl Write for FakeHandle {
         if let Some(sink) = &self.sink {
             let mut g = sink.lock().unwrap();
             if let Some((pat, n, kind)) = g.write_nth.clone()
-                && self.path.to_string_lossy().contains(&pat)
+                && self.path.to_string_lossy().replace('\\', "/").contains(&pat)
             {
                 g.writes += 1;
                 if g.writes == n {
@@ -1311,6 +1313,14 @@ impl FaultFs {
             .insert(path.as_ref().to_path_buf(), (code, kind));
     }
 
+    /// Make `read_dir` fail EVERY time on the directory whose snapshot path is `path`, and only there.
+    /// The global `fail`/`fail_kind` fault is consumed by whichever call asks first, so it cannot aim at one
+    /// directory of a walk; this one can. The call is still logged as `read_dir(<path>)`.
+    pub fn fail_read_dir_of(&self, path: impl AsRef<Path>, code: Code, kind: std::io::ErrorKind) {
+        let p = self.norm(path.as_ref());
+        self.inner.lock().unwrap().read_dir_faults.insert(p, (code, kind));
+    }
+
     /// Whether this fake's `rename_no_replace` has an atomic no-replace primitive.
     /// Defaults to `true`; set `false` to make it report the platform's unsupported
     /// error, which is how a caller's behaviour on such a destination is tested
@@ -1788,6 +1798,9 @@ impl FileSystem for FaultFs {
                 Code::IoError,
                 std::io::Error::from(std::io::ErrorKind::NotFound),
             ));
+        }
+        if let Some(&(code, kind)) = g.read_dir_faults.get(&p) {
+            return Err(FsError::new(code, std::io::Error::from(kind)));
         }
         // Immediate children only, from both maps. Unsorted deliberately: the trait
         // says ordering is the caller's job, and a fake that pre-sorted would let a
@@ -2658,6 +2671,23 @@ impl DirHandle for FakeDirHandle {
 mod tests {
     use super::*;
     use flux_fs::FileIdentity;
+
+    #[test]
+    fn fail_read_dir_of_fails_that_directory_only_and_logs_the_call() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.create_dir(Path::new("/d/x")).unwrap();
+        fs.create_dir(Path::new("/d/y")).unwrap();
+        fs.fail_read_dir_of("/d/x", Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+        assert_eq!(fs.read_dir(Path::new("/d")).unwrap().len(), 2);
+        for _ in 0..2 {
+            let e = fs.read_dir(Path::new("/d/x")).unwrap_err();
+            assert_eq!(e.code, Code::PermissionDenied);
+            assert_eq!(e.source.kind(), std::io::ErrorKind::PermissionDenied);
+        }
+        assert!(fs.read_dir(Path::new("/d/y")).is_ok());
+        assert_eq!(fs.calls().iter().filter(|c| *c == "read_dir(/d/x)").count(), 2);
+    }
 
     #[test]
     fn fail_write_nth_fails_exactly_the_nth_write_once() {

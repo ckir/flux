@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b75469094d24ccfca698a412e3a299450a2ac3126ad24bf647a3cbb9b6b78d0c # shrinks to case = Case { base: [(["z"], Dir { mount: No, list_error: None }), (["a-b"], Symlink { payload: "t" }), (["z", "a0"], File { len: 17, fill: 2 })], edits: [KeepBoth, KeepBoth, KeepBoth], extras: [(Source, ["a"], Dir { mount: Yes, list_error: Some(PermissionDenied) })], mounts: Cross, links: Copy }
+cc dc22de09db9a9e5b29d5c840f06e588cb0d2832c64afe172f0c081798f38cfd0 # shrinks to case = Case { base: [(["a0"], Dir { mount: No, list_error: None }), (["a-b"], Dir { mount: Unknown, list_error: None }), (["a0", "a-b"], File { len: 0, fill: 1 })], edits: [ChangeKind(Source, Dir { mount: Yes, list_error: None }), ChangeKind(Source, Dir { mount: Yes, list_error: None }), KeepBoth], extras: [], mounts: Stay, links: Copy }
+cc 834ca5ec24d4b465a2c751b6880568e546df095e93c65276f201dfe09a59e2a3 # shrinks to case = Case { base: [(["b"], Dir { mount: No, list_error: None }), (["b", "a-b"], Dir { mount: No, list_error: Some(PermissionDenied) }), (["b", "a.txt"], Dir { mount: No, list_error: None })], edits: [KeepBoth, ChangeKind(Source, Dir { mount: Yes, list_error: Some(IoError) }), KeepBoth], extras: [], mounts: Cross, links: Copy }
