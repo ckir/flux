@@ -680,6 +680,7 @@ mod tests {
                 (vec!["b"], f(0, b'b')),
                 (vec!["b"], f(1, b'B')),
                 (vec!["l"], link("t")),
+                (vec!["m"], link("u")),
                 (vec!["o"], Spec::Other),
             ],
             edits: vec![
@@ -688,6 +689,7 @@ mod tests {
                 Edit::EditContent(Which::Source),
                 Edit::EditContent(Which::Source),
                 Edit::DropFromDest,
+                Edit::EditContent(Which::Dest),
                 Edit::EditContent(Which::Dest),
                 Edit::EditContent(Which::Source),
             ],
@@ -703,12 +705,14 @@ mod tests {
         let keys = |m: &BTreeMap<PathBuf, Spec>| {
             m.keys().map(|p| p.to_string_lossy().replace('\\', "/")).collect::<Vec<_>>()
         };
-        assert_eq!(keys(&s), ["a", "a/x", "a/x/y", "b", "c", "l", "o"]);
-        assert_eq!(keys(&d), ["a", "b", "l", "o"]);
+        assert_eq!(keys(&s), ["a", "a/x", "a/x/y", "b", "c", "l", "m", "o"]);
+        assert_eq!(keys(&d), ["a", "b", "l", "m", "o"]);
         assert_eq!(s[&PathBuf::from("b")], f(1, b'b')); // EditContent on an empty file: len 1, fill unchanged
         assert_eq!(d[&PathBuf::from("b")], f(0, b'b')); // the dedupe loser's DropFromDest was ignored
         assert_eq!(d[&PathBuf::from("a")], f(1, b'a')); // ChangeKind on dest; a/x, a/x/y, a/z pruned there
         assert_eq!(d[&PathBuf::from("l")], link("u")); // EditContent on a symlink swaps the payload
+        assert_eq!(d[&PathBuf::from("m")], link("t")); // and swaps it back the other way (both generated payloads)
+        assert_eq!(s[&PathBuf::from("m")], link("u")); // the unedited side keeps its payload
         assert_eq!(s[&PathBuf::from("o")], Spec::Other); // EditContent is a no-op on Other
         assert_eq!(s[&Path::new("a").join("x").join("y")], f(1, b'z')); // EditContent on a non-empty file: fill + 1, len kept
         assert_eq!(s[&PathBuf::from("b")].clone(), f(1, b'b')); // the extra at an existing path was dropped

@@ -1216,6 +1216,61 @@ mod tests {
         assert_eq!((s.missing, s.extra), (2, 0));
     }
 
+    #[test]
+    fn an_unlistable_directory_inside_destination_control_state_is_still_ignored() {
+        // `Walk::enter` lists a directory before it yields its `Dir` event (`walk.rs:452`), so a listing fault
+        // on or under `/d/.flux` reaches the merge as a `WalkError`, which the control-state filter must drop
+        // exactly like the directory it names (test-audit gap CA-1).
+        for faulted in [".flux", ".flux/operations"] {
+            let fs = FaultFs::new();
+            tree(&fs, "/s", &["sub"], &[("sub/f", b"x")]);
+            tree(&fs, "/d", &["sub", ".flux", ".flux/operations"], &[("sub/f", b"x")]);
+            fs.fail_read_dir_of(
+                Path::new("/d").join(faulted),
+                Code::PermissionDenied,
+                std::io::ErrorKind::PermissionDenied,
+            );
+            let (rows, s) = run(&fs, "/s", "/d", &opts());
+            assert!(
+                fs.called(&format!("read_dir(/d/{faulted})")),
+                "{faulted}: the fault was not reached"
+            );
+            assert_eq!(
+                rows,
+                vec![
+                    rec("sub", Outcome::Match, Kind::Dir),
+                    rec("sub/f", Outcome::Match, Kind::File)
+                ],
+                "{faulted}"
+            );
+            assert_eq!((s.matched, s.extra, s.unreadable), (2, 0, 0), "{faulted}");
+        }
+    }
+
+    #[test]
+    fn a_directory_named_like_control_state_and_a_source_side_control_name_are_user_data() {
+        // The lock name hides only a top-level FILE and the partial pattern only a file or symlink (6.4); a
+        // directory under either name is user data, and the source walker never filters (test-audit gap AB-2).
+        let fs = FaultFs::new();
+        let a = format!("a.flux-partial.{ZEROS}");
+        let b = format!("b.flux-partial.{ZEROS}");
+        let c = format!("sub/c.flux-partial.{ZEROS}");
+        tree(&fs, "/s", &["sub"], &[(".flux-root.lock", b"s"), (b.as_str(), b"s")]);
+        tree(&fs, "/d", &[".flux-root.lock", a.as_str(), "sub", c.as_str()], &[]);
+        let (rows, s) = run(&fs, "/s", "/d", &opts());
+        assert_eq!(
+            rows,
+            vec![
+                mm(".flux-root.lock", Kind::File, "source file, destination dir"),
+                rec(a.as_str(), Outcome::Extra, Kind::Dir),
+                rec(b.as_str(), Outcome::Missing, Kind::File),
+                rec("sub", Outcome::Match, Kind::Dir),
+                rec(c.as_str(), Outcome::Extra, Kind::Dir),
+            ]
+        );
+        assert_eq!((s.mismatched, s.extra, s.missing, s.matched), (1, 2, 1, 1));
+    }
+
     const REFUSE_A: &str = "the destination is the source or lies inside it; nothing was compared";
     const REFUSE_B: &str = "the source lies inside the destination; nothing was compared";
     const DEGRADED: &str = " (decided by path alone: a root's identity could not be confirmed)";
