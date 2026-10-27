@@ -51,7 +51,7 @@ pub(crate) struct MultiPlace<'p, F: DestinationRoot> {
     pub(crate) lock_dir: &'p OnceCell<F::Dir>,
     pub(crate) capability: LockCapability,
     pub(crate) prefix_id: PrefixIdOwned,
-    /// A `RefCell` so that `Place::remove`, which takes `&self`, can release the locks (the trait does not change).
+    /// A `RefCell` so that `Place::remove`, which takes `&self`, can release the locks (the trait does not change). Released for this run's own id only.
     pub(crate) prefix: RefCell<Option<PrefixLocks<'p, F::Dir>>>,
 }
 
@@ -298,6 +298,10 @@ impl<F: DestinationRoot> Place<F::Dir> for MultiPlace<'_, F> {
     }
 
     fn remove(&self, id: &str) -> Result<(), (PathBuf, FsError)> {
+        // A prior's workspace (a supersede) is retired without touching this run's locks.
+        if id != self.prefix_id.operation_id {
+            return self.tree.remove(id);
+        }
         // The prefix locks go before the workspace is retired (spec 3.4). A lock that would not release is reported
         // after the workspace has been dealt with, and does not stop it.
         let released = release_cell(&self.prefix);
@@ -440,12 +444,9 @@ pub fn trees<F: DestinationRoot>(
     // A one-root manifest would be format 4 with a `kind`, which the validator rejects: the caller routes one source
     // to `tree` or `file`.
     debug_assert!(!cfg.dry_run, "a dry run of several sources is not supported");
-    // `MultiPlace::remove` releases this run's prefix locks whatever operation id it is given, and a supersede or an
-    // adoption removes a prior's: neither is supported with several sources.
-    debug_assert!(
-        !cfg.restart && !cfg.resume,
-        "several sources support neither --restart nor --resume"
-    );
+    // Adoption (`--resume`) is the unsupported case: `MultiPlace::remove` releases the prefix locks only for this
+    // run's own id, so a supersede (`--restart`) removing a prior's workspace leaves them held.
+    debug_assert!(!cfg.resume, "several sources do not support --resume");
     debug_assert!(specs.len() >= 2, "one source is `tree` or `file`");
     let mut run = Run {
         copy: None,
@@ -770,6 +771,38 @@ mod tests {
         assert_eq!(lock_files(&fx.fs).len(), 2, "both locks are held while the run lives");
         assert!(p.release_prefix_locks().is_empty());
         assert!(lock_files(&fx.fs).is_empty());
+    }
+
+    #[test]
+    fn remove_of_a_prior_keeps_this_runs_prefix_locks() {
+        let fx = fx();
+        let mut p = place(&fx, vec![root("data", RootKind::Tree)]);
+        let mut warnings = Vec::new();
+        p.create(&state(), &mut warnings).unwrap();
+        let prior = "22222222222222222222222222222222";
+        fx.fs.create_dir(Path::new(&format!("/p/dest/.flux/operations/{prior}"))).unwrap();
+        p.remove(prior).unwrap();
+        assert!(
+            !fx.fs.exists(format!("/p/dest/.flux/operations/{prior}")),
+            "the prior's workspace is retired"
+        );
+        assert_eq!(
+            lock_files(&fx.fs),
+            vec!["/p/dest/data.flux-lock".to_string()],
+            "this run's prefix lock is still held"
+        );
+        assert!(p.prefix.borrow().is_some());
+    }
+
+    #[test]
+    fn remove_of_this_run_releases_its_prefix_locks() {
+        let fx = fx();
+        let mut p = place(&fx, vec![root("data", RootKind::Tree)]);
+        let mut warnings = Vec::new();
+        p.create(&state(), &mut warnings).unwrap();
+        p.remove(ID).unwrap();
+        assert!(lock_files(&fx.fs).is_empty(), "{:?}", lock_files(&fx.fs));
+        assert!(p.prefix.borrow().is_none());
     }
 
     #[test]
