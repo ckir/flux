@@ -85,25 +85,25 @@
    "stable": false
   },
   "windows/large/robocopy": {
-   "calibrated": "2026-10-27T02:39:46Z",
-   "cv": 0.0784,
+   "calibrated": "2026-10-27T19:43:49Z",
+   "cv": 0.0446,
    "image": "20261021.278.1",
    "source": "calibration",
    "stable": false
   },
   "windows/mixed/robocopy": {
-   "calibrated": "2026-10-27T02:39:46Z",
-   "cv": 0.0597,
+   "calibrated": "2026-10-27T19:43:49Z",
+   "cv": 0.0297,
    "image": "20261021.278.1",
    "source": "calibration",
-   "stable": false
+   "stable": true
   },
   "windows/small/robocopy": {
-   "calibrated": "2026-10-27T02:39:46Z",
-   "cv": 0.0312,
+   "calibrated": "2026-10-27T19:43:49Z",
+   "cv": 0.0277,
    "image": "20261021.278.1",
    "source": "calibration",
-   "stable": false
+   "stable": true
   }
  },
  "schema": 1
