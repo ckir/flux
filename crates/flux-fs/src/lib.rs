@@ -22,6 +22,7 @@ pub mod fs;
 pub mod hardlinks;
 pub mod lock;
 pub mod name;
+pub mod select;
 
 pub use claims::{
     ClaimKey, ClaimOutcome, ClaimRecord, ClaimStatus, ClaimStore, FluxPathKey, PreparedRecord,
@@ -34,3 +35,7 @@ pub use fs::{
 pub use hardlinks::{HardlinkEntry, HardlinkIndex, encode_object};
 pub use lock::{LockCapability, LockFile};
 pub use name::check_component;
+pub use select::{
+    MAX_PATTERN_BYTES, MAX_PATTERN_SEGMENTS, MAX_PATTERNS, MAX_TOTAL_PATTERN_BYTES, Pattern,
+    SelectError, Selection, Verdict,
+};
