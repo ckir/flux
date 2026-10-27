@@ -135,6 +135,9 @@ pub fn summary_line(s: &Summary) -> String {
     if s.not_entered > 0 {
         line.push_str(&format!("; {} mount points not entered", s.not_entered));
     }
+    if s.excluded > 0 {
+        line.push_str(&format!("; {} excluded", s.excluded));
+    }
     line
 }
 
@@ -153,8 +156,14 @@ struct SummaryBody {
     extra: u64,
     unreadable: u64,
     not_entered: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    excluded: u64,
     bytes_hashed: u64,
     exit: u8,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 #[derive(Serialize)]
@@ -192,6 +201,7 @@ pub fn summary_json(
             extra: s.extra,
             unreadable: s.unreadable,
             not_entered: s.not_entered,
+            excluded: s.excluded,
             bytes_hashed: s.bytes_hashed,
             exit,
         },
@@ -343,6 +353,7 @@ mod tests {
             extra: 4,
             unreadable: 5,
             not_entered: 6,
+            excluded: 0,
             bytes_hashed: 7,
         };
         let text = summary_json(Sources::One(Path::new("/s")), Path::new("/d"), "blake3", &s, 1);
@@ -469,6 +480,38 @@ mod tests {
         assert_eq!(
             summary_line(&s),
             "verified: 3 matched, 1 missing, 0 mismatched, 0 extra, 0 unreadable; 9 bytes hashed; 2 mount points not entered"
+        );
+    }
+
+    #[test]
+    fn the_summary_json_has_excluded_only_when_non_zero_between_not_entered_and_bytes_hashed() {
+        let mut s = Summary { matched: 1, not_entered: 2, bytes_hashed: 7, ..Summary::default() };
+        let text = summary_json(Sources::One(Path::new("/s")), Path::new("/d"), "blake3", &s, 0);
+        assert!(!text.contains("\"excluded\""), "{text}");
+        s.excluded = 4;
+        let text = summary_json(Sources::One(Path::new("/s")), Path::new("/d"), "blake3", &s, 0);
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["summary"]["excluded"], 4);
+        let at = |k: &str| text.find(&format!("\"{k}\":")).unwrap();
+        assert!(
+            at("not_entered") < at("excluded") && at("excluded") < at("bytes_hashed"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_summary_line_has_the_excluded_clause_after_the_mount_clause() {
+        let mut s = Summary { matched: 3, bytes_hashed: 9, ..Summary::default() };
+        assert!(!summary_line(&s).contains("excluded"));
+        s.excluded = 5;
+        assert_eq!(
+            summary_line(&s),
+            "verified: 3 matched, 0 missing, 0 mismatched, 0 extra, 0 unreadable; 9 bytes hashed; 5 excluded"
+        );
+        s.not_entered = 2;
+        assert_eq!(
+            summary_line(&s),
+            "verified: 3 matched, 0 missing, 0 mismatched, 0 extra, 0 unreadable; 9 bytes hashed; 2 mount points not entered; 5 excluded"
         );
     }
 

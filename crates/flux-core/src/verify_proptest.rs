@@ -657,7 +657,7 @@ fn fixture_snippet(case: &Case) -> String {
     }
     let _ = writeln!(
         out,
-        "let o = VerifyOptions {{ links: Links::{:?}, mounts: MountPolicy::{:?}, hash: HashAlgorithm::Blake3 }};",
+        "let o = VerifyOptions {{ links: Links::{:?}, mounts: MountPolicy::{:?}, hash: HashAlgorithm::Blake3, selection: Default::default() }};",
         case.links, case.mounts
     );
     out
@@ -900,8 +900,12 @@ mod tests {
         };
         assert_eq!(reference(&case), (vec![], Summary::default()));
         let (fs, _) = materialise(&case);
-        let opts =
-            VerifyOptions { links: case.links, mounts: case.mounts, hash: HashAlgorithm::Blake3 };
+        let opts = VerifyOptions {
+            links: case.links,
+            mounts: case.mounts,
+            hash: HashAlgorithm::Blake3,
+            selection: Default::default(),
+        };
         let mut records = Vec::new();
         let summary =
             verify_tree(&fs, Path::new("/s"), Path::new("/d"), &opts, &mut |r| records.push(r))
@@ -935,7 +939,7 @@ mod tests {
             "fs.add_special(\"/s/o\");",
             "fs.set_mount_root(\"/s/d\", MountRoot::Yes);",
             "fs.fail_read_dir_of(\"/s/d\", Code::IoError, std::io::ErrorKind::Other);",
-            "let o = VerifyOptions { links: Links::Skip, mounts: MountPolicy::Stay, hash: HashAlgorithm::Blake3 };",
+            "let o = VerifyOptions { links: Links::Skip, mounts: MountPolicy::Stay, hash: HashAlgorithm::Blake3, selection: Default::default() };",
         ] {
             assert!(text.contains(want), "missing {want:?} in:\n{text}");
         }
@@ -971,6 +975,7 @@ mod tests {
                 links: case.links,
                 mounts: case.mounts,
                 hash: HashAlgorithm::Blake3,
+                selection: Default::default(),
             };
             let mut rows = Vec::new();
             verify_tree(&fs, Path::new("/s"), Path::new("/d"), &opts, &mut |r| rows.push(row(&r)))
@@ -1310,6 +1315,7 @@ mod tests {
                 links: case.links,
                 mounts: case.mounts,
                 hash: HashAlgorithm::Blake3,
+                selection: Default::default(),
             };
             let mut rows = Vec::new();
             let result =

@@ -746,6 +746,7 @@ fn verify_options(args: &VerifyArgs) -> flux_core::verify::VerifyOptions {
         hash: match args.hash {
             HashArg::Blake3 => flux_fs::HashAlgorithm::Blake3,
         },
+        selection: Default::default(),
     }
 }
 
