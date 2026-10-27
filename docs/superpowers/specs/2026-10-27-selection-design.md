@@ -181,7 +181,7 @@ Each test is pinned by a named case; the plan assigns the exact names. Matcher (
 - `/foo` vs `foo` YES, `a/foo` NO; `foo` vs `a/b/foo` YES.
 - `docs/**/notes.txt`: `docs/notes.txt` YES, `docs/2026/10/notes.txt` YES; `build/*` vs `build/x/y` NO.
 - `**` alone: every entry YES; `**/foo`: `foo` YES, `a/foo` YES.
-- `?`: `caf?` vs `café` YES (one scalar), `caf??` vs `café` NO; a 3-byte (`€`) and a 4-byte (emoji) scalar each match ONE `?`; `caf?` vs the non-UTF-8 name `caf\xff` YES and `??` vs the invalid pair `\xe2\x82` YES (byte mode); a name invalid anywhere is matched in byte mode as a whole.
+- `?`: `fil?` vs `filé` YES (one scalar), `fil??` vs `filé` NO; a 3-byte (`€`) and a 4-byte (emoji) scalar each match ONE `?`; `fil?` vs the non-UTF-8 name `fil\xff` YES and `??` vs the invalid pair `\xe2\x82` YES (byte mode); a name invalid anywhere is matched in byte mode as a whole.
 - Case: `README` vs `readme` NO, and `É` vs `é` NO (no Unicode folding).
 - Rejected at compile: `""`, `/`, `a//b`, `..`, `a/../b`, `./a`, `a\b`, `a!b`, `[a]`, `a**`, `***`, `**/**`, `**a`, `a*b**`, a pattern with a newline, a tab, U+0085 or NUL, a 1025-byte pattern, a 65-segment pattern, 65 patterns, 16 KiB + 1 of pattern bytes, and a pathological `a*a*a*...*b` pattern that
   still completes within a bounded step count (linearity).
