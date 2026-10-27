@@ -65,6 +65,7 @@ fn opts() -> CopyOptions {
         cross_filesystems: false,
         verify: flux_fs::VerifyLevel::None,
         hash: flux_fs::HashAlgorithm::Blake3,
+        selection: flux_fs::Selection::default(),
     }
 }
 
@@ -11018,4 +11019,229 @@ fn hardlink_pair_verifies_the_anchor_once() {
             "{mode:?}"
         );
     }
+}
+
+// ---- Cut 16 Task 3b: the copy path selects through the walker and counts what it excluded ----
+
+/// `opts()` with `--exclude patterns` and the recursion flag.
+fn selecting(patterns: &[&str], recursive: bool) -> CopyOptions {
+    let typed: Vec<String> = patterns.iter().map(|p| (*p).to_string()).collect();
+    CopyOptions { selection: flux_fs::Selection::compile(&typed, recursive).unwrap(), ..opts() }
+}
+
+/// `/src` holding `files` (their parent directories made), and `/p`.
+fn tree_of(files: &[&str]) -> FaultFs {
+    let fs = FaultFs::new();
+    for d in ["/src", "/p"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    for f in files {
+        let path = format!("/src/{f}");
+        let mut at = "/src".to_string();
+        let parts: Vec<&str> = f.split('/').collect();
+        for part in &parts[..parts.len() - 1] {
+            at.push_str(&format!("/{part}"));
+            if !fs.exists(&at) {
+                fs.create_dir(Path::new(&at)).unwrap();
+            }
+        }
+        fs.write_file(path, b"x");
+    }
+    fs
+}
+
+fn select_run(
+    fs: &FaultFs,
+    o: &CopyOptions,
+    c: &RunConfig,
+) -> (Run<Result<TreeOutcome, TreeAbort>>, Vec<TreeFailure>) {
+    run_tree_with(fs, c, o)
+}
+
+#[test]
+fn excluded_entries_are_absent_from_the_destination_and_counted() {
+    let fs = tree_of(&["a", "b.tmp", "sub/c.tmp", "sub/d"]);
+    let (r, got) = select_run(&fs, &selecting(&["*.tmp"], true), &cfg());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert!(fs.exists("/p/dest/a") && fs.exists("/p/dest/sub/d"));
+    assert!(!fs.exists("/p/dest/b.tmp") && !fs.exists("/p/dest/sub/c.tmp"));
+    assert_eq!(out.excluded, 2);
+    assert_eq!(out.files_total, 2);
+}
+
+#[test]
+fn a_pruned_directory_counts_one_whatever_its_subtree() {
+    let fs = tree_of(&["keep", "junk/x", "junk/y", "junk/deeper/z"]);
+    let (r, got) = select_run(&fs, &selecting(&["junk/"], true), &cfg());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(out.excluded, 1);
+    assert_eq!(out.files_total, 1);
+    assert!(fs.exists("/p/dest/keep"));
+    assert!(!fs.exists("/p/dest/junk"));
+}
+
+#[test]
+fn exclude_double_star_counts_the_top_level_entries_and_copies_nothing() {
+    let fs = tree_of(&["a", "b", "sub/c"]);
+    let (r, got) = select_run(&fs, &selecting(&["**"], true), &cfg());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(out.excluded, 3, "a, b and the directory sub");
+    assert_eq!(out.files_total, 0);
+    assert!(fs.exists("/p/dest"));
+    for name in ["a", "b", "sub", "sub/c"] {
+        assert!(!fs.exists(format!("/p/dest/{name}")), "{name}");
+    }
+}
+
+#[test]
+fn private_star_star_creates_the_empty_directory() {
+    let fs = tree_of(&["private/x", "private/y", "z"]);
+    let (r, got) = select_run(&fs, &selecting(&["private/**"], true), &cfg());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    // DEST and `private`.
+    assert_eq!(out.directories_created, 2);
+    assert!(fs.exists("/p/dest/private") && fs.exists("/p/dest/z"));
+    assert!(!fs.exists("/p/dest/private/x") && !fs.exists("/p/dest/private/y"));
+    assert_eq!(out.excluded, 2);
+}
+
+fn hardlink_pair(excluding: &[&str]) -> (Run<Result<TreeOutcome, TreeAbort>>, Vec<TreeFailure>) {
+    let fs = tree_of(&["a1"]);
+    link_names(&fs, "/src", "a1", &["a2"]);
+    let o = CopyOptions { hardlinks: flux_fs::Hardlinks::Preserve, ..selecting(excluding, true) };
+    let r = select_run(&fs, &o, &cfg());
+    for (name, present) in [("a1", !excluding.contains(&"a1")), ("a2", !excluding.contains(&"a2"))]
+    {
+        assert_eq!(fs.exists(format!("/p/dest/{name}")), present, "{name}");
+    }
+    r
+}
+
+#[test]
+fn a_hardlink_group_with_its_first_member_excluded_copies_the_other_normally() {
+    let (r, got) = hardlink_pair(&["a1"]);
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!((out.files_copied, out.files_hardlinked, out.hardlinks_degraded), (1, 0, 0));
+    assert_eq!(out.excluded, 1);
+    // The mirror: the last member excluded.
+    let (r, got) = hardlink_pair(&["a2"]);
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!((out.files_copied, out.files_hardlinked, out.hardlinks_degraded), (1, 0, 0));
+    assert_eq!(out.excluded, 1);
+    // Two selected members still link.
+    let (r, got) = hardlink_pair(&[]);
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!((out.files_copied, out.files_hardlinked), (1, 1), "one copy and one link");
+    assert_eq!(out.excluded, 0);
+}
+
+#[test]
+fn the_count_survives_an_abort_mid_walk() {
+    // `0.tmp` sorts before everything and is excluded; the first heartbeat after it fails, as in
+    // `a_tree_stops_at_a_failed_heartbeat_and_records_failed`.
+    let fs = fake();
+    fs.write_file("/src/0.tmp", b"T");
+    fail_heartbeat(&fs, 2, LOCK, false);
+    let (r, got) = select_run(&fs, &selecting(&["*.tmp"], true), &beating());
+    let a = aborted(&r);
+    assert_eq!((a.error.step, a.error.code()), (CopyStep::Heartbeat, Code::IoError));
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(a.outcome.excluded, 1);
+}
+
+#[test]
+fn dry_run_live_and_resume_report_the_same_nonzero_count() {
+    let o = selecting(&["*.tmp"], true);
+    let build = || {
+        let fs = fake_src(100);
+        fs.write_file("/src/x.tmp", b"T");
+        fs.write_file("/src/sub/y.tmp", b"T");
+        fs
+    };
+    let fs = build();
+    let (r, _) = select_run(&fs, &o, &cfg());
+    assert_eq!(ok(&r).excluded, 2, "live");
+    let fs = build();
+    let (r, _) = select_run(&fs, &o, &dry());
+    assert_eq!(ok(&r).excluded, 2, "dry");
+    // Resume: `a` is already complete and passes the filter, and must not add to the count.
+    let fs = build();
+    prior3_with(&fs, 5, OpState::Transferring, &o);
+    put(&fs, "/p/dest/a", b"o", 101);
+    claimed(&fs, 5, "a", ClaimStatus::Created, "a");
+    let (r, got) = select_run(&fs, &o, &resume());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(out.files_resumed, 1);
+    assert_eq!(out.excluded, 2, "resume");
+}
+
+#[test]
+fn a_file_operand_is_copied_whatever_the_patterns_say() {
+    let fs = fake();
+    let o = selecting(&["a", "*"], true);
+    let r = file(&fs, Path::new("/src/a"), Path::new("/p/t"), &o, &cfg());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert!(matches!(&r.copy, Some(Ok(_))), "{:?}", r.copy);
+    assert_eq!(fs.read_file("/p/t").as_deref(), Some(&b"A"[..]));
+}
+
+#[test]
+fn the_public_copy_tree_path_filters_too() {
+    let fs = tree_of(&["a", "b.tmp", "sub/c.tmp", "sub/d"]);
+    let mut got = Vec::new();
+    let out = crate::copy_tree(
+        &fs,
+        Path::new("/src"),
+        Path::new("/p/dest"),
+        &selecting(&["*.tmp"], true),
+        &mut |f| got.push(f),
+    )
+    .unwrap();
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!((out.excluded, out.files_total), (2, 2));
+    assert!(fs.exists("/p/dest/a") && fs.exists("/p/dest/sub/d"));
+    assert!(!fs.exists("/p/dest/b.tmp") && !fs.exists("/p/dest/sub/c.tmp"));
+}
+
+#[test]
+fn no_recursive_creates_no_subdirectory_and_counts_zero() {
+    let fs = tree_of(&["a", "sub/b", "sub2/c"]);
+    let (r, got) = select_run(&fs, &selecting(&[], false), &cfg());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(out.excluded, 0);
+    assert_eq!(out.directories_created, 1, "DEST only");
+    assert!(fs.exists("/p/dest/a"));
+    assert!(!fs.exists("/p/dest/sub") && !fs.exists("/p/dest/sub2"));
+}
+
+#[test]
+fn no_recursive_with_a_pattern_counts_only_the_pattern_removals() {
+    let fs = tree_of(&["a", "b.tmp", "sub/c.tmp", "sub/d"]);
+    let (r, got) = select_run(&fs, &selecting(&["*.tmp"], false), &cfg());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(
+        out.excluded, 1,
+        "b.tmp only: `sub` is skipped, never entered, so c.tmp is not reached"
+    );
+    assert!(fs.exists("/p/dest/a") && !fs.exists("/p/dest/sub"));
+}
+
+#[test]
+fn a_directory_removed_by_both_counts_once() {
+    let fs = tree_of(&["a", "sub/b"]);
+    let (r, got) = select_run(&fs, &selecting(&["sub/"], false), &cfg());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(out.excluded, 1);
+    assert!(!fs.exists("/p/dest/sub"));
 }

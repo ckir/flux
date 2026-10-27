@@ -64,6 +64,8 @@ pub struct TreeOutcome {
     /// Cut 10b: source mount roots created as empty directories and not descended into (section 42). Not failures; the
     /// CLI reports them as `mounts_skipped`, apart from `files_skipped`.
     pub mounts_skipped: u64,
+    /// Cut 16: entries the `--exclude` patterns removed; `--no-recursive` removals are not counted.
+    pub excluded: u64,
     /// Part M: pre-existing destination directories whose mount-root query could not tell, merged into under
     /// `Safety::Default`. The example is relative to the source root, as `warnings` are.
     pub mount_unknown: Option<DegradedGroup>,
@@ -627,7 +629,8 @@ fn run_tree<F: DestinationRoot>(
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<(), CopyError> {
-    let source = prepare_source(fs, src_root, dst_root, MountPolicy::of(opts))?;
+    let mut source = prepare_source(fs, src_root, dst_root, MountPolicy::of(opts))?;
+    source.events.set_selection(&opts.selection);
 
     // 3-5. Resolve the destination, compare it with the source, create the root.
     let resolve = |e| CopyError::at(CopyStep::Resolve, e);
@@ -949,7 +952,7 @@ impl RootIdentity {
 /// frame is `fresh` and holds no handle). The root handle is handed back as it came.
 pub(crate) fn copy_tree_frames<F: DestinationRoot>(
     cx: &Shared<'_, F>,
-    events: Walk<'_, F>,
+    mut events: Walk<'_, F>,
     root: Option<F::Dir>,
     root_identity: RootIdentity,
     root_created: bool,
@@ -968,7 +971,9 @@ pub(crate) fn copy_tree_frames<F: DestinationRoot>(
         fresh: state.fresh,
         batch: Batch::default(),
     }];
-    let walked = walk_into(cx, events, root_identity, &mut stack, out, on_report);
+    let walked = walk_into(cx, &mut events, root_identity, &mut stack, out, on_report);
+    // Cut 16 (section 5.9): counted here, before the drain, so every exit path of the walk carries it.
+    out.excluded += events.excluded();
     // Cut 9d, spec decision 5(e): every live frame's batch is flushed whatever the walk returned; the walk's own error
     // wins over a stop of the drain.
     let mode = drain_mode(&walked);
@@ -1042,7 +1047,7 @@ fn drain_mode(walked: &std::result::Result<(), CopyError>) -> DrainMode {
 /// `copy_tree_at`'s loop. Every `?` here is an abort.
 fn walk_into<F: DestinationRoot>(
     cx: &Shared<'_, F>,
-    events: Walk<'_, F>,
+    events: &mut Walk<'_, F>,
     root_identity: RootIdentity,
     stack: &mut Vec<Frame<F::Dir>>,
     out: &mut TreeOutcome,
@@ -4531,6 +4536,7 @@ mod tests {
             cross_filesystems: false,
             verify: flux_fs::VerifyLevel::None,
             hash: flux_fs::HashAlgorithm::Blake3,
+            selection: flux_fs::Selection::default(),
         }
     }
 

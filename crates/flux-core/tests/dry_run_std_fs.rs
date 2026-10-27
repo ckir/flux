@@ -36,6 +36,7 @@ fn opts(existing: ExistingPolicy, links: Links, safety: Safety) -> CopyOptions {
         cross_filesystems: false,
         verify: flux_fs::VerifyLevel::None,
         hash: flux_fs::HashAlgorithm::Blake3,
+        selection: flux_fs::Selection::default(),
     }
 }
 

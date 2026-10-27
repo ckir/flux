@@ -1211,7 +1211,20 @@ item was, not only in a commit message.
 ## Cut 14 open (flux verify; spec `docs/superpowers/specs/2026-10-26-verify-command-design.md`)
 
 - [ ] **A stderr advisory for DEST's top-level entries that belong to no root of a several-source verify** (design 2026-10-27 section 5: option O3 was rejected as records; an advisory line is the candidate).
-- [ ] **`--exclude` and `--recursive` through the shared walker** when phase 3 selection lands. Today both are usage
-      errors (exit 2).
+- [x] **`--exclude` and `--recursive` through the shared walker** (cut 16): shipped on branch `feat/exclude` (design `docs/superpowers/specs/2026-10-27-selection-design.md`).
+
+## Cut 16 open (selection; spec `docs/superpowers/specs/2026-10-27-selection-design.md`)
+
+- [ ] **A per-entry `EXCLUDE` record or listing** of what `--exclude` removed (today only the `excluded` count is reported).
+- [ ] **`--exclude-from FILE`**: read patterns from a file.
+- [ ] **Negation and character classes** in `--exclude` patterns (`!`, `[ ]` and `\` are reserved and rejected today).
+- [ ] **`--exclude-ignore-case`**: case-insensitive matching (matching is case-sensitive today).
+- [ ] **`--max-depth`**: limit descent to N levels (`--no-recursive` is the only bound today).
+- [ ] **A per-pattern or per-entry selection summary in the `--json` report** (today one `excluded` total).
+- [ ] **`--exclude` matching of a file operand** (R7): a file source is not filtered today.
+- [ ] **Selection::select decodes every path component per entry** (crates/flux-fs/src/select.rs, `select_with`): decode only `file_name()` when no pattern is anchored (precompute at compile), and skip decoding when every pattern is dir-only and the entry is not a Dir; measure a 1M-entry `--dry-run` with and without `--exclude '*.tmp'` first (timing needs the owner's OK and an idle machine).
+- [ ] **select.rs `invalid_patterns_are_refused_with_a_reason`**: assert the SelectError variant per row, not only is_err.
+- [ ] **select.rs: 17 copies of one 1024-byte pattern must be refused** (the byte cap is applied before dedup, pin it).
+- [ ] **A selection on a single-file source still enters the resume fingerprint** (a --resume without the flag is refused with exit 3 although the flag had no effect on a file operand; consistent with cross_filesystems): document it in --help or relax the fingerprint for file roots.
 - [ ] **Windows reparse points and junctions** as `Other` or `Symlink` in verify are CI evidence only; no local
       Windows run has shown how the walker classifies them.

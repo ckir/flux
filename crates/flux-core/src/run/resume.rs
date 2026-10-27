@@ -27,12 +27,17 @@ fn incompatible(detail: String) -> RunError {
     refused(LockCode::IncompatibleState, detail)
 }
 
+/// The display form of a recorded pattern list: space-joined, or `(none)` for an empty list.
+fn exclude_display(patterns: &[String]) -> String {
+    if patterns.is_empty() { "(none)".to_string() } else { patterns.join(" ") }
+}
+
 /// A stored `native_hex` path as the message shows it: decoded, or the hex itself when it does not decode.
 fn shown(hex: &str) -> String {
     from_native_hex(hex).map_or_else(|| hex.to_string(), |p| p.display().to_string())
 }
 
-/// The spec's Compatibility table, in this order: format, fingerprint, roots, the four exact-match options,
+/// The spec's Compatibility table, in this order: format, fingerprint, roots, the eight exact-match options,
 /// durability. `Ok` is the `Config` the adopted manifest will carry (the stored one, `durability` set to "strict" on
 /// a normal -> strict resume). Every `Err` is `RunError::Refused { changed: false, not_removed: None }`.
 pub(crate) fn validate(
@@ -104,6 +109,7 @@ pub(crate) fn validate(
     let now = Options::of(opts);
     let then = &stored.options;
     let (then_cf, now_cf) = (then.cross_filesystems.to_string(), now.cross_filesystems.to_string());
+    let (then_rec, now_rec) = (then.recursive.to_string(), now.recursive.to_string());
     for (name, was, asks) in [
         ("preserve_times", &then.preserve_times, &now.preserve_times),
         ("preserve_permissions", &then.preserve_permissions, &now.preserve_permissions),
@@ -117,6 +123,20 @@ pub(crate) fn validate(
                 "{name}: the operation runs with {was}, this run asks {asks}; run again with the same option, or with --restart to supersede it"
             )));
         }
+    }
+    // The lists are compared as lists: a space is a legal pattern character, so joined text would equate
+    // `--exclude 'a b'` with `--exclude a --exclude b`. The joined form is display only.
+    if then.exclude != now.exclude {
+        return Err(incompatible(format!(
+            "exclude: the operation runs with {}, this run asks {}; run again with the same option, or with --restart to supersede it",
+            exclude_display(&then.exclude),
+            exclude_display(&now.exclude)
+        )));
+    }
+    if then.recursive != now.recursive {
+        return Err(incompatible(format!(
+            "recursive: the operation runs with {then_rec}, this run asks {now_rec}; run again with the same option, or with --restart to supersede it"
+        )));
     }
     let mut config = stored.clone();
     if then.durability != now.durability {
@@ -173,6 +193,7 @@ mod tests {
             cross_filesystems: false,
             verify: flux_fs::VerifyLevel::None,
             hash: flux_fs::HashAlgorithm::Blake3,
+            selection: flux_fs::Selection::default(),
         }
     }
 
@@ -391,6 +412,80 @@ mod tests {
         let (r, w) = run(&prior, &roots_now(), &opts());
         assert!(r.is_ok(), "{:?}", r.err());
         assert!(w.is_empty());
+    }
+
+    fn selecting(patterns: &[&str], recursive: bool) -> CopyOptions {
+        let typed: Vec<String> = patterns.iter().map(|s| (*s).to_string()).collect();
+        CopyOptions { selection: flux_fs::Selection::compile(&typed, recursive).unwrap(), ..opts() }
+    }
+
+    fn prior_selecting(patterns: &[&str], recursive: bool) -> PriorOp {
+        prior_options(|o| {
+            o.exclude = patterns.iter().map(|s| (*s).to_string()).collect();
+            o.recursive = recursive;
+        })
+    }
+
+    #[test]
+    fn a_different_exclude_set_is_refused_as_incompatible_state() {
+        let cases = [
+            (prior_selecting(&["a"], true), opts()),
+            (prior_selecting(&[], true), selecting(&["a"], true)),
+            (prior_selecting(&["a"], true), selecting(&["b"], true)),
+        ];
+        for (prior, now) in cases {
+            let (code, detail) = refused(run(&prior, &roots_now(), &now).0);
+            assert_eq!(code, LockCode::IncompatibleState);
+            assert!(detail.starts_with("exclude:"), "{detail}");
+            assert!(detail.contains("--restart"), "{detail}");
+        }
+        let (_, detail) = refused(
+            run(&prior_selecting(&["a", "b"], true), &roots_now(), &selecting(&["c"], true)).0,
+        );
+        assert!(detail.contains("runs with a b, this run asks c"), "{detail}");
+        let (_, detail) =
+            refused(run(&prior_selecting(&[], true), &roots_now(), &selecting(&["a"], true)).0);
+        assert!(detail.contains("runs with (none), this run asks a"), "{detail}");
+        let (_, detail) = refused(run(&prior_selecting(&["a"], true), &roots_now(), &opts()).0);
+        assert!(detail.contains("runs with a, this run asks (none)"), "{detail}");
+    }
+
+    #[test]
+    fn a_different_recursion_mode_is_refused() {
+        let cases = [
+            (prior_selecting(&[], false), opts(), "false", "true"),
+            (prior_selecting(&[], true), selecting(&[], false), "true", "false"),
+        ];
+        for (prior, now, was, asks) in cases {
+            let (code, detail) = refused(run(&prior, &roots_now(), &now).0);
+            assert_eq!(code, LockCode::IncompatibleState);
+            assert!(detail.starts_with("recursive:"), "{detail}");
+            assert!(detail.contains(&format!("runs with {was}, this run asks {asks}")), "{detail}");
+            assert!(detail.contains("--restart"), "{detail}");
+        }
+    }
+
+    #[test]
+    fn a_run_differing_in_both_reports_exclude_first() {
+        let prior = prior_selecting(&["a"], true);
+        let (_, detail) = refused(run(&prior, &roots_now(), &selecting(&["b"], false)).0);
+        assert!(detail.starts_with("exclude:"), "{detail}");
+    }
+
+    #[test]
+    fn the_same_selection_resumes() {
+        let prior = prior_selecting(&["a", "b"], false);
+        let (r, w) = run(&prior, &roots_now(), &selecting(&["b", "a", "b"], false));
+        assert!(r.is_ok(), "{:?}", r.err());
+        assert!(w.is_empty());
+    }
+
+    #[test]
+    fn a_space_in_one_pattern_is_not_two_patterns() {
+        let prior = prior_selecting(&["a b"], true);
+        let (code, detail) = refused(run(&prior, &roots_now(), &selecting(&["a", "b"], true)).0);
+        assert_eq!(code, LockCode::IncompatibleState);
+        assert!(detail.starts_with("exclude:"), "{detail}");
     }
 
     #[test]

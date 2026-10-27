@@ -215,6 +215,8 @@ fn completed_fixture(dst: &Path) -> String {
             existing: "overwrite".to_owned(),
             links: "copy".to_owned(),
             cross_filesystems: false,
+            exclude: Vec::new(),
+            recursive: true,
         },
     );
     let mut state = OperationState::created(&id, Kind::Tree, dst, 5, None, config);

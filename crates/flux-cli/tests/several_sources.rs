@@ -387,3 +387,36 @@ fn a_symlink_at_a_folder_roots_destination_name_exits_3_and_copies_nothing() {
     assert!(control_plane_names(&out_dir).is_empty(), "{:?}", control_plane_names(&out_dir));
     assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0, "nothing went through the link");
 }
+
+#[test]
+fn exclude_applies_to_each_source_root() {
+    let d = TempDir::new().unwrap();
+    let (alpha, beta) = (folder(d.path(), "alpha"), folder(d.path(), "beta"));
+    std::fs::write(alpha.join("x.tmp"), b"1").unwrap();
+    std::fs::write(beta.join("sub").join("y.tmp"), b"2").unwrap();
+    std::fs::write(beta.join("z.tmp"), b"3").unwrap();
+    let file = d.path().join("note.tmp");
+    std::fs::write(&file, b"hello").unwrap();
+    let out_dir = d.path().join("out");
+
+    let out = flux()
+        .arg("copy")
+        .arg(&alpha)
+        .arg(&file)
+        .arg(&beta)
+        .arg(&out_dir)
+        .args(["--exclude", "*.tmp", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let v = json(&out);
+    assert_eq!(v["excluded"].as_u64(), Some(3), "{v}");
+    assert_eq!(std::fs::read(out_dir.join("note.tmp")).unwrap(), b"hello");
+    assert!(
+        out_dir.join("alpha").join("a").is_file()
+            && out_dir.join("beta").join("sub").join("b").is_file()
+    );
+    assert!(!out_dir.join("alpha").join("x.tmp").exists());
+    assert!(!out_dir.join("beta").join("z.tmp").exists());
+    assert!(!out_dir.join("beta").join("sub").join("y.tmp").exists());
+}

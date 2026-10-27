@@ -7,7 +7,7 @@
 //! Flux CLI (spec §3.6): argument parsing and command dispatch. The logic lives in the
 //! `flux_cli` library (`resolve`, `report`, `exit_code`), where it is unit-tested.
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use flux_cli::exit_code;
 use flux_cli::report::{self, Report};
 use flux_cli::resolve::{self, Job, Stop};
@@ -80,6 +80,22 @@ struct VerifyArgs {
     /// Also print each `match` record (the default prints only what is not a match).
     #[arg(long)]
     verbose: bool,
+    /// Leave out every entry whose name or path matches PATTERN (repeatable; matched entries are neither compared nor
+    /// reported, and not entered, on either side, and are counted as `excluded`). A pattern without `/` is matched against each entry's own name at any
+    /// depth (`*.tmp`); with a leading or inner `/` it is anchored and matched against the whole path below the source
+    /// root (`/build`, `docs/*.md`). `*` matches any run of characters within one name, `?` exactly one; a `**` segment
+    /// matches whole path components (`a/**/b`; a trailing `**` matches everything inside). A trailing `/` limits the
+    /// pattern to directories. Matching is case-sensitive. A pattern that starts with `-` is written
+    /// `--exclude=-foo`. The characters `! [ ] \` are reserved and cannot be written: reach a name that has one with
+    /// `?` or `*`. A source that is a file is not filtered, and a source operand itself (file or folder) is never matched; patterns apply below it.
+    #[arg(long, value_name = "PATTERN", action = ArgAction::Append, value_parser = parse_exclude)]
+    exclude: Vec<String>,
+    /// Descend into subdirectories (the default; this flag only says so). Conflicts with --no-recursive.
+    #[arg(long, conflicts_with = "no_recursive")]
+    recursive: bool,
+    /// Take only the top level of each source folder: only the top level of each side is compared; no subdirectory is entered.
+    #[arg(long)]
+    no_recursive: bool,
 }
 
 #[derive(Args)]
@@ -180,6 +196,22 @@ struct CopyArgs {
     /// The hash used by --verify.
     #[arg(long, value_enum, default_value_t = HashArg::Blake3)]
     hash: HashArg,
+    /// Leave out every entry whose name or path matches PATTERN (repeatable; matched entries are neither copied nor
+    /// entered, and are counted as `excluded`). A pattern without `/` is matched against each entry's own name at any
+    /// depth (`*.tmp`); with a leading or inner `/` it is anchored and matched against the whole path below the source
+    /// root (`/build`, `docs/*.md`). `*` matches any run of characters within one name, `?` exactly one; a `**` segment
+    /// matches whole path components (`a/**/b`; a trailing `**` matches everything inside). A trailing `/` limits the
+    /// pattern to directories. Matching is case-sensitive. A pattern that starts with `-` is written
+    /// `--exclude=-foo`. The characters `! [ ] \` are reserved and cannot be written: reach a name that has one with
+    /// `?` or `*`. A source that is a file is not filtered, and a source operand itself (file or folder) is never matched; patterns apply below it.
+    #[arg(long, value_name = "PATTERN", action = ArgAction::Append, value_parser = parse_exclude)]
+    exclude: Vec<String>,
+    /// Descend into subdirectories (the default; this flag only says so). Conflicts with --no-recursive.
+    #[arg(long, conflicts_with = "no_recursive")]
+    recursive: bool,
+    /// Take only the top level of each source folder: its files and links, no subdirectory is created or entered.
+    #[arg(long)]
+    no_recursive: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -261,6 +293,16 @@ fn main() -> ExitCode {
     })
 }
 
+/// Parses one `--exclude` value; the clap error is the pattern's own message.
+fn parse_exclude(s: &str) -> Result<String, String> {
+    flux_fs::Pattern::parse(s).map(|_| s.to_string()).map_err(|e| e.to_string())
+}
+
+/// The selection the flags ask for, with the aggregate caps checked.
+fn selection_of(exclude: &[String], no_recursive: bool) -> Result<flux_fs::Selection, String> {
+    flux_fs::Selection::compile(exclude, !no_recursive).map_err(|e| e.to_string())
+}
+
 /// Explicitly requested preservation is Strict; otherwise best effort (§44.1).
 fn options(args: &CopyArgs) -> CopyOptions {
     let preserve = |asked: bool| {
@@ -302,6 +344,8 @@ fn options(args: &CopyArgs) -> CopyOptions {
         hash: match args.hash {
             HashArg::Blake3 => flux_fs::HashAlgorithm::Blake3,
         },
+        selection: selection_of(&args.exclude, args.no_recursive)
+            .expect("validated at the top of copy/verify"),
     }
 }
 
@@ -394,6 +438,10 @@ fn counters_file(outcome: &flux_core::tree::TreeOutcome, run_beat_gap_max: std::
 fn counters_file(_outcome: &flux_core::tree::TreeOutcome, _run_beat_gap_max: std::time::Duration) {}
 
 fn copy(args: &CopyArgs) -> u8 {
+    if let Err(msg) = selection_of(&args.exclude, args.no_recursive) {
+        err(&format!("error: {msg}"));
+        return exit_code::USAGE;
+    }
     if args.resume_verify == Some(ResumeVerifyArg::Metadata) {
         err(
             "error: --resume-verify=metadata is not implemented in this version; use chunks (the default) or full",
@@ -615,6 +663,10 @@ fn several_flag_gate(args: &CopyArgs) -> Option<String> {
 
 /// `flux copy SOURCE... DEST` with two or more sources (spec 3.1 to 3.8).
 fn copy_several(args: &CopyArgs) -> u8 {
+    if let Err(msg) = selection_of(&args.exclude, args.no_recursive) {
+        err(&format!("error: {msg}"));
+        return exit_code::USAGE;
+    }
     if let Some(msg) = several_flag_gate(args) {
         err(&msg);
         return exit_code::USAGE;
@@ -745,11 +797,17 @@ fn verify_options(args: &VerifyArgs) -> flux_core::verify::VerifyOptions {
         hash: match args.hash {
             HashArg::Blake3 => flux_fs::HashAlgorithm::Blake3,
         },
+        selection: selection_of(&args.exclude, args.no_recursive)
+            .expect("validated at the top of copy/verify"),
     }
 }
 
 /// `flux verify` (cut 14): design 6.1 and 6.6. Records go to stdout; stderr carries only operational lines.
 fn verify(args: &VerifyArgs) -> u8 {
+    if let Err(msg) = selection_of(&args.exclude, args.no_recursive) {
+        err(&format!("error: {msg}"));
+        return exit_code::USAGE;
+    }
     if args.paths.len() == 2 {
         verify_one(args, &args.paths[0], &args.paths[1])
     } else {
@@ -1027,14 +1085,44 @@ mod tests {
         ]);
         assert!(matches!(all.links, LinksArg::Skip));
         assert!(all.cross_filesystems && all.json && all.verbose);
+        for argv in [&["flux", "verify", "s"][..], &["flux", "verify", "s", "d", "--resume"]] {
+            assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
+        }
+        assert_eq!(parse_verify(&["flux", "verify", "s", "d", "--exclude", "x"]).exclude, ["x"]);
+        assert_eq!(parse_verify(&["flux", "verify", "s", "t", "d"]).paths.len(), 3);
+    }
+
+    #[test]
+    fn exclude_is_repeatable_and_parses() {
+        let c = parse(&["--exclude", "*.tmp", "--exclude=-foo"]);
+        assert_eq!(c.exclude, ["*.tmp", "-foo"]);
+        assert!(!c.recursive && !c.no_recursive);
+        let v = parse_verify(&["flux", "verify", "s", "d", "--exclude", "a", "--exclude", "b/c"]);
+        assert_eq!(v.exclude, ["a", "b/c"]);
+        assert!(parse(&["--recursive"]).recursive);
+        assert!(parse_verify(&["flux", "verify", "s", "d", "--no-recursive"]).no_recursive);
+    }
+
+    #[test]
+    fn recursive_and_no_recursive_conflict() {
         for argv in [
-            &["flux", "verify", "s"][..],
-            &["flux", "verify", "s", "d", "--resume"],
-            &["flux", "verify", "s", "d", "--exclude", "x"],
+            &["flux", "copy", "s", "d", "--recursive", "--no-recursive"][..],
+            &["flux", "verify", "s", "d", "--no-recursive", "--recursive"],
         ] {
             assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
         }
-        assert_eq!(parse_verify(&["flux", "verify", "s", "t", "d"]).paths.len(), 3);
+    }
+
+    #[test]
+    fn a_bad_pattern_is_a_parse_error() {
+        for argv in [
+            &["flux", "copy", "s", "d", "--exclude", "a//b"][..],
+            &["flux", "verify", "s", "d", "--exclude", ""],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
+        }
+        assert!(selection_of(&["a\\b".to_string()], false).is_err());
+        assert!(selection_of(&["*.tmp".to_string()], true).is_ok());
     }
 
     fn parse_cleanup(argv: &[&str]) -> CleanupArgs {

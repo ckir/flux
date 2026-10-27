@@ -31,6 +31,7 @@ fn opts(verify: VerifyLevel) -> CopyOptions {
         cross_filesystems: false,
         verify,
         hash: HashAlgorithm::Blake3,
+        selection: flux_fs::Selection::default(),
     }
 }
 

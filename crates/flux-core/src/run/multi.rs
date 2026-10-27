@@ -474,7 +474,8 @@ pub fn trees<F: DestinationRoot>(
         let (kind, identity) = match spec.kind {
             SourceKind::Folder => {
                 match prepare_source(fs, &spec.src, &target, MountPolicy::of(&opts)) {
-                    Ok(source) => {
+                    Ok(mut source) => {
+                        source.events.set_selection(&opts.selection);
                         let identity = source.identity;
                         inputs.push(RootInput::Folder {
                             name: spec.name.clone(),
@@ -1015,6 +1016,7 @@ mod trees_tests {
             cross_filesystems: false,
             verify: flux_fs::VerifyLevel::None,
             hash: flux_fs::HashAlgorithm::Blake3,
+            selection: flux_fs::Selection::default(),
         }
     }
 
@@ -1901,5 +1903,88 @@ mod trees_tests {
         assert_eq!(fs.read_file("/p/dest/a/x").as_deref(), Some(&b"ax"[..]));
         assert_eq!(fs.read_file("/p/dest/b/k").as_deref(), Some(&b"bk"[..]));
         assert!(lock_files(&fs).is_empty(), "{:?}", lock_files(&fs));
+    }
+
+    // ---- Cut 16 Task 3b: the selection applies to each folder root and the count sums over the roots ----
+
+    fn selecting() -> CopyOptions {
+        let typed = vec!["*.tmp".to_string()];
+        CopyOptions { selection: flux_fs::Selection::compile(&typed, true).unwrap(), ..opts() }
+    }
+
+    fn with_tmp_files() -> FaultFs {
+        let fs = fake();
+        for p in [
+            "/src/a/t1.tmp",
+            "/src/a/sub/t2.tmp",
+            "/src/b/u1.tmp",
+            "/src/b/u2.tmp",
+            "/src/b/u3.tmp",
+        ] {
+            fs.write_file(p, b"T");
+        }
+        fs
+    }
+
+    #[test]
+    fn the_selection_applies_to_each_root_and_the_counts_sum() {
+        let fs = with_tmp_files();
+        let specs = ["a", "b"].map(spec).to_vec();
+        let (r, got) = go_with(&fs, specs, &selecting(), &cfg());
+        let out = ok(&r);
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(out.excluded, 5, "2 under a and 3 under b");
+        assert_eq!(out.files_total, 3, "x, y, k");
+        assert!(!fs.exists("/p/dest/a/t1.tmp") && !fs.exists("/p/dest/b/u3.tmp"));
+        assert!(fs.exists("/p/dest/a/x") && fs.exists("/p/dest/b/k"));
+    }
+
+    #[test]
+    fn only_the_roots_that_exclude_contribute() {
+        // `a` excludes two, `b` none, `c` none.
+        let fs = fake();
+        fs.write_file("/src/a/t1.tmp", b"T");
+        fs.write_file("/src/a/sub/t2.tmp", b"T");
+        let specs = ["a", "b", "c"].map(spec).to_vec();
+        let (r, _) = go_with(&fs, specs, &selecting(), &cfg());
+        assert_eq!(ok(&r).excluded, 2);
+        // And the mirror: only the second root excludes.
+        let fs = fake();
+        fs.write_file("/src/b/u1.tmp", b"T");
+        let specs = ["a", "b"].map(spec).to_vec();
+        let (r, _) = go_with(&fs, specs, &selecting(), &cfg());
+        assert_eq!(ok(&r).excluded, 1);
+    }
+
+    #[test]
+    fn a_root_that_fails_before_its_walk_counts_zero_and_the_rest_are_not_reached() {
+        // The first root cannot be created: nothing was walked, so nothing was counted, and `b` never starts.
+        let n = reference(with_tmp_files, &["a", "b"], "create_dir", "create_dir(/p/dest/a)");
+        let fs = with_tmp_files();
+        fs.fail_nth("create_dir", n, Code::IoError, std::io::ErrorKind::Other);
+        let (r, _) = go_with(&fs, ["a", "b"].map(spec).to_vec(), &selecting(), &cfg());
+        let Some(Err(a)) = &r.run.copy else { panic!("the copy aborted: {:?}", r.run.copy) };
+        assert_eq!(a.outcome.excluded, 0);
+        assert_eq!(statuses(&r), [RootStatus::Failed, RootStatus::NotStarted]);
+        // The second root cannot be created: only `a`'s two count.
+        let n = reference(with_tmp_files, &["a", "b"], "create_dir", "create_dir(/p/dest/b)");
+        let fs = with_tmp_files();
+        fs.fail_nth("create_dir", n, Code::IoError, std::io::ErrorKind::Other);
+        let (r, _) = go_with(&fs, ["a", "b"].map(spec).to_vec(), &selecting(), &cfg());
+        let Some(Err(a)) = &r.run.copy else { panic!("the copy aborted: {:?}", r.run.copy) };
+        assert_eq!(a.outcome.excluded, 2);
+    }
+
+    #[test]
+    fn a_file_root_is_copied_whatever_the_patterns_say_and_adds_nothing() {
+        let fs = with_tmp_files();
+        let typed = vec!["f".to_string(), "*.tmp".to_string()];
+        let o =
+            CopyOptions { selection: flux_fs::Selection::compile(&typed, true).unwrap(), ..opts() };
+        let (r, got) = go_with(&fs, ["a", "f"].map(spec).to_vec(), &o, &cfg());
+        let out = ok(&r);
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(fs.read_file("/p/dest/f").as_deref(), Some(&b"F"[..]));
+        assert_eq!(out.excluded, 2, "a's two tmp files; the file root f adds none");
     }
 }

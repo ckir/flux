@@ -1033,3 +1033,235 @@ fn a_verified_tree_reports_files_verified() {
     assert_eq!((v["files_verified"].as_u64(), v["files_mismatched"].as_u64()), (Some(3), Some(0)));
     assert!(stderr(&out).contains("3 verified"), "stderr: {}", stderr(&out));
 }
+
+/// `tree_in(d)` plus three `*.tmp` files (`x.tmp`, `y.tmp`, `sub/z.tmp`).
+fn tree_with_tmp(d: &Path) -> PathBuf {
+    let src = tree_in(d);
+    std::fs::write(src.join("x.tmp"), b"1").unwrap();
+    std::fs::write(src.join("y.tmp"), b"22").unwrap();
+    std::fs::write(src.join("sub").join("z.tmp"), b"333").unwrap();
+    src
+}
+
+#[test]
+fn exclude_skips_matching_files_and_reports_the_count() {
+    let d = TempDir::new().unwrap();
+    let src = tree_with_tmp(d.path());
+    let dst = d.path().join("dst");
+    let out = flux()
+        .arg("copy")
+        .arg(&src)
+        .arg(&dst)
+        .args(["--exclude", "*.tmp", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let v = json(&out);
+    assert_eq!(v["excluded"].as_u64(), Some(3), "{v}");
+    assert_eq!(v["files_copied"].as_u64(), Some(2), "{v}");
+    assert!(dst.join("a").is_file() && dst.join("sub").join("b").is_file());
+    assert!(!dst.join("x.tmp").exists() && !dst.join("sub").join("z.tmp").exists());
+    assert!(stderr(&out).contains("; 3 excluded"), "{}", stderr(&out));
+}
+
+#[test]
+fn without_a_match_there_is_no_excluded_key_or_text() {
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let out = flux()
+        .arg("copy")
+        .arg(&src)
+        .arg(d.path().join("dst"))
+        .args(["--exclude", "*.tmp", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let v = json(&out);
+    assert!(v.get("excluded").is_none(), "{v}");
+    assert_eq!(v.as_object().unwrap().len(), KEYS.len());
+    assert!(!stderr(&out).contains("excluded"), "{}", stderr(&out));
+}
+
+#[test]
+fn a_bad_pattern_exits_2_names_the_reason_and_creates_nothing() {
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let dst = d.path().join("dst");
+    let out = flux().arg("copy").arg(&src).arg(&dst).args(["--exclude", "a//b"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("error:") && stderr(&out).contains("empty segment"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!dst.exists(), "the destination was created");
+    assert!(!d.path().join(".flux").exists() && !src.join(".flux").exists());
+    // A backslash gets its own advice.
+    let out = flux().arg("copy").arg(&src).arg(&dst).args(["--exclude", "a\\b"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains("use `/` as the separator"), "{}", stderr(&out));
+    assert!(!dst.exists());
+}
+
+#[test]
+fn too_many_patterns_exit_2() {
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let dst = d.path().join("dst");
+    let mut c = flux();
+    c.arg("copy").arg(&src).arg(&dst);
+    for _ in 0..65 {
+        c.args(["--exclude", "a"]);
+    }
+    let out = c.output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("error:"), "{}", stderr(&out));
+    assert!(!dst.exists());
+
+    let mut c = flux();
+    c.arg("copy").arg(&src).arg(&dst);
+    for _ in 0..17 {
+        c.arg("--exclude").arg("x".repeat(1024));
+    }
+    let out = c.output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(!dst.exists());
+}
+
+#[test]
+fn no_recursive_copies_only_the_top_level() {
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let dst = d.path().join("dst");
+    let out =
+        flux().arg("copy").arg(&src).arg(&dst).args(["--no-recursive", "--json"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(dst.join("a").is_file());
+    assert!(!dst.join("sub").exists(), "a subdirectory was created");
+    assert_eq!(json(&out)["files_copied"].as_u64(), Some(1));
+}
+
+#[test]
+fn recursive_and_no_recursive_together_exit_2() {
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let dst = d.path().join("dst");
+    let out = flux()
+        .arg("copy")
+        .arg(&src)
+        .arg(&dst)
+        .args(["--recursive", "--no-recursive"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(!dst.exists());
+}
+
+#[test]
+fn sixty_five_patterns_exit_2_for_several_source_copy() {
+    let d = TempDir::new().unwrap();
+    let one = tree_in(d.path());
+    let two = d.path().join("two");
+    std::fs::create_dir_all(&two).unwrap();
+    std::fs::write(two.join("f"), b"F").unwrap();
+    let dst = d.path().join("dst");
+    let mut c = flux();
+    c.arg("copy").arg(&one).arg(&two).arg(&dst);
+    for _ in 0..65 {
+        c.args(["--exclude", "a"]);
+    }
+    let out = c.output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("error:"), "{}", stderr(&out));
+    assert!(!dst.exists());
+}
+
+#[test]
+fn recursive_alone_is_accepted() {
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let dst = d.path().join("dst");
+    let out = flux().arg("copy").arg(&src).arg(&dst).arg("--recursive").output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(dst.join("sub").join("b").is_file());
+}
+
+#[test]
+fn exclude_equals_dash_foo_is_accepted_and_dash_foo_alone_is_refused() {
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    std::fs::write(src.join("-foo"), b"f").unwrap();
+    let dst = d.path().join("dst");
+    let out = flux().arg("copy").arg(&src).arg(&dst).arg("--exclude=-foo").output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(!dst.join("-foo").exists() && dst.join("a").is_file());
+
+    let dst2 = d.path().join("dst2");
+    let out = flux().arg("copy").arg(&src).arg(&dst2).args(["--exclude", "-foo"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(!dst2.exists());
+}
+
+#[test]
+fn a_file_operand_is_copied_despite_a_matching_pattern() {
+    let d = TempDir::new().unwrap();
+    let file = d.path().join("note.tmp");
+    std::fs::write(&file, b"hello").unwrap();
+    let dst = d.path().join("out.tmp");
+    let out = flux()
+        .arg("copy")
+        .arg(&file)
+        .arg(&dst)
+        .args(["--exclude", "*.tmp", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(std::fs::read(&dst).unwrap(), b"hello");
+    assert!(json(&out).get("excluded").is_none());
+}
+
+#[test]
+fn exclude_star_star_copies_nothing_and_exits_0() {
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let dst = d.path().join("dst");
+    let out = flux()
+        .arg("copy")
+        .arg(&src)
+        .arg(&dst)
+        .args(["--exclude", "**", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let v = json(&out);
+    assert_eq!(v["files_copied"].as_u64(), Some(0), "{v}");
+    // `tree_in` has two top-level entries (`a` and `sub`); `**` removes both and enters neither.
+    assert_eq!(v["excluded"].as_u64(), Some(2), "{v}");
+    assert!(!dst.join("a").exists() && !dst.join("sub").exists());
+}
+
+#[test]
+fn dry_run_with_exclude_reports_the_same_count() {
+    let d = TempDir::new().unwrap();
+    let src = tree_with_tmp(d.path());
+    let dst = d.path().join("dst");
+    let dry = flux()
+        .arg("copy")
+        .arg(&src)
+        .arg(&dst)
+        .args(["--exclude", "*.tmp", "--dry-run", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(dry.status.code(), Some(0), "stderr: {}", stderr(&dry));
+    assert!(!dst.exists());
+    assert_eq!(json(&dry)["excluded"].as_u64(), Some(3));
+    assert!(stderr(&dry).contains("; 3 excluded"), "{}", stderr(&dry));
+    let real = flux()
+        .arg("copy")
+        .arg(&src)
+        .arg(&dst)
+        .args(["--exclude", "*.tmp", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(json(&real)["excluded"], json(&dry)["excluded"]);
+}

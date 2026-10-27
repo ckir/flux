@@ -74,6 +74,21 @@ zero; the summary line appends `; N hardlinked`, `; N hardlinks degraded` and `;
 `--dry-run` reports a planned link as `would_hardlink` and counts it in `files_hardlinked`. A hardlinked symlink is still
 copied as independent links.
 
+### Selection
+
+`flux copy` and `flux verify` take `--exclude PATTERN` (repeatable), `--recursive` and `--no-recursive`. An entry that
+matches a pattern is neither copied nor entered. A pattern without `/` is matched against each entry's own name at any
+depth (`*.tmp`); with a leading or inner `/` it is anchored and matched against the whole path below the source root
+(`/build`, `docs/*.md`). `*` matches any run of characters within one name, `?` exactly one, and a `**` segment matches
+whole path components (`a/**/b`; a trailing `**` matches everything inside). A trailing `/` limits the pattern to
+directories. Matching is case-sensitive. The characters `! [ ] \` are reserved and rejected (exit 2); reach a name that
+has one with `?` or `*`, and write a pattern that starts with `-` as `--exclude=-foo`. `--recursive` is the default;
+`--no-recursive` takes only the top level of each source folder (its files and links; no subdirectory is created or
+entered) and the two flags conflict. The report counts what `--exclude` removed in `excluded` (absent at zero; the
+summary line appends `; N excluded`); subdirectories skipped by `--no-recursive` are not counted. `--exclude` and
+`--recursive` are part of the resume fingerprint: `--resume` with a different selection is refused. A source that is a
+file is not filtered, and a source operand itself (file or folder) is never matched; patterns apply below it.
+
 ### Verification
 
 `flux copy --verify[=none|source-stream|destination|full]` checks each copied file's content; `--verify` alone means
@@ -87,7 +102,7 @@ With `--resume` the check covers the files this run copies or resumes; files a p
 
 ### Verify
 
-`flux verify SOURCE... DEST [--links=copy|skip] [--cross-filesystems] [--hash=blake3] [--json] [--verbose]` compares one
+`flux verify SOURCE... DEST [--links=copy|skip] [--exclude PATTERN]... [--recursive|--no-recursive] [--cross-filesystems] [--hash=blake3] [--json] [--verbose]` compares one
 source (a file or a folder, mapped onto DEST as `flux copy` maps it) with DEST by content and writes nothing. With
 several sources each is compared with `DEST/<name>`, as `flux copy` places it; what else DEST holds is not examined.
 Both sides are walked together in path order and every file is read in full on both sides and hashed. Flux's own control
@@ -103,7 +118,9 @@ itself, while inside each `DEST/<name>` only `*.flux-partial.<id>` temporaries a
 - `unreadable`: either side could not be read or hashed (the error is reported).
 
 `--links=copy` (the default) compares a symlink's payload; `--links=skip` leaves source symlinks out. A directory that
-is another mount is reported as present and not entered unless `--cross-filesystems` is given. Records go to stdout.
+is another mount is reported as present and not entered unless `--cross-filesystems` is given. `--exclude` and
+`--no-recursive` select entries on both sides exactly as in `flux copy` (see Selection); a selected-out entry is not
+compared and not reported, and the summary counts what `--exclude` removed in `excluded` (absent at zero). Records go to stdout.
 
 Exit status is 0 when nothing is missing, mismatched or unreadable, 1 when something is, and 2 for a usage error or
 roots that are the same or nested; with several sources a refused source name, two sources that take one name (as bytes
@@ -140,6 +157,8 @@ What a pass guarantees:
 - A name that differs only in case on a case-insensitive destination is a `missing` plus an `extra`, not a `match`. The same holds for two Unicode normalisations of one name (macOS NFD against NFC): names are compared as raw bytes.
 
 - A mount point the walker did not enter (no `--cross-filesystems`) is reported `match` for its presence only; its contents were NOT compared. The summary's `not_entered` count and the notice line say so, and exit 0 does not mean those contents were verified.
+
+- Entries removed by `--exclude`, and subdirectories left out by `--no-recursive`, are not compared on either side: they are neither reported nor counted as `missing` or `extra`. A directory that was not entered is therefore not only a mount point, and exit 0 does not mean its contents were verified.
 
 ### Cleanup
 

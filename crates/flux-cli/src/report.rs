@@ -53,6 +53,9 @@ pub struct Report {
     /// Cut 10b: source mount roots created as empty directories and not descended into; absent at zero.
     #[serde(skip_serializing_if = "is_zero")]
     pub mounts_skipped: u64,
+    /// Cut 16: entries the `--exclude` patterns removed; absent at zero. Never part of `files_skipped`.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub excluded: u64,
     /// Cut 12: members of a hardlink group copied independently, whatever the reason; absent at zero.
     #[serde(skip_serializing_if = "is_zero")]
     pub hardlinks_degraded: u64,
@@ -121,6 +124,7 @@ impl Report {
             hash_algorithm: "blake3",
             resume_verify: None,
             mounts_skipped: 0,
+            excluded: 0,
             hardlinks_degraded: 0,
             hardlinks_unchecked: 0,
             dry_run: false,
@@ -141,6 +145,7 @@ impl Report {
             + out.files_skipped
             + out.files_resumed;
         r.mounts_skipped = out.mounts_skipped;
+        r.excluded = out.excluded;
         r.files_hardlinked = out.files_hardlinked;
         r.hardlinks_degraded = out.hardlinks_degraded;
         r.hardlinks_unchecked = out.hardlinks_unchecked.as_ref().map_or(0, |g| g.count);
@@ -487,6 +492,7 @@ pub fn summary_line(r: &Report, directories_created: u64) -> String {
         (r.hardlinks_unchecked, "hardlinks unchecked"),
         (r.files_verified, "verified"),
         (r.files_mismatched, "mismatched"),
+        (r.excluded, "excluded"),
     ] {
         if n > 0 {
             s.push_str(&format!("; {n} {what}"));
@@ -503,8 +509,11 @@ pub fn dry_run_summary_line(r: &Report, directories_created: u64) -> String {
     } else {
         String::new()
     };
+    // Cut 16: the entries the patterns removed, only when there are any.
+    let excluded =
+        if r.excluded > 0 { format!("; {} excluded", r.excluded) } else { String::new() };
     format!(
-        "dry run: would copy {} files ({} bytes), overwrite {}{links}, skip {}, create {directories_created} directories; {} errors",
+        "dry run: would copy {} files ({} bytes), overwrite {}{links}, skip {}, create {directories_created} directories; {} errors{excluded}",
         r.files_copied, r.bytes_copied, r.files_overwritten, r.files_skipped, r.errors
     )
 }
@@ -1039,6 +1048,65 @@ mod tests {
         let obj = zero.as_object().unwrap();
         assert_eq!(obj.len(), 18);
         assert!(!obj.contains_key("mounts_skipped"));
+    }
+
+    #[test]
+    fn excluded_is_absent_from_json_and_text_at_zero() {
+        let zero = serde_json::to_value(Report::tree(&TreeOutcome::default(), false, 0)).unwrap();
+        let obj = zero.as_object().unwrap();
+        assert_eq!(obj.len(), 18, "the pinned key set holds at zero");
+        assert!(!obj.contains_key("excluded"));
+        let r = Report::tree(&TreeOutcome { excluded: 3, ..TreeOutcome::default() }, false, 0);
+        assert_eq!(r.excluded, 3);
+        assert_eq!(serde_json::to_value(&r).unwrap()["excluded"], 3);
+        let mut z = Report::pre_engine(false);
+        z.errors = 0;
+        assert!(!summary_line(&z, 1).contains("excluded"));
+        assert!(!dry_run_summary_line(&z, 1).contains("excluded"));
+    }
+
+    #[test]
+    fn excluded_follows_mounts_skipped_and_precedes_hardlinks_degraded_in_json() {
+        let mut r = Report::pre_engine(false);
+        r.mounts_skipped = 1;
+        r.excluded = 2;
+        r.hardlinks_degraded = 3;
+        let s = r.to_json();
+        let at = |k: &str| s.find(&format!("\"{k}\":")).unwrap();
+        assert!(at("mounts_skipped") < at("excluded"));
+        assert!(at("excluded") < at("hardlinks_degraded"));
+    }
+
+    #[test]
+    fn the_summary_and_dry_run_lines_end_with_an_excluded_suffix_only_when_non_zero() {
+        let mut r = Report::pre_engine(false);
+        r.errors = 0;
+        r.files_copied = 2;
+        r.bytes_copied = 3;
+        r.excluded = 4;
+        assert_eq!(
+            summary_line(&r, 1),
+            "copied 2 files (3 bytes), created 1 directories; 0 failed, 0 skipped; 4 excluded"
+        );
+        r.files_verified = 3;
+        r.files_mismatched = 1;
+        assert_eq!(
+            summary_line(&r, 1),
+            "copied 2 files (3 bytes), created 1 directories; 0 failed, 0 skipped; 3 verified; 1 mismatched; 4 excluded",
+            "the suffix is the last"
+        );
+        assert_eq!(
+            dry_run_summary_line(&r, 1),
+            "dry run: would copy 2 files (3 bytes), overwrite 0, skip 0, create 1 directories; 0 errors; 4 excluded"
+        );
+    }
+
+    #[test]
+    fn excluded_never_enters_files_skipped() {
+        let base = Report::tree(&TreeOutcome::default(), false, 0).files_skipped;
+        let r = Report::tree(&TreeOutcome { excluded: 5, ..TreeOutcome::default() }, false, 0);
+        assert_eq!(r.files_skipped, base);
+        assert_eq!((r.files_failed, r.errors), (0, 0));
     }
 
     #[test]

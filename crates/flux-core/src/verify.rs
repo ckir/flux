@@ -93,6 +93,8 @@ pub struct Summary {
     pub unreadable: u64,
     /// Mount points not entered (each is also one `matched`).
     pub not_entered: u64,
+    /// Source entries the `--exclude` patterns removed (the source side only; `--no-recursive` is silent).
+    pub excluded: u64,
     /// Bytes read by completed hashes on both sides; a read that failed adds nothing.
     pub bytes_hashed: u64,
 }
@@ -105,11 +107,13 @@ impl Summary {
 }
 
 /// How a verify is configured.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct VerifyOptions {
     pub links: Links,
     pub mounts: MountPolicy,
     pub hash: HashAlgorithm,
+    /// Applied to BOTH walks (design 5.6).
+    pub selection: flux_fs::Selection,
 }
 
 /// Why a verify did not run.
@@ -170,8 +174,10 @@ impl<'a, F: FileSystem> Side<'a, F> {
         mounts: MountPolicy,
         skip_links: bool,
         filter: ControlFilter,
+        selection: &'a flux_fs::Selection,
     ) -> Result<Self, FsError> {
-        let walk = walk_with(fs, root, WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts })?;
+        let mut walk = walk_with(fs, root, WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts })?;
+        walk.set_selection(selection);
         Ok(Side {
             walk: Some(walk),
             peeked: None,
@@ -181,6 +187,11 @@ impl<'a, F: FileSystem> Side<'a, F> {
             skip_links,
             filter,
         })
+    }
+
+    /// The entries this side's walk dropped under `--exclude` (0 for a side with no walk).
+    fn excluded(&self) -> u64 {
+        self.walk.as_ref().map_or(0, Walk::excluded)
     }
 
     /// A side with nothing on it: the walk of a destination that does not exist (design 6.1).
@@ -546,6 +557,7 @@ pub fn verify_several<F: DestinationRoot>(
         total.extra += root.extra;
         total.unreadable += root.unreadable;
         total.not_entered += root.not_entered;
+        total.excluded += root.excluded;
         total.bytes_hashed += root.bytes_hashed;
     }
     Ok(total)
@@ -603,18 +615,24 @@ fn walk_checked<F: DestinationRoot>(
         }
     };
     // The source walk is built first, then the destination's (a test pins the `read_dir` order).
-    let mut a =
-        match Side::new(fs, src, opts.mounts, opts.links == Links::Skip, ControlFilter::None) {
-            Ok(a) => a,
-            Err(e) => {
-                root_unreadable(out, &format!("{SOURCE}{}", e.source), e.code);
-                return;
-            }
-        };
+    let mut a = match Side::new(
+        fs,
+        src,
+        opts.mounts,
+        opts.links == Links::Skip,
+        ControlFilter::None,
+        &opts.selection,
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            root_unreadable(out, &format!("{SOURCE}{}", e.source), e.code);
+            return;
+        }
+    };
     let mut b = if dst_absent {
         Side::empty()
     } else {
-        match Side::new(fs, dst, opts.mounts, false, filter) {
+        match Side::new(fs, dst, opts.mounts, false, filter, &opts.selection) {
             Ok(b) => b,
             Err(e) => {
                 root_unreadable(out, &format!("{DESTINATION}{}", e.source), e.code);
@@ -646,6 +664,8 @@ fn walk_checked<F: DestinationRoot>(
             }
         }
     }
+    // The SOURCE side only: the destination's walk drops entries the same way, but they are not the run's to count.
+    out.summary.excluded += a.excluded();
 }
 
 /// Why the root check stopped the run.
@@ -930,6 +950,7 @@ mod tests {
             links: Links::Copy,
             mounts: MountPolicy::Cross,
             hash: HashAlgorithm::Blake3,
+            selection: flux_fs::Selection::default(),
         }
     }
 
@@ -2370,6 +2391,7 @@ mod tests {
             sum.extra += s.extra;
             sum.unreadable += s.unreadable;
             sum.not_entered += s.not_entered;
+            sum.excluded += s.excluded;
             sum.bytes_hashed += s.bytes_hashed;
         }
         assert_eq!(sum, total);
@@ -2506,6 +2528,7 @@ mod tests {
             sum.extra += r.extra;
             sum.unreadable += r.unreadable;
             sum.not_entered += r.not_entered;
+            sum.excluded += r.excluded;
             sum.bytes_hashed += r.bytes_hashed;
         }
         assert_eq!(total, sum);
@@ -2573,5 +2596,127 @@ mod tests {
         fs4.write_file("/d/a/x", b"1");
         fs4.fail_read_dir_of("/s/a", Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
         check(&fs4, SOURCE, Some(Code::PermissionDenied));
+    }
+
+    fn selecting(patterns: &[&str], recursive: bool) -> VerifyOptions {
+        let patterns: Vec<String> = patterns.iter().map(|p| (*p).to_string()).collect();
+        VerifyOptions {
+            selection: flux_fs::Selection::compile(&patterns, recursive).unwrap(),
+            ..opts()
+        }
+    }
+
+    #[test]
+    fn an_excluded_name_at_the_destination_is_not_extra() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("a", b"1")]);
+        tree(&fs, "/d", &[], &[("a", b"1"), ("skip", b"2")]);
+        let (rows, s) = run(&fs, "/s", "/d", &selecting(&["skip"], true));
+        assert_eq!(rows, vec![rec("a", Outcome::Match, Kind::File)]);
+        assert_eq!((s.extra, s.excluded), (0, 0));
+    }
+
+    #[test]
+    fn an_excluded_name_at_the_source_is_not_missing() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("a", b"1"), ("skip", b"2")]);
+        tree(&fs, "/d", &[], &[("a", b"1")]);
+        let (rows, s) = run(&fs, "/s", "/d", &selecting(&["skip"], true));
+        assert_eq!(rows, vec![rec("a", Outcome::Match, Kind::File)]);
+        assert_eq!((s.missing, s.excluded), (0, 1));
+        assert!(!s.failed());
+    }
+
+    #[test]
+    fn no_recursive_hides_destination_subdirectories_and_exits_clean() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("a", b"1")]);
+        tree(&fs, "/d", &["extra"], &[("a", b"1"), ("extra/z", b"9")]);
+        let (rows, s) = run(&fs, "/s", "/d", &selecting(&[], false));
+        assert_eq!(rows, vec![rec("a", Outcome::Match, Kind::File)]);
+        assert!(!s.failed());
+        assert_eq!((s.extra, s.excluded), (0, 0));
+    }
+
+    #[test]
+    fn a_top_level_mismatch_still_fails_under_no_recursive() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &["sub"], &[("a", b"1"), ("sub/q", b"1")]);
+        tree(&fs, "/d", &["sub"], &[("a", b"2"), ("sub/q", b"1")]);
+        let (rows, s) = run(&fs, "/s", "/d", &selecting(&[], false));
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].0.as_str(), rows[0].1), ("a", Outcome::Mismatched));
+        assert!(s.failed());
+    }
+
+    #[test]
+    fn a_source_file_against_a_destination_directory_under_a_dir_only_pattern_is_missing() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("foo", b"1")]);
+        tree(&fs, "/d", &["foo"], &[]);
+        let (rows, s) = run(&fs, "/s", "/d", &selecting(&["foo/"], true));
+        assert_eq!(rows, vec![rec("foo", Outcome::Missing, Kind::File)]);
+        assert_eq!((s.missing, s.excluded), (1, 0));
+    }
+
+    #[test]
+    fn a_source_directory_against_a_destination_file_under_a_dir_only_pattern_is_extra() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &["foo"], &[]);
+        tree(&fs, "/d", &[], &[("foo", b"1")]);
+        let (rows, s) = run(&fs, "/s", "/d", &selecting(&["foo/"], true));
+        assert_eq!(rows, vec![rec("foo", Outcome::Extra, Kind::File)]);
+        assert_eq!((s.extra, s.excluded), (1, 1));
+    }
+
+    #[test]
+    fn the_count_is_source_side_only_with_asymmetric_sides() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("a", b"1"), ("skip", b"2")]);
+        tree(&fs, "/d", &[], &[("a", b"1"), ("skip", b"2"), ("skip2", b"3")]);
+        let (_, s) = run(&fs, "/s", "/d", &selecting(&["skip", "skip2"], true));
+        assert_eq!(s.excluded, 1);
+    }
+
+    #[test]
+    fn two_roots_sum_their_counts() {
+        use crate::run::SourceKind::Folder;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        fs.create_dir(Path::new("/d")).unwrap();
+        tree(&fs, "/s/a", &[], &[("k", b"1"), ("skip", b"2")]);
+        tree(&fs, "/d/a", &[], &[("k", b"1")]);
+        tree(&fs, "/s/b", &[], &[("k", b"1"), ("skip", b"2"), ("skip.d", b"3")]);
+        tree(&fs, "/d/b", &[], &[("k", b"1")]);
+        let o = selecting(&["skip", "skip.d"], true);
+        let specs = ["a", "b"].map(|n| spec(&format!("/s/{n}"), n, Folder)).to_vec();
+        let (_, roots, _, total) = several(&fs, specs, "/d", &o);
+        assert_eq!(roots[0].1.excluded, 1);
+        assert_eq!(roots[1].1.excluded, 2);
+        assert_eq!(total.excluded, 3);
+    }
+
+    #[test]
+    fn an_absent_destination_still_reports_the_source_count() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("a", b"1"), ("skip", b"2")]);
+        let (rows, s) = run(&fs, "/s", "/d", &selecting(&["skip"], true));
+        assert_eq!(rows, vec![rec("a", Outcome::Missing, Kind::File)]);
+        assert_eq!(s.excluded, 1);
+    }
+
+    #[test]
+    fn exclusions_under_a_pruned_mount_subtree_still_count() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &["m"], &[("m/x", b"x"), ("m/skip", b"y")]);
+        tree(&fs, "/d", &["m"], &[]);
+        fs.set_mount_root("/d/m", MountRoot::Yes);
+        let o = VerifyOptions { mounts: MountPolicy::Stay, ..selecting(&["skip"], true) };
+        let (rows, s) = run(&fs, "/s", "/d", &o);
+        assert_eq!(
+            rows,
+            vec![("m".to_string(), Outcome::Match, Kind::Dir, None, MOUNT_NOT_ENTERED.to_string())]
+        );
+        assert_eq!((s.not_entered, s.excluded), (1, 1));
     }
 }
