@@ -87,9 +87,10 @@ re-read may be served by the operating system's page cache, so it does not prove
 
 ### Verify
 
-`flux verify SOURCE DEST [--links=copy|skip] [--cross-filesystems] [--hash=blake3] [--json] [--verbose]` compares one
-source (a file or a folder, mapped onto DEST as `flux copy` maps it) with DEST by content and writes nothing. Both
-sides are walked together in path order and every file is read in full on both sides and hashed. Flux's own control
+`flux verify SOURCE... DEST [--links=copy|skip] [--cross-filesystems] [--hash=blake3] [--json] [--verbose]` compares one
+source (a file or a folder, mapped onto DEST as `flux copy` maps it) with DEST by content and writes nothing. With
+several sources each is compared with `DEST/<name>`, as `flux copy` places it; what else DEST holds is not examined.
+Both sides are walked together in path order and every file is read in full on both sides and hashed. Flux's own control
 state under DEST (`.flux/`, the root lock, partial files) is never compared. Each path is reported as one of:
 
 - `match`: the same on both sides (printed only with `--verbose`).
