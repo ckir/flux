@@ -8,6 +8,7 @@
 
 use flux_fs::{
     Code, DirEntry, FileIdentity, FileSystem, FileType, FsError, MountRoot, ObjectId, Result,
+    Selection, Verdict,
 };
 use std::path::{Path, PathBuf};
 
@@ -131,6 +132,10 @@ pub struct Walk<'a, F: FileSystem> {
     /// Only `Strong` identities are ever pushed, so "both sides Strong" holds by
     /// construction rather than by a second check at comparison time.
     ancestors: Vec<ObjectId>,
+    /// The `--exclude` / `--no-recursive` filter; `None` keeps every entry.
+    selection: Option<&'a Selection>,
+    /// Entries a pattern removed (never those `--no-recursive` skipped).
+    excluded: u64,
 }
 
 // Manual, not derived: `#[derive(Debug)]` on a generic struct adds a `F: Debug`
@@ -240,6 +245,8 @@ pub fn walk_with<'a, F: FileSystem>(
             mount: None,
         }],
         ancestors,
+        selection: None,
+        excluded: 0,
     })
 }
 
@@ -327,6 +334,19 @@ impl<'a, F: FileSystem> Iterator for Walk<'a, F> {
                 }
             };
 
+            // The filter runs BEFORE `enter`, so a dropped directory is never
+            // stat'ed, mount-queried or listed, and the depth cap never sees it.
+            if let (Some(selection), Some((path, file_type))) = (self.selection, step.as_ref()) {
+                match selection.select(path, *file_type) {
+                    Verdict::Keep => {}
+                    Verdict::Excluded => {
+                        self.excluded += 1;
+                        continue;
+                    }
+                    Verdict::Skipped => continue,
+                }
+            }
+
             match step {
                 Some((path, FileType::File)) => return Some(Ok(WalkEvent::File { path })),
                 Some((path, FileType::Symlink)) => return Some(Ok(WalkEvent::Symlink { path })),
@@ -350,6 +370,18 @@ impl<'a, F: FileSystem> Iterator for Walk<'a, F> {
 }
 
 impl<'a, F: FileSystem> Walk<'a, F> {
+    /// Filter every entry below the root through `selection`. The root itself is
+    /// never filtered.
+    pub fn set_selection(&mut self, selection: &'a Selection) {
+        self.selection = Some(selection);
+    }
+
+    /// How many entries a pattern removed so far (section 5.9): a pruned directory
+    /// is one, and entries `--no-recursive` skipped are not counted.
+    pub fn excluded(&self) -> u64 {
+        self.excluded
+    }
+
     /// Descend into `rel`, or refuse it. On `Ok` a frame has been pushed and the
     /// pre-order `Dir` event is returned; on `Err` nothing was pushed, the subtree
     /// is skipped, and the walk continues with the next sibling.
@@ -1374,5 +1406,240 @@ mod tests {
         // `dev` yields exactly one Other event - not a File, and not a Dir it
         // descends into - while `real` still produces its full triple.
         assert_eq!(paths(&fs), vec!["O dev", "D real", "F real/f", "E real"]);
+    }
+
+    fn sel(patterns: &[&str], recursive: bool) -> Selection {
+        let v: Vec<String> = patterns.iter().map(|p| (*p).to_string()).collect();
+        Selection::compile(&v, recursive).unwrap()
+    }
+
+    /// Every item rendered like `paths`, plus `ERR <path>` for a failed entry, and
+    /// the walk's `excluded()` after it was drained.
+    fn run_selected(
+        fs: &FaultFs,
+        selection: &Selection,
+        max_depth: usize,
+        mounts: MountPolicy,
+    ) -> (Vec<String>, u64) {
+        let mut walk = walk_with(fs, Path::new("/r"), WalkOptions { max_depth, mounts }).unwrap();
+        walk.set_selection(selection);
+        let mut out = Vec::new();
+        for item in walk.by_ref() {
+            out.push(match item {
+                Ok(WalkEvent::Dir { path, .. }) => format!("D {}", rel(&path)),
+                Ok(WalkEvent::File { path }) => format!("F {}", rel(&path)),
+                Ok(WalkEvent::Symlink { path }) => format!("L {}", rel(&path)),
+                Ok(WalkEvent::Other { path }) => format!("O {}", rel(&path)),
+                Ok(WalkEvent::DirEnd { path }) => format!("E {}", rel(&path)),
+                Ok(WalkEvent::MountSkipped { path }) => format!("M {}", rel(&path)),
+                Ok(WalkEvent::MountUnknown { path }) => format!("U {}", rel(&path)),
+                Err(e) => format!("ERR {}", rel(&e.path)),
+            });
+        }
+        (out, walk.excluded())
+    }
+
+    fn paths_selected(fs: &FaultFs, selection: &Selection) -> Vec<String> {
+        run_selected(fs, selection, DEFAULT_MAX_DEPTH, MountPolicy::Cross).0
+    }
+
+    fn selected(fs: &FaultFs, selection: &Selection) -> (Vec<String>, u64) {
+        run_selected(fs, selection, DEFAULT_MAX_DEPTH, MountPolicy::Cross)
+    }
+
+    fn dirs(fs: &FaultFs, ds: &[&str]) {
+        for d in ds {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_excluded_file_symlink_and_other_entry_are_dropped_and_counted() {
+        let fs = FaultFs::new();
+        dirs(&fs, &["/r"]);
+        fs.write_file("/r/a.tmp", b"");
+        fs.add_symlink("/r/b.tmp");
+        fs.add_special("/r/c.tmp");
+        fs.write_file("/r/keep.txt", b"");
+        let s = sel(&["*.tmp"], true);
+        assert_eq!(paths_selected(&fs, &s), vec!["F keep.txt"]);
+        assert_eq!(selected(&fs, &s).1, 3);
+    }
+
+    #[test]
+    fn an_excluded_directory_is_never_entered() {
+        let fs = FaultFs::new();
+        dirs(&fs, &["/r", "/r/private", "/r/private/deep"]);
+        fs.write_file("/r/private/f", b"");
+        fs.write_file("/r/private/deep/g", b"");
+        fs.write_file("/r/keep", b"");
+        let s = sel(&["private"], true);
+        let (got, n) = selected(&fs, &s);
+        assert_eq!(got, vec!["F keep"]);
+        assert_eq!(n, 1);
+        let calls = fs.calls();
+        // The fixture's own `create_dir`/`write_file` calls are logged too; only a
+        // walk-side query for the excluded directory is the failure.
+        let walked = |c: &&String| {
+            ["read_dir(", "metadata(", "source_mount_root("].iter().any(|p| c.starts_with(p))
+        };
+        assert!(!calls.iter().filter(walked).any(|c| c.contains("/r/private")), "got {calls:?}");
+    }
+
+    #[test]
+    fn a_directory_at_depth_two_is_pruned_too() {
+        let fs = FaultFs::new();
+        dirs(&fs, &["/r", "/r/a", "/r/a/b", "/r/a/b/skip"]);
+        fs.write_file("/r/a/b/skip/x", b"");
+        fs.write_file("/r/a/b/k", b"");
+        let s = sel(&["skip"], true);
+        let (got, n) = selected(&fs, &s);
+        assert_eq!(got, vec!["D a", "D a/b", "F a/b/k", "E a/b", "E a"]);
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn private_star_star_keeps_the_directory_and_filters_its_children() {
+        let fs = FaultFs::new();
+        dirs(&fs, &["/r", "/r/private"]);
+        fs.write_file("/r/private/one", b"");
+        fs.write_file("/r/private/two", b"");
+        let s = sel(&["private/**"], true);
+        let (got, n) = selected(&fs, &s);
+        assert_eq!(got, vec!["D private", "E private"]);
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn two_patterns_on_one_entry_count_once_and_two_entries_in_one_directory_count_two() {
+        let fs = FaultFs::new();
+        dirs(&fs, &["/r"]);
+        fs.write_file("/r/a.tmp", b"");
+        fs.write_file("/r/b.tmp", b"");
+        fs.write_file("/r/keep", b"");
+        // `a.tmp` matches both patterns: one entry, one count. `b.tmp` is the second.
+        let s = sel(&["a.tmp", "*.tmp"], true);
+        let (got, n) = selected(&fs, &s);
+        assert_eq!(got, vec!["F keep"]);
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn no_recursive_yields_only_top_level_non_directories_without_a_depth_error() {
+        let fs = FaultFs::new();
+        dirs(&fs, &["/r", "/r/d", "/r/d/e"]);
+        fs.write_file("/r/d/f", b"");
+        fs.write_file("/r/f", b"");
+        fs.add_symlink_to("/r/link", "d", flux_fs::LinkKind::Dir);
+        let s = Selection::compile(&[], false).unwrap();
+        // A depth cap of 0 would refuse every directory, so a `Skipped` directory
+        // that still reached `enter` would show up as an `ERR` item.
+        let (got, n) = run_selected(&fs, &s, 0, MountPolicy::Cross);
+        assert_eq!(got, vec!["F f", "L link"]);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn a_directory_removed_by_both_a_pattern_and_no_recursive_counts_once() {
+        let fs = FaultFs::new();
+        dirs(&fs, &["/r", "/r/d", "/r/e"]);
+        fs.write_file("/r/f", b"");
+        let s = sel(&["d"], false);
+        let (got, n) = selected(&fs, &s);
+        assert_eq!(got, vec!["F f"]);
+        // `d` is Excluded (patterns first) and counts; `e` is only Skipped.
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn exclusions_in_the_root_and_at_depth_two_sum() {
+        let fs = FaultFs::new();
+        dirs(&fs, &["/r", "/r/d", "/r/d/e"]);
+        fs.write_file("/r/a.tmp", b"");
+        fs.write_file("/r/d/b.tmp", b"");
+        fs.write_file("/r/d/e/c.tmp", b"");
+        fs.write_file("/r/d/f", b"");
+        let s = sel(&["*.tmp"], true);
+        let (got, n) = selected(&fs, &s);
+        assert_eq!(got, vec!["D d", "D d/e", "E d/e", "F d/f", "E d"]);
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn nothing_under_an_excluded_directory_can_fail_the_walk() {
+        let fs = FaultFs::new();
+        dirs(&fs, &["/r", "/r/skip"]);
+        fs.write_file("/r/skip/x", b"");
+        fs.write_file("/r/keep", b"");
+        // The second `read_dir` call would be `/r/skip`.
+        fs.fail_nth("read_dir", 2, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+        let s = sel(&["skip"], true);
+        let (got, n) = selected(&fs, &s);
+        assert_eq!(got, vec!["F keep"], "no ERR item; got {got:?}");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn an_excluded_directory_beyond_the_depth_cap_raises_no_depth_error() {
+        let fs = FaultFs::new();
+        dirs(&fs, &["/r", "/r/a", "/r/a/b", "/r/a/b/c", "/r/a/b/c/d"]);
+        let s = sel(&["c"], true);
+        // Cap of 2: `a/b/c` would be refused with an error had it reached `enter`.
+        let (got, n) = run_selected(&fs, &s, 2, MountPolicy::Cross);
+        assert_eq!(got, vec!["D a", "D a/b", "E a/b", "E a"]);
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn an_excluded_mount_directory_emits_no_note() {
+        let fs = mount_tree();
+        let s = sel(&["m"], true);
+        let (got, n) = run_selected(&fs, &s, DEFAULT_MAX_DEPTH, MountPolicy::Stay);
+        assert_eq!(got, vec!["F z"]);
+        assert_eq!(n, 1);
+        let calls = fs.calls();
+        let walked = |c: &&String| {
+            ["read_dir(", "metadata(", "source_mount_root("].iter().any(|p| c.starts_with(p))
+        };
+        assert!(!calls.iter().filter(walked).any(|c| c.contains("/r/m")), "got {calls:?}");
+    }
+
+    #[test]
+    fn the_root_is_never_filtered() {
+        let fs = FaultFs::new();
+        dirs(&fs, &["/r", "/r/a", "/r/b"]);
+        fs.write_file("/r/a/f", b"");
+        fs.write_file("/r/c.tmp", b"");
+        let s = sel(&["**"], true);
+        let (got, n) = selected(&fs, &s);
+        assert_eq!(got, Vec::<String>::new());
+        assert_eq!(n, 3, "the three top-level entries, not the root");
+    }
+
+    #[test]
+    fn an_anchored_multi_component_pattern_matches_at_depth_two() {
+        let fs = FaultFs::new();
+        dirs(&fs, &["/r", "/r/sub", "/r/o", "/r/o/sub"]);
+        fs.write_file("/r/sub/x.tmp", b"");
+        fs.write_file("/r/sub/y.txt", b"");
+        fs.write_file("/r/x.tmp", b"");
+        fs.write_file("/r/o/sub/z.tmp", b"");
+        let s = sel(&["sub/*.tmp"], true);
+        let (got, n) = selected(&fs, &s);
+        assert_eq!(
+            got,
+            vec![
+                "D o",
+                "D o/sub",
+                "F o/sub/z.tmp",
+                "E o/sub",
+                "E o",
+                "D sub",
+                "F sub/y.txt",
+                "E sub",
+                "F x.tmp"
+            ]
+        );
+        assert_eq!(n, 1);
     }
 }
