@@ -79,8 +79,8 @@ Anti-goals
 ## 4. Approaches
 
 A. A selection predicate inside the walker, consulted before `match step`. Prunes before any I/O; copy, dry run, resume
-   and verify get it for free; hardlinks need no change. Cost: `WalkOptions` must carry a handle to the compiled
-   selection, and `VerifyOptions` (`Copy`) must as well.
+   and verify get it for free; hardlinks need no change. Cost: the walk must be handed the compiled
+   selection (through `Walk::set_selection`, section 5.3), and `CopyOptions` and `VerifyOptions` must carry it (`VerifyOptions` stops being `Copy`).
 B. The consumers filter (`tree.rs`, `verify.rs` each skip events). Rejected: `read_dir` has already happened for an
    excluded directory, two consumers duplicate the logic, and a skipped `Dir` event must be matched by its `DirEnd`.
 C. A pre-pass producing the selected list. Rejected: spec `:511` forbids an unbounded global list.
@@ -132,16 +132,12 @@ entered, silently (owner ruling). A symlink to a directory is `FileType::Symlink
 
 ### 5.3 Where it lives
 
-New `crates/flux-core/src/select.rs`: `Selection` (compiled patterns, `recursive: bool`), `Selection::compile(&[String],
+New `crates/flux-fs/src/select.rs` (in `flux-fs` because `CopyOptions` lives there): `Selection` (compiled patterns, `recursive: bool`), `Selection::compile(&[String],
 recursive) -> Result<Selection, SelectError>`, and `Selection::select(&self, rel: &Path, ft: FileType) -> Verdict`, where `Verdict` is `Keep`, `Excluded` (a pattern matched) or `Skipped` (`--no-recursive` dropped a directory). Patterns are tested FIRST, so an entry both a pattern and `--no-recursive` would remove is `Excluded` and counts (call R11). The walker `continue`s on both removals and counts only `Excluded`. `rel` is the `PathBuf` that `Walk::next` builds with `join` (`walk.rs:326`): its separator is the OS one (`\` on Windows), with no prefix and no leading separator. The matcher therefore walks `rel.components()` (`Component::Normal` names) and NEVER splits the path's bytes on `/`; treating `\` as a second separator would be wrong on Linux, where a name may contain one. Per entry it decides the byte-or-scalar mode once per component, takes only `file_name()` for unanchored patterns, and returns early when there are no patterns and recursion is on (the walker then holds `None`). `Selection` stays `Sync` (Phase 3 shares it); the test-only step count comes from a counted generic entry point, not a `Cell`.
-`WalkOptions` gains an optional borrowed handle to it (`Option<&'a Selection>` keeps the struct `Copy`; the plan
-decides the lifetime plumbing). `Walk::next` calls it for every entry before `match step`, and `continue`s on `Excluded` and `Skipped`.
-The CLI validates each `--exclude` argument with the same parser (a clap `value_parser`) so a bad pattern fails at
-argument time with exit 2; the engine receives `CopyOptions.exclude: Vec<String>` and `CopyOptions.recursive: bool`
-(`flux-fs`, raw strings and a bool) and compiles once per run. `VerifyOptions` carries the same two fields or a borrowed
-`Selection`; the plan chooses, keeping `Copy` if cheap.
+The walker holds `Option<&'a Selection>`, set with `Walk::set_selection(&mut self, &'a Selection)` after `prepare_source` at its three production sites; `WalkOptions` is untouched and stays `Copy`. `Walk::next` calls the selection for every entry before `match step`, and `continue`s on `Excluded` and `Skipped`.
+The CLI compiles each `--exclude` argument with `Selection::compile` (a clap `value_parser`), so a bad pattern fails at argument time with exit 2. `CopyOptions` and `VerifyOptions` each carry ONE compiled `selection: flux_fs::Selection` field (not raw strings and a bool), so the engine has no fallible compile; state decode recompiles the recorded patterns and reports a bad one as `Corrupt`. `VerifyOptions` is `Debug, Clone` and no longer `Copy`.
 
-Plan rulings (amending the three paragraphs above). P1: the matcher lives in `flux-fs`, not `flux-core`, because `CopyOptions` lives there; `CopyOptions` and `VerifyOptions` carry ONE compiled `Selection` field instead of raw strings, so the engine has no fallible compile; compilation happens in the CLI (a usage error, exit 2) and in state decode (`Corrupt`). P2: the walker takes the selection through `Walk::set_selection`, not a `WalkOptions` field, which keeps `WalkOptions` `Copy`. P3: `VerifyOptions` loses `Copy`.
+Plan rulings recorded here: P1 (the matcher and the compiled field live in `flux-fs`; compilation in the CLI and in state decode), P2 (`Walk::set_selection`, not a `WalkOptions` field) and P3 (`VerifyOptions` loses `Copy`).
 
 ### 5.4 Copy, dry run, resume
 
@@ -256,8 +252,7 @@ make `?` a byte; drop `recursive=false` from `canonical_bytes`; drop the destina
 
 ## 8. Self-audit (gaps and where they close)
 
-- Walker `Copy` constraint: a borrowed handle keeps it; if the plan finds the lifetime plumbing spreads, an `Arc<Selection>`
-  makes `WalkOptions` `Clone` and the few `Copy` uses change. Decided in the plan, pinned by the compiler.
+- Walker `Copy` constraint: closed by plan ruling P2: the selection is passed through `Walk::set_selection`, so `WalkOptions` is untouched and stays `Copy`.
 - `MountSkipped` / `MountUnknown` notes are produced inside `enter` for directories that pass the filter; an excluded
   mount directory yields no note (nothing was looked at). Pinned by a walker test.
 - The root itself is never filtered (`--exclude .` is rejected; `**` cannot match the root).
