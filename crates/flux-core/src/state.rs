@@ -109,6 +109,22 @@ pub struct Options {
     /// still reads; a state without the key reads as `false`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cross_filesystems: bool,
+    /// The `--exclude` patterns as typed, sorted and deduplicated (cut 16). Written only when non-empty, so a
+    /// state without a selection is byte-identical to the pre-cut format; a state without the key reads as none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
+    /// Whether the run descends into directories (cut 16; `--no-recursive` is false). Written only when false; a
+    /// state without the key reads as `true`.
+    #[serde(default = "recursive_true", skip_serializing_if = "is_true")]
+    pub recursive: bool,
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
+}
+
+fn recursive_true() -> bool {
+    true
 }
 
 fn is_false(v: &bool) -> bool {
@@ -158,12 +174,16 @@ impl Options {
             }
             .to_string(),
             cross_filesystems: opts.cross_filesystems,
+            exclude: opts.selection.patterns().to_vec(),
+            recursive: opts.selection.recursive(),
         }
     }
 
-    /// `FINGERPRINT_HEADER`, then the four covered options, one `name=value` line each, then `links=skip` only when
-    /// links are skipped (so every state written before cut 10a keeps its exact hash). `durability` is not covered
-    /// (it is compared by rule at resume).
+    /// `FINGERPRINT_HEADER`, then `preserve_times`, `preserve_permissions`, `safety` and `existing`, one
+    /// `name=value` line each, then only when non-default: `links=skip`, `cross_filesystems=true`, one
+    /// `exclude=<pattern>` per pattern (sorted and deduplicated here, so a literal and `Options::of` agree) and
+    /// `recursive=false`, so every state written before those options existed keeps its exact hash. `durability` is
+    /// not covered (it is compared by rule at resume).
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut text = format!(
             "{FINGERPRINT_HEADER}preserve_times={}\npreserve_permissions={}\nsafety={}\nexisting={}\n",
@@ -174,6 +194,17 @@ impl Options {
         }
         if self.cross_filesystems {
             text.push_str("cross_filesystems=true\n");
+        }
+        let mut exclude: Vec<&String> = self.exclude.iter().collect();
+        exclude.sort();
+        exclude.dedup();
+        for pattern in exclude {
+            text.push_str("exclude=");
+            text.push_str(pattern);
+            text.push('\n');
+        }
+        if !self.recursive {
+            text.push_str("recursive=false\n");
         }
         text.into_bytes()
     }
@@ -644,6 +675,11 @@ fn validate(s: &OperationState) -> Result<(), String> {
         one_of("safety", &o.safety, &["default", "strict"])?;
         one_of("existing", &o.existing, &["overwrite", "update", "skip-existing"])?;
         one_of("links", &o.links, &["copy", "skip"])?;
+        if o.exclude.windows(2).any(|w| w[0] >= w[1]) {
+            return Err("exclude is not strictly sorted".to_string());
+        }
+        flux_fs::Selection::compile(&o.exclude, o.recursive)
+            .map_err(|e| format!("exclude is not a valid selection: {e}"))?;
         let f = &c.configuration_fingerprint;
         if f.len() != 64 || !f.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
             return Err(format!("configuration_fingerprint is not 64 lowercase hex: {f}"));
@@ -1894,7 +1930,11 @@ mod tests {
     }
 
     fn options_default() -> Options {
-        Options::of(&flux_fs::CopyOptions {
+        Options::of(&copy_options_default())
+    }
+
+    fn copy_options_default() -> flux_fs::CopyOptions {
+        flux_fs::CopyOptions {
             preserve_times: flux_fs::Preserve::Default,
             preserve_permissions: flux_fs::Preserve::Default,
             durability: flux_fs::Durability::Normal,
@@ -1908,7 +1948,7 @@ mod tests {
             verify: flux_fs::VerifyLevel::None,
             hash: flux_fs::HashAlgorithm::Blake3,
             selection: flux_fs::Selection::default(),
-        })
+        }
     }
 
     fn config() -> Config {
@@ -2287,6 +2327,135 @@ mod tests {
         let mut expected = skip.canonical_bytes();
         expected.extend_from_slice(b"cross_filesystems=true\n");
         assert_eq!(both.canonical_bytes(), expected);
+    }
+
+    fn typed(patterns: &[&str]) -> Vec<String> {
+        patterns.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn selecting(patterns: &[&str], recursive: bool) -> flux_fs::CopyOptions {
+        flux_fs::CopyOptions {
+            selection: flux_fs::Selection::compile(&typed(patterns), recursive).unwrap(),
+            ..copy_options_default()
+        }
+    }
+
+    #[test]
+    fn the_default_selection_adds_no_line_and_keeps_the_pre_cut_fingerprint() {
+        let o = options_default();
+        assert!(o.exclude.is_empty());
+        assert!(o.recursive);
+        assert_eq!(
+            o.canonical_bytes(),
+            b"flux-config-v1\npreserve_times=default\npreserve_permissions=default\nsafety=default\nexisting=overwrite\n"
+        );
+        assert_eq!(
+            o.fingerprint(),
+            "6814cb38cd3fe6c13a382a988c9c5cbac2ebcf30be0bb4af44596d3019b19f1d",
+            "the pre-cut fingerprint"
+        );
+    }
+
+    #[test]
+    fn exclude_lines_follow_the_existing_ones_sorted() {
+        let o = Options {
+            links: "skip".into(),
+            cross_filesystems: true,
+            exclude: typed(&["b", "a"]),
+            recursive: false,
+            ..options_default()
+        };
+        let mut expected = options_default().canonical_bytes();
+        expected.extend_from_slice(
+            b"links=skip\ncross_filesystems=true\nexclude=a\nexclude=b\nrecursive=false\n",
+        );
+        assert_eq!(o.canonical_bytes(), expected);
+        let only = Options { exclude: typed(&["a", "b"]), ..options_default() };
+        let mut expected = options_default().canonical_bytes();
+        expected.extend_from_slice(b"exclude=a\nexclude=b\n");
+        assert_eq!(only.canonical_bytes(), expected);
+        let flat = Options { recursive: false, ..options_default() };
+        let mut expected = options_default().canonical_bytes();
+        expected.extend_from_slice(b"recursive=false\n");
+        assert_eq!(flat.canonical_bytes(), expected);
+    }
+
+    #[test]
+    fn the_fingerprint_is_independent_of_flag_order_and_duplicates() {
+        let a = Options::of(&selecting(&["b", "a", "b"], true));
+        let b = Options::of(&selecting(&["a", "b"], true));
+        assert_eq!(a.fingerprint(), b.fingerprint());
+        let literal = Options { exclude: typed(&["b", "a", "b"]), ..options_default() };
+        let sorted = Options { exclude: typed(&["a", "b"]), ..options_default() };
+        assert_eq!(literal.canonical_bytes(), sorted.canonical_bytes());
+        assert_eq!(literal.fingerprint(), a.fingerprint());
+        assert_ne!(a.fingerprint(), options_default().fingerprint());
+    }
+
+    #[test]
+    fn a_pre_cut_manifest_decodes_and_resumes() {
+        let o: Options = serde_json::from_str(
+            r#"{"preserve_times":"default","preserve_permissions":"default","durability":"normal","safety":"default","existing":"overwrite"}"#,
+        )
+        .unwrap();
+        assert!(o.exclude.is_empty());
+        assert!(o.recursive);
+        let mut s = tree_v3();
+        s.config.as_mut().unwrap().options = o;
+        assert_eq!(decode(&s.encode()).unwrap(), s);
+    }
+
+    #[test]
+    fn a_default_selection_serialises_without_the_new_keys() {
+        let default = tree_v3();
+        let v: serde_json::Value = serde_json::from_slice(&default.encode()).unwrap();
+        let options = v["options"].as_object().unwrap();
+        assert!(!options.contains_key("exclude"), "{options:?}");
+        assert!(!options.contains_key("recursive"), "{options:?}");
+        let mut s = tree_v3();
+        let o = &mut s.config.as_mut().unwrap().options;
+        o.exclude = typed(&["a"]);
+        o.recursive = false;
+        let v: serde_json::Value = serde_json::from_slice(&s.encode()).unwrap();
+        assert_eq!(v["options"]["exclude"], serde_json::json!(["a"]));
+        assert_eq!(v["options"]["recursive"], serde_json::Value::Bool(false));
+        assert_eq!(decode(&s.encode()).unwrap(), s, "round trip");
+    }
+
+    #[test]
+    fn an_unsorted_or_uncompilable_stored_list_reads_as_corrupt() {
+        let many: Vec<String> = (0..65).map(|i| format!("p{i:03}")).collect();
+        let big: Vec<String> = (0..17).map(|i| format!("{i:0>1000}")).collect();
+        let cases: [(&str, Vec<String>); 6] = [
+            ("unsorted", typed(&["b", "a"])),
+            ("duplicate", typed(&["a", "a"])),
+            ("uncompilable", typed(&["a\\b"])),
+            ("empty pattern", typed(&[""])),
+            ("65 entries", many),
+            ("over 16 KiB", big),
+        ];
+        for (what, list) in cases {
+            let mut s = tree_v3();
+            s.config.as_mut().unwrap().options.exclude = list;
+            assert!(matches!(decode(&s.encode()), Err(Unusable::Corrupt(_))), "{what}");
+        }
+        let mut ok = tree_v3();
+        ok.config.as_mut().unwrap().options.exclude = typed(&["a", "b"]);
+        assert_eq!(decode(&ok.encode()).unwrap(), ok);
+    }
+
+    #[test]
+    fn a_manifest_with_the_largest_accepted_selection_is_under_state_limit() {
+        let patterns: Vec<String> =
+            (0..16).map(|i| format!("{}{i:x}", "\"".repeat(1023))).collect();
+        let selection = flux_fs::Selection::compile(&patterns, true).expect("within the caps");
+        let o = Options::of(&flux_fs::CopyOptions { selection, ..copy_options_default() });
+        assert_eq!(o.exclude.len(), 16);
+        let mut s = tree_v3();
+        s.config.as_mut().unwrap().options = o;
+        let bytes = s.encode();
+        assert!(bytes.len() < STATE_LIMIT, "{} bytes", bytes.len());
+        assert_eq!(decode(&bytes).unwrap(), s);
     }
 
     #[test]

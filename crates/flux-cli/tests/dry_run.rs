@@ -163,6 +163,8 @@ fn prior_in(src: &Path, dst: &Path, id: &str, state: OpState) -> PathBuf {
             existing: "overwrite".to_owned(),
             links: "copy".to_owned(),
             cross_filesystems: false,
+            exclude: Vec::new(),
+            recursive: true,
         },
     );
     let mut st = OperationState::created(id, Kind::Tree, dst, 5, None, config);
@@ -287,6 +289,8 @@ fn a_single_file_restart_lists_its_discards() {
             existing: "overwrite".to_owned(),
             links: "copy".to_owned(),
             cross_filesystems: false,
+            exclude: Vec::new(),
+            recursive: true,
         },
     );
     let fields = flux_core::state::FileFields {
@@ -510,6 +514,8 @@ fn a_dry_run_notes_a_completed_prior_and_still_plans() {
             existing: "overwrite".to_owned(),
             links: "copy".to_owned(),
             cross_filesystems: false,
+            exclude: Vec::new(),
+            recursive: true,
         },
     );
     let mut state = OperationState::created(&id, Kind::Tree, &dst, 5, None, config);
