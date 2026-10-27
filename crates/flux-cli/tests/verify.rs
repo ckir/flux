@@ -590,6 +590,10 @@ fn two_roots(d: &Path) -> (PathBuf, PathBuf, PathBuf) {
 fn three_positionals_verify_each_root_under_dest() {
     let d = TempDir::new().unwrap();
     let (a, b, dest) = two_roots(d.path());
+    // A real several-source copy first (design test 11); `two_roots`' hand-made dest is replaced by it.
+    std::fs::remove_dir_all(&dest).unwrap();
+    let copy = flux().arg("copy").arg(&a).arg(&b).arg(&dest).output().unwrap();
+    assert_eq!(copy.status.code(), Some(0), "{}", stderr(&copy));
     let out = verify(&[&a, &b, &dest]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert_eq!(
@@ -745,6 +749,8 @@ fn refusals_match_copy() {
     std::fs::create_dir_all(&q).unwrap();
     let out = verify(&[&a, &q, &dest]);
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stdout(&out).is_empty(), "{}", stdout(&out));
+    assert!(stderr(&out).contains("error"), "{}", stderr(&out));
 
     #[cfg(unix)]
     {

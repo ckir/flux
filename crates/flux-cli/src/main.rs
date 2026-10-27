@@ -50,10 +50,12 @@ enum Commands {
     Copy(CopyArgs),
     /// Classify and remove what earlier operations left at DEST (§24.4, §251).
     Cleanup(CleanupArgs),
-    /// Compare SOURCE with DEST by content and report what differs; nothing is written.
+    /// Compare SOURCE with DEST by content, or several sources with their `DEST/<name>`, and report what differs;
+    /// nothing is written.
     ///
     /// Every file is read in full on both sides and hashed. Exit 0: nothing missing, mismatched
-    /// or unreadable; 1: something is; 2: a usage error, roots that are the same or nested, a refused source name, two sources that take one name.
+    /// or unreadable; 1: something is; 2: a usage error, roots that are the same or nested, a refused source name,
+    /// two sources that take one name or are one directory on the destination.
     #[command(after_long_help = verify_report::GUARANTEES)]
     Verify(VerifyArgs),
 }

@@ -138,6 +138,7 @@ pub fn summary_line(s: &Summary) -> String {
     line
 }
 
+// The declaration order is the JSON key order and is part of the output contract.
 #[derive(Serialize)]
 struct SummaryBody {
     #[serde(skip_serializing_if = "Option::is_none")]

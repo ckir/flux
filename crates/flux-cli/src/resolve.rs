@@ -72,7 +72,8 @@ pub fn job(source: &Path, dest: &Path) -> Result<Job, Stop> {
 /// §4.1's last row for two or more sources (spec 3.2): each is resolved as `job` resolves one, in this order:
 /// `symlink_metadata` on the path as given, then its kind, then canonicalisation for the name (the canonical path's
 /// final component). DEST is classified as `job` does, and returned canonical with its absent remainder appended.
-/// `cap` is `source_cap`'s figure.
+/// `cap` is `source_cap`'s figure. `verb` fills the usage message `several sources cannot be {verb} the existing file
+/// <DEST>` (copy passes "copied onto", verify "verified against").
 pub fn several(
     sources: &[PathBuf],
     dest: &Path,

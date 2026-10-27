@@ -91,7 +91,10 @@ re-read may be served by the operating system's page cache, so it does not prove
 source (a file or a folder, mapped onto DEST as `flux copy` maps it) with DEST by content and writes nothing. With
 several sources each is compared with `DEST/<name>`, as `flux copy` places it; what else DEST holds is not examined.
 Both sides are walked together in path order and every file is read in full on both sides and hashed. Flux's own control
-state under DEST (`.flux/`, the root lock, partial files) is never compared. Each path is reported as one of:
+state under DEST (`.flux/`, the root lock, partial files) is never compared; under several sources this applies to DEST
+itself, while inside each `DEST/<name>` only `*.flux-partial.<id>` temporaries are hidden and a `.flux` or
+`.flux-root.lock` there is compared as user data (a one-source copy's own residue inside such a root therefore shows as
+`extra`). Each path is reported as one of:
 
 - `match`: the same on both sides (printed only with `--verbose`).
 - `missing`: in the source, absent at the destination.
@@ -103,17 +106,24 @@ state under DEST (`.flux/`, the root lock, partial files) is never compared. Eac
 is another mount is reported as present and not entered unless `--cross-filesystems` is given. Records go to stdout.
 
 Exit status is 0 when nothing is missing, mismatched or unreadable, 1 when something is, and 2 for a usage error or
-roots that are the same or nested. `extra` paths never change the exit status.
+roots that are the same or nested; with several sources a refused source name, two sources that take one name (as bytes
+or as one directory on the destination) and a refused root also exit 2, with nothing on stdout. `extra` paths never
+change the exit status. With several sources stderr carries one
+`root <name>: <matched> matched, <missing> missing, <mismatched> mismatched, <extra> extra, <unreadable> unreadable`
+line per finished root, in both output modes.
 
 A destination-only directory that cannot be listed is reported as `extra` with the error and a stderr warning; it never
 fails the run. A source path that is named like flux control state (`.flux/`, `.flux-root.lock`,
-`*.flux-partial.<id>`) is reported `missing` because verify ignores that name at the destination. In a record, `path`
+`*.flux-partial.<id>`) is reported `missing` because verify ignores that name at the destination (under several sources
+only at DEST itself; inside `DEST/<name>` a `.flux` or `.flux-root.lock` is compared as user data). In a record, `path`
 is shown with `\\`, control characters and non-UTF-8 bytes escaped, so two different names never print alike. If
 stdout cannot be written to (a closed pipe), the run stops at once with exit 1.
 
 `--json` writes newline-delimited JSON on stdout: one object per record (`path`, `outcome`, `kind`, `code`, `detail`),
-then one final `{"summary": {...}}` object with the fields `source`, `dest`, `hash`, `matched`, `missing`,
-`mismatched`, `extra`, `unreadable`, `not_entered`, `bytes_hashed` and `exit`. A run that stops before any walk with
+then one final `{"summary": {...}}` object with, for one source, the fields `source`, `dest`, `hash`, `matched`, `missing`,
+`mismatched`, `extra`, `unreadable`, `not_entered`, `bytes_hashed` and `exit`; with several sources the first field is
+`sources` (an array of the sources in command-line order, canonical after a run that reached the roots, as typed when
+the run stopped during resolution) and there is no `source`. A run that stops before any walk with
 exit 1 prints a summary of all-zero counts with `"exit": 1`, so a script must read `exit`, not recompute it from the
 counts.
 

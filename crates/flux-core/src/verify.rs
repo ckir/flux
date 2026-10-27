@@ -533,7 +533,11 @@ pub fn verify_several<F: DestinationRoot>(
                 );
                 out.summary
             }
-            None => verify_file(fs, &spec.src, &dst, opts, sink)?,
+            // Invariant: no record precedes an exit 2, and `verify_file` has no refusal path today.
+            None => match verify_file(fs, &spec.src, &dst, opts, sink) {
+                Ok(s) => s,
+                Err(_) => unreachable!("verify_file has no refusal path"),
+            },
         };
         on_root_done(&spec.name, &root);
         total.matched += root.matched;
