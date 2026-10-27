@@ -25,7 +25,9 @@ pub const GUARANTEES: &str = "What a pass guarantees:
 
 - A name that differs only in case on a case-insensitive destination is a `missing` plus an `extra`, not a `match`. The same holds for two Unicode normalisations of one name (macOS NFD against NFC): names are compared as raw bytes.
 
-- A mount point the walker did not enter (no `--cross-filesystems`) is reported `match` for its presence only; its contents were NOT compared. The summary's `not_entered` count and the notice line say so, and exit 0 does not mean those contents were verified.";
+- A mount point the walker did not enter (no `--cross-filesystems`) is reported `match` for its presence only; its contents were NOT compared. The summary's `not_entered` count and the notice line say so, and exit 0 does not mean those contents were verified.
+
+- With several sources, only `DEST/<name>` for each source is compared; other entries of DEST are neither reported nor counted.";
 
 /// Append `s` with the backslash, the control characters (U+0000-U+001F, U+007F) escaped.
 fn escape_chars(s: &str, out: &mut String) {

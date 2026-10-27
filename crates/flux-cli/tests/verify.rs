@@ -558,3 +558,246 @@ fn awkward_names_are_unambiguous_and_never_split_a_line() {
     // One line per extra plus the summary, whatever the names hold.
     assert_eq!(stdout(&out).lines().count(), names.len() + 1, "{}", stdout(&out));
 }
+
+const SEVERAL_SUMMARY_KEYS: [&str; 11] = [
+    "sources",
+    "dest",
+    "hash",
+    "matched",
+    "missing",
+    "mismatched",
+    "extra",
+    "unreadable",
+    "not_entered",
+    "bytes_hashed",
+    "exit",
+];
+
+/// `a/x` (`A`), `b/y` (`BB`) and an identical `dest/{a/x, b/y}` under `d`; returns `(a, b, dest)`.
+fn two_roots(d: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let (a, b, dest) = (d.join("a"), d.join("b"), d.join("dest"));
+    for (root, file, bytes) in [(&a, "x", &b"A"[..]), (&b, "y", &b"BB"[..])] {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(root.join(file), bytes).unwrap();
+        let under = dest.join(root.file_name().unwrap());
+        std::fs::create_dir_all(&under).unwrap();
+        std::fs::write(under.join(file), bytes).unwrap();
+    }
+    (a, b, dest)
+}
+
+#[test]
+fn three_positionals_verify_each_root_under_dest() {
+    let d = TempDir::new().unwrap();
+    let (a, b, dest) = two_roots(d.path());
+    let out = verify(&[&a, &b, &dest]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out).lines().last(),
+        Some("verified: 2 matched, 0 missing, 0 mismatched, 0 extra, 0 unreadable; 6 bytes hashed"),
+        "{}",
+        stdout(&out)
+    );
+    std::fs::write(dest.join("b").join("y"), b"BX").unwrap();
+    let out = verify(&[&a, &b, &dest]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stdout(&out).lines().any(|l| l.starts_with("mismatched: b/y: VERIFY_MISMATCH: ")),
+        "{}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn dest_strangers_and_copy_residue_are_invisible() {
+    let d = TempDir::new().unwrap();
+    let (a, b, dest) = two_roots(d.path());
+    std::fs::create_dir_all(dest.join("c")).unwrap();
+    std::fs::write(dest.join("c").join("z"), b"Z").unwrap();
+    std::fs::write(dest.join("a.flux-lock"), b"").unwrap();
+    let state = dest.join(".flux").join("operations").join("0".repeat(32));
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join("state"), b"s").unwrap();
+    let out = verify(&[&a, &b, &dest]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(!stdout(&out).lines().any(|l| l.starts_with("extra:")), "{}", stdout(&out));
+}
+
+#[test]
+fn json_several_summary_has_sources_and_no_source() {
+    let d = TempDir::new().unwrap();
+    let (a, b, dest) = two_roots(d.path());
+    let ta = d.path().join(".").join("a");
+    let tb = d.path().join("b").join("..").join("b");
+    let td = d.path().join(".").join("dest");
+    let out = flux().arg("verify").arg(&ta).arg(&tb).arg(&td).arg("--json").output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = stdout(&out);
+    let last = text.lines().last().unwrap();
+    let v: serde_json::Value = serde_json::from_str(last).unwrap();
+    let s = &v["summary"];
+    assert!(keys_in_order(last, s, &SEVERAL_SUMMARY_KEYS), "{last}");
+    let want = [std::fs::canonicalize(&a).unwrap(), std::fs::canonicalize(&b).unwrap()];
+    let got: Vec<&str> =
+        s["sources"].as_array().unwrap().iter().map(|x| x.as_str().unwrap()).collect();
+    assert_eq!(got, [want[0].to_str().unwrap(), want[1].to_str().unwrap()]);
+    assert_ne!(got[0], ta.to_str().unwrap());
+    assert_ne!(got[1], tb.to_str().unwrap());
+    assert_eq!(
+        s["dest"].as_str().unwrap(),
+        std::fs::canonicalize(&dest).unwrap().to_str().unwrap()
+    );
+
+    // A stopped run prints the strings as typed.
+    let absent = d.path().join("absent");
+    let out = flux().arg("verify").arg(&a).arg(&absent).arg(&dest).arg("--json").output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let lines = ndjson(&out);
+    assert_eq!(lines.len(), 1, "{}", stdout(&out));
+    let s = &lines[0]["summary"];
+    let got: Vec<&str> =
+        s["sources"].as_array().unwrap().iter().map(|x| x.as_str().unwrap()).collect();
+    assert_eq!(got, [a.to_str().unwrap(), absent.to_str().unwrap()]);
+    assert_eq!(s["exit"], 1);
+
+    // The one-source summary is unchanged.
+    let out = flux().arg("verify").arg(&a).arg(dest.join("a")).arg("--json").output().unwrap();
+    let text = stdout(&out);
+    let v: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+    assert!(
+        v["summary"].get("source").is_some() && v["summary"].get("sources").is_none(),
+        "{text}"
+    );
+}
+
+#[test]
+fn per_root_stderr_lines_and_the_absent_dest_lines() {
+    let d = TempDir::new().unwrap();
+    let (a, b, dest) = two_roots(d.path());
+    for json in [false, true] {
+        let mut c = flux();
+        c.arg("verify").arg(&a).arg(&b).arg(&dest);
+        if json {
+            c.arg("--json");
+        }
+        let out = c.output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        let e = stderr(&out);
+        let ra = e
+            .find("root a: 1 matched, 0 missing, 0 mismatched, 0 extra, 0 unreadable")
+            .unwrap_or_else(|| panic!("json={json}: {e}"));
+        let rb = e
+            .find("root b: 1 matched, 0 missing, 0 mismatched, 0 extra, 0 unreadable")
+            .unwrap_or_else(|| panic!("json={json}: {e}"));
+        assert!(ra < rb, "{e}");
+    }
+    let gone = d.path().join("gone");
+    let out = verify(&[&a, &b, &gone]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let e = stderr(&out);
+    let canon = std::fs::canonicalize(d.path()).unwrap().join("gone");
+    for n in ["a", "b"] {
+        let want = format!(
+            "destination does not exist: {}/{n} (every source path is reported missing)",
+            canon.display()
+        );
+        assert!(e.contains(&want), "{e}");
+    }
+    let o = stdout(&out);
+    assert!(o.lines().any(|l| l == "missing: a/x"), "{o}");
+    assert!(o.lines().any(|l| l == "missing: b/y"), "{o}");
+}
+
+#[test]
+fn refusals_match_copy() {
+    let d = TempDir::new().unwrap();
+    let (a, b, dest) = two_roots(d.path());
+
+    let out = verify(&[&a]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stdout(&out).is_empty());
+    assert!(stderr(&out).contains("error"), "{}", stderr(&out));
+
+    let file_dest = d.path().join("file");
+    std::fs::write(&file_dest, b"f").unwrap();
+    let absent = d.path().join("absent");
+    let out = verify(&[&absent, &b, &file_dest]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+
+    let out = verify(&[&a, &b, &file_dest]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("several sources cannot be verified against the existing file"),
+        "{}",
+        stderr(&out)
+    );
+
+    let (x, y) = (d.path().join("x"), d.path().join("y"));
+    for p in [&x, &y] {
+        std::fs::create_dir_all(p.join("a")).unwrap();
+    }
+    let out = verify(&[&x.join("a"), &y.join("a"), &dest]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("error:"), "{}", stderr(&out));
+    assert!(stdout(&out).is_empty(), "{}", stdout(&out));
+
+    let q = d.path().join("q.flux-lock");
+    std::fs::create_dir_all(&q).unwrap();
+    let out = verify(&[&a, &q, &dest]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+
+    #[cfg(unix)]
+    {
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        let out = verify(&[&b, &link, &dest]);
+        assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+        let want = format!(
+            "SYMLINK_CREATION_UNAVAILABLE: {}: a symlink SOURCE is not followed; copy its parent folder, or name its target",
+            link.display()
+        );
+        assert!(stderr(&out).contains(&want), "{}", stderr(&out));
+    }
+}
+
+#[test]
+fn help_shows_the_several_source_synopsis_and_guarantee() {
+    let out = flux().arg("verify").arg("--help").output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let o = stdout(&out);
+    assert!(o.contains("SOURCE... DEST"), "{o}");
+    assert!(o.contains("With several sources, only"), "{o}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_root_name_with_a_newline_or_invalid_bytes_prints_escaped_on_stderr() {
+    let d = TempDir::new().unwrap();
+    let (a, _b, dest) = two_roots(d.path());
+    let odd = d.path().join("a\nb");
+    std::fs::create_dir_all(&odd).unwrap();
+    std::fs::write(odd.join("x"), b"A").unwrap();
+    std::fs::create_dir_all(dest.join("a\nb")).unwrap();
+    std::fs::write(dest.join("a\nb").join("x"), b"A").unwrap();
+    let out = verify(&[&a, &odd, &dest]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let e = stderr(&out);
+    assert!(e.lines().any(|l| l.starts_with("root a\\nb: 1 matched")), "{e:?}");
+}
+
+#[test]
+fn a_refused_root_check_and_a_refused_alias_exit_2_with_nothing_on_stdout() {
+    let d = TempDir::new().unwrap();
+    let (a, _b, dest) = two_roots(d.path());
+    let out = verify(&[&a, &dest, &dest]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stdout(&out).is_empty(), "{}", stdout(&out));
+    let e = stderr(&out);
+    let canon = std::fs::canonicalize(&dest).unwrap();
+    let want = format!(
+        "error: root dest: {}/dest: the destination is the source or lies inside it",
+        canon.display()
+    );
+    assert!(e.contains(&want), "{e}");
+    assert!(e.trim_end().ends_with("; nothing was verified"), "{e}");
+}
