@@ -630,6 +630,7 @@ fn copy_several(args: &CopyArgs) -> u8 {
         sources,
         &destination[0],
         flux_core::run::source_cap(cfg.descriptor_limit),
+        "copied onto",
     ) {
         Ok(planned) => planned,
         Err(Stop::Usage(msg)) => {
