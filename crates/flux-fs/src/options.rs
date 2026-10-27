@@ -129,6 +129,8 @@ pub struct CopyOptions {
     pub cross_filesystems: bool,
     pub verify: VerifyLevel,
     pub hash: HashAlgorithm,
+    /// Cut 16: which entries a walk selects (`--exclude`, `--recursive`/`--no-recursive`); the default selects everything.
+    pub selection: crate::Selection,
 }
 
 #[derive(Debug)]

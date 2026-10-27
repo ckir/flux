@@ -302,6 +302,7 @@ fn options(args: &CopyArgs) -> CopyOptions {
         hash: match args.hash {
             HashArg::Blake3 => flux_fs::HashAlgorithm::Blake3,
         },
+        selection: flux_fs::Selection::default(),
     }
 }
 

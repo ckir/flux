@@ -527,6 +527,7 @@ mod tests {
             cross_filesystems: cross,
             verify: flux_fs::VerifyLevel::None,
             hash: flux_fs::HashAlgorithm::Blake3,
+            selection: flux_fs::Selection::default(),
         };
         assert_eq!(MountPolicy::of(&with(false)), MountPolicy::Stay);
         assert_eq!(MountPolicy::of(&with(true)), MountPolicy::Cross);

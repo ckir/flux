@@ -1907,6 +1907,7 @@ mod tests {
             cross_filesystems: false,
             verify: flux_fs::VerifyLevel::None,
             hash: flux_fs::HashAlgorithm::Blake3,
+            selection: flux_fs::Selection::default(),
         })
     }
 
@@ -2217,6 +2218,7 @@ mod tests {
                 cross_filesystems: false,
                 verify: flux_fs::VerifyLevel::None,
                 hash: flux_fs::HashAlgorithm::Blake3,
+                selection: flux_fs::Selection::default(),
             };
             f(&mut o);
             Options::of(&o)
