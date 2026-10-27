@@ -9,12 +9,15 @@
 //! Two walks, one per root, are merged in lockstep by `FluxPathKey` bytes. Each record is handed to the sink as soon
 //! as it is decided; the engine holds no list of records.
 
+use crate::run::{RunError, SourceKind, SourceSpec, plan_roots};
 use crate::walk::{DEFAULT_MAX_DEPTH, MountPolicy, Walk, WalkEvent, WalkOptions, walk_with};
 use flux_fs::{
-    Code, DestinationRoot, DirHandle, FileSystem, FileType, FluxPathKey, FsError, HashAlgorithm,
-    Links, Safety,
+    Code, DestinationRoot, DirHandle, FileIdentity, FileSystem, FileType, FluxPathKey, FsError,
+    HashAlgorithm, Links, ObjectId, Safety,
 };
 use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 /// What a path turned out to be.
@@ -114,6 +117,13 @@ pub struct VerifyOptions {
 pub enum VerifyError {
     /// Exit 2: the two roots are the same object, or one lies inside the other; nothing was read (design 6.1).
     RefusedRoots { reason: String },
+    /// Exit 2 (several sources): the root check of the source named `name` refused; `reason` is the clause without its
+    /// `; nothing was compared` tail, the by-path-alone note (if any) kept. Nothing was walked.
+    RefusedRoot { name: OsString, reason: String },
+    /// Exit 2 (several sources): the planner refused the names; `reason` is its detail.
+    RefusedNames { reason: String },
+    /// Exit 2 (several sources): two roots are one directory on this filesystem.
+    RefusedAlias { a: OsString, b: OsString },
 }
 
 /// One entry of one side's walk, in the form the merge compares.
@@ -127,6 +137,18 @@ struct Item {
 
 type RawEvent = std::result::Result<WalkEvent, crate::walk::WalkError>;
 
+/// Which of Flux's own control state a side drops from the merge (design 6.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlFilter {
+    /// Nothing is dropped (the source side).
+    None,
+    /// A destination that is itself a Flux root: the top-level `.flux` directory, the root-level `.flux-root.lock`, and
+    /// a copy's partial temporaries.
+    Root,
+    /// A destination root nested inside another: only a copy's partial temporaries; a `.flux` there is user data.
+    NestedRoot,
+}
+
 /// One root's walk, reduced to `Item`s, with one held item for the merge to look at.
 struct Side<'a, F: FileSystem> {
     walk: Option<Walk<'a, F>>,
@@ -137,8 +159,8 @@ struct Side<'a, F: FileSystem> {
     pruned: Option<PathBuf>,
     /// The SOURCE side under `Links::Skip`: symlink items are dropped (design 6.3).
     skip_links: bool,
-    /// The DEST side: Flux's own control state is dropped (design 6.4).
-    control_state: bool,
+    /// The DEST side: which of Flux's own control state is dropped (design 6.4).
+    filter: ControlFilter,
 }
 
 impl<'a, F: FileSystem> Side<'a, F> {
@@ -147,7 +169,7 @@ impl<'a, F: FileSystem> Side<'a, F> {
         root: &Path,
         mounts: MountPolicy,
         skip_links: bool,
-        control_state: bool,
+        filter: ControlFilter,
     ) -> Result<Self, FsError> {
         let walk = walk_with(fs, root, WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts })?;
         Ok(Side {
@@ -157,7 +179,7 @@ impl<'a, F: FileSystem> Side<'a, F> {
             done: false,
             pruned: None,
             skip_links,
-            control_state,
+            filter,
         })
     }
 
@@ -170,7 +192,7 @@ impl<'a, F: FileSystem> Side<'a, F> {
             done: true,
             pruned: None,
             skip_links: false,
-            control_state: false,
+            filter: ControlFilter::None,
         }
     }
 
@@ -196,9 +218,18 @@ impl<'a, F: FileSystem> Side<'a, F> {
         }
     }
 
-    /// Whether `item` is Flux's own control state (design 6.4): a top-level `.flux` directory with all it holds, the
-    /// root-level `.flux-root.lock`, and a copy's `<name>.flux-partial.<id>` temporary at any depth.
-    fn is_control_state(item: &Item) -> bool {
+    /// Whether `item` is Flux's own control state under `filter` (design 6.4). `None` drops nothing. `Root` drops a
+    /// top-level `.flux` directory with all it holds, the root-level `.flux-root.lock`, and a copy's
+    /// `<name>.flux-partial.<id>` temporary at any depth. `NestedRoot` drops only that temporary.
+    fn is_control_state(item: &Item, filter: ControlFilter) -> bool {
+        match filter {
+            ControlFilter::None => false,
+            ControlFilter::Root => Self::is_root_control_state(item),
+            ControlFilter::NestedRoot => Self::is_partial_temporary(item),
+        }
+    }
+
+    fn is_root_control_state(item: &Item) -> bool {
         let mut parts = item.path.components();
         let first = parts.next().map(|c| c.as_os_str());
         let single = parts.next().is_none();
@@ -215,6 +246,10 @@ impl<'a, F: FileSystem> Side<'a, F> {
         {
             return true;
         }
+        Self::is_partial_temporary(item)
+    }
+
+    fn is_partial_temporary(item: &Item) -> bool {
         matches!(item.kind, Kind::File | Kind::Symlink)
             && item
                 .path
@@ -259,9 +294,7 @@ impl<'a, F: FileSystem> Side<'a, F> {
                 | Ok(WalkEvent::MountSkipped { .. })
                 | Ok(WalkEvent::MountUnknown { .. }) => continue,
             };
-            if self.under_pruned(&item.path)
-                || (self.control_state && Self::is_control_state(&item))
-            {
+            if self.under_pruned(&item.path) || Self::is_control_state(&item, self.filter) {
                 continue;
             }
             return Some(item);
@@ -371,29 +404,221 @@ pub fn verify_tree_notifying<F: DestinationRoot>(
     on_absent: &mut dyn FnMut(),
     sink: &mut dyn FnMut(Record),
 ) -> Result<Summary, VerifyError> {
-    let mut out = Emitter { summary: Summary::default(), sink };
-    let dst_absent = match check_roots(fs, src, dst) {
-        Ok(absent) => absent,
-        Err(RootsCheck::Refused(reason)) => return Err(VerifyError::RefusedRoots { reason }),
-        Err(RootsCheck::Unreadable(side, e)) => {
-            return Ok(root_unreadable(out, &format!("{side}{}", e.source), e.code));
-        }
-    };
-    if dst_absent {
+    verify_tree_filtered(fs, src, dst, opts, ControlFilter::Root, on_absent, sink)
+}
+
+/// `verify_tree_notifying` with the destination side's control-state `filter` chosen by the caller.
+pub(crate) fn verify_tree_filtered<F: DestinationRoot>(
+    fs: &F,
+    src: &Path,
+    dst: &Path,
+    opts: &VerifyOptions,
+    filter: ControlFilter,
+    on_absent: &mut dyn FnMut(),
+    sink: &mut dyn FnMut(Record),
+) -> Result<Summary, VerifyError> {
+    let mut out = Emitter { summary: Summary::default(), sink: &mut *sink };
+    let verdict =
+        check_pair(fs, src, dst).map_err(|reason| VerifyError::RefusedRoots { reason })?;
+    if matches!(verdict, RootVerdict::Absent) {
         on_absent();
     }
-    // The source walk is built first, then the destination's (a test pins the `read_dir` order).
-    let mut a = match Side::new(fs, src, opts.mounts, opts.links == Links::Skip, false) {
-        Ok(a) => a,
-        Err(e) => return Ok(root_unreadable(out, &format!("{SOURCE}{}", e.source), e.code)),
+    walk_checked(fs, src, dst, opts, filter, verdict, &mut out);
+    Ok(out.summary)
+}
+
+const NOTHING_COMPARED: &str = "; nothing was compared";
+
+/// A root-check refusal `reason` without its `; nothing was compared` tail; what follows the tail is kept.
+fn strip_compared_tail(reason: &str) -> String {
+    match reason.split_once(NOTHING_COMPARED) {
+        Some((head, rest)) => format!("{head}{rest}"),
+        None => reason.to_string(),
+    }
+}
+
+/// Several sources against `dest` (design 6.2 to 6.5): each root is compared with `dest/<name>`, in the order of the
+/// copy's root planner. Every root is checked before any is walked, so a refusal prints nothing. A folder root's paths
+/// are re-rooted under its name; a file root's single record already carries it. `on_absent` fires for a folder
+/// root whose destination does not exist, `on_root_done` after each root with that root's counts.
+pub fn verify_several<F: DestinationRoot>(
+    fs: &F,
+    specs: Vec<SourceSpec>,
+    dest: &Path,
+    opts: &VerifyOptions,
+    on_absent: &mut dyn FnMut(&OsStr),
+    on_root_done: &mut dyn FnMut(&OsStr, &Summary),
+    sink: &mut dyn FnMut(Record),
+) -> Result<Summary, VerifyError> {
+    let specs = plan_roots(specs).map_err(|e| match e {
+        RunError::Refused { refusal, .. } => VerifyError::RefusedNames { reason: refusal.detail },
+        RunError::Failed { .. } => unreachable!("the root planner only refuses"),
+    })?;
+    let mut verdicts = Vec::with_capacity(specs.len());
+    for spec in &specs {
+        let verdict = match spec.kind {
+            SourceKind::Folder => {
+                let dst = dest.join(&spec.name);
+                // The destination's own type, not its target's: a link at `DEST/<name>` is a wrong type.
+                match fs.metadata(&dst) {
+                    Ok(m) if m.file_type != FileType::Dir => {
+                        Some(RootVerdict::WrongType(file_kind(m.file_type)))
+                    }
+                    Err(e) if e.source.kind() != std::io::ErrorKind::NotFound => {
+                        Some(RootVerdict::Unreadable { side: DESTINATION, error: e })
+                    }
+                    _ => Some(check_pair(fs, &spec.src, &dst).map_err(|reason| {
+                        VerifyError::RefusedRoot {
+                            name: spec.name.clone(),
+                            reason: strip_compared_tail(&reason),
+                        }
+                    })?),
+                }
+            }
+            SourceKind::File => None,
+        };
+        verdicts.push(verdict);
+    }
+    // Two folder roots that are one directory on the destination (design 6.2): the first name per Strong identity.
+    // Run after the whole loop so a refused root wins, and before any walk so nothing remembered is emitted.
+    let mut seen: HashMap<ObjectId, OsString> = HashMap::new();
+    for (spec, verdict) in specs.iter().zip(&verdicts) {
+        if let Some(RootVerdict::Checked { dest_identity: Some(id) }) = verdict {
+            match seen.get(id) {
+                Some(a) => {
+                    return Err(VerifyError::RefusedAlias { a: a.clone(), b: spec.name.clone() });
+                }
+                None => {
+                    seen.insert(*id, spec.name.clone());
+                }
+            }
+        }
+    }
+    let mut total = Summary::default();
+    for (spec, verdict) in specs.iter().zip(verdicts) {
+        let dst = dest.join(&spec.name);
+        let root = match verdict {
+            Some(RootVerdict::WrongType(k)) => {
+                let mut out = Emitter { summary: Summary::default(), sink: &mut *sink };
+                out.emit(Record {
+                    path: PathBuf::from(&spec.name),
+                    outcome: Outcome::Mismatched,
+                    kind: Kind::Dir,
+                    code: Some(Code::VerifyMismatch),
+                    detail: format!("source dir, destination {}", k.as_str()),
+                });
+                out.summary
+            }
+            Some(verdict) => {
+                if matches!(verdict, RootVerdict::Absent) {
+                    on_absent(&spec.name);
+                }
+                let mut reroot = |mut r: Record| {
+                    r.path = if r.path == Path::new(".") {
+                        PathBuf::from(&spec.name)
+                    } else {
+                        Path::new(&spec.name).join(&r.path)
+                    };
+                    sink(r);
+                };
+                let mut out = Emitter { summary: Summary::default(), sink: &mut reroot };
+                walk_checked(
+                    fs,
+                    &spec.src,
+                    &dst,
+                    opts,
+                    ControlFilter::NestedRoot,
+                    verdict,
+                    &mut out,
+                );
+                out.summary
+            }
+            // Invariant: no record precedes an exit 2, and `verify_file` has no refusal path today.
+            None => match verify_file(fs, &spec.src, &dst, opts, sink) {
+                Ok(s) => s,
+                Err(_) => unreachable!("verify_file has no refusal path"),
+            },
+        };
+        on_root_done(&spec.name, &root);
+        total.matched += root.matched;
+        total.missing += root.missing;
+        total.mismatched += root.mismatched;
+        total.extra += root.extra;
+        total.unreadable += root.unreadable;
+        total.not_entered += root.not_entered;
+        total.bytes_hashed += root.bytes_hashed;
+    }
+    Ok(total)
+}
+
+/// What the root check decided for one source and destination pair.
+#[derive(Debug)]
+enum RootVerdict {
+    /// The destination does not exist and is to be treated as empty.
+    Absent,
+    /// A root could not be examined: the root record `.` is reported, nothing is walked.
+    Unreadable { side: &'static str, error: FsError },
+    /// A folder root's destination exists but is not a directory (several sources only; never produced by
+    /// `check_pair`).
+    WrongType(Kind),
+    /// The roots are distinct and both exist. `dest_identity` is the destination directory's identity when it is
+    /// `Strong`, the only kind the alias rule trusts.
+    Checked { dest_identity: Option<ObjectId> },
+}
+
+/// The root check of one pair (design 6.2): no directory is listed. `Err(reason)` is a refusal.
+fn check_pair<F: DestinationRoot>(fs: &F, src: &Path, dst: &Path) -> Result<RootVerdict, String> {
+    match check_roots(fs, src, dst) {
+        Ok(Presence::Absent) => Ok(RootVerdict::Absent),
+        Ok(Presence::Present(identity)) => Ok(RootVerdict::Checked {
+            dest_identity: match identity {
+                FileIdentity::Strong(id) => Some(id),
+                FileIdentity::Weak(_) | FileIdentity::Unavailable => None,
+            },
+        }),
+        Err(RootsCheck::Refused(reason)) => Err(reason),
+        Err(RootsCheck::Unreadable(side, error)) => Ok(RootVerdict::Unreadable { side, error }),
+    }
+}
+
+/// The walk of one checked pair (design 6.3), its records emitted through `out`.
+fn walk_checked<F: DestinationRoot>(
+    fs: &F,
+    src: &Path,
+    dst: &Path,
+    opts: &VerifyOptions,
+    filter: ControlFilter,
+    verdict: RootVerdict,
+    out: &mut Emitter<'_>,
+) {
+    let dst_absent = match verdict {
+        RootVerdict::Unreadable { side, error } => {
+            root_unreadable(out, &format!("{side}{}", error.source), error.code);
+            return;
+        }
+        RootVerdict::Absent => true,
+        RootVerdict::Checked { .. } => false,
+        RootVerdict::WrongType(_) => {
+            unreachable!("only verify_several probes the type, and it reports it itself")
+        }
     };
+    // The source walk is built first, then the destination's (a test pins the `read_dir` order).
+    let mut a =
+        match Side::new(fs, src, opts.mounts, opts.links == Links::Skip, ControlFilter::None) {
+            Ok(a) => a,
+            Err(e) => {
+                root_unreadable(out, &format!("{SOURCE}{}", e.source), e.code);
+                return;
+            }
+        };
     let mut b = if dst_absent {
         Side::empty()
     } else {
-        match Side::new(fs, dst, opts.mounts, false, true) {
+        match Side::new(fs, dst, opts.mounts, false, filter) {
             Ok(b) => b,
             Err(e) => {
-                return Ok(root_unreadable(out, &format!("{DESTINATION}{}", e.source), e.code));
+                root_unreadable(out, &format!("{DESTINATION}{}", e.source), e.code);
+                return;
             }
         }
     };
@@ -408,20 +633,19 @@ pub fn verify_tree_notifying<F: DestinationRoot>(
         match order {
             Ordering::Less => {
                 let x = a.take().expect("peeked");
-                alone(&mut out, &x, Outcome::Missing, &mut a, &mut b);
+                alone(out, &x, Outcome::Missing, &mut a, &mut b);
             }
             Ordering::Greater => {
                 let y = b.take().expect("peeked");
-                alone(&mut out, &y, Outcome::Extra, &mut a, &mut b);
+                alone(out, &y, Outcome::Extra, &mut a, &mut b);
             }
             Ordering::Equal => {
                 let x = a.take().expect("peeked");
                 let y = b.take().expect("peeked");
-                pair(fs, (src, dst), &mut out, &mut buf, (&x, &y), (&mut a, &mut b));
+                pair(fs, (src, dst), out, &mut buf, (&x, &y), (&mut a, &mut b));
             }
         }
     }
-    Ok(out.summary)
 }
 
 /// Why the root check stopped the run.
@@ -467,9 +691,16 @@ fn sided_check<F: DestinationRoot>(
     }
 }
 
-/// The root check (design 6.1), run before any directory is listed or file opened. `Ok(true)` when the destination
-/// does not exist and is to be treated as empty.
-fn check_roots<F: DestinationRoot>(fs: &F, src: &Path, dst: &Path) -> Result<bool, RootsCheck> {
+/// What the root check found at the destination.
+enum Presence {
+    Absent,
+    /// The destination's identity.
+    Present(FileIdentity),
+}
+
+/// The root check (design 6.1), run before any directory is listed or file opened. `Presence::Absent` when the destination
+/// does not exist and is to be treated as empty, else the destination's identity.
+fn check_roots<F: DestinationRoot>(fs: &F, src: &Path, dst: &Path) -> Result<Presence, RootsCheck> {
     use crate::tree::{lexically_within, preflight};
     let d = match fs.destination_root(dst) {
         Ok(d) => d,
@@ -477,7 +708,7 @@ fn check_roots<F: DestinationRoot>(fs: &F, src: &Path, dst: &Path) -> Result<boo
             if lexically_within(dst, src) {
                 return Err(RootsCheck::Refused(REFUSED_DST_IN_SRC.to_string()));
             }
-            return Ok(true);
+            return Ok(Presence::Absent);
         }
         Err(e) => return Err(RootsCheck::Unreadable(DESTINATION, e)),
     };
@@ -497,13 +728,12 @@ fn check_roots<F: DestinationRoot>(fs: &F, src: &Path, dst: &Path) -> Result<boo
             return Err(RootsCheck::Refused(format!("{REFUSED_SRC_IN_DST}{BY_PATH_ALONE}")));
         }
     }
-    Ok(false)
+    Ok(Presence::Present(di))
 }
 
 /// The run ends at the root record `.` (design 6.6): one `unreadable`, nothing walked.
-fn root_unreadable(mut out: Emitter<'_>, detail: &str, code: Code) -> Summary {
+fn root_unreadable(out: &mut Emitter<'_>, detail: &str, code: Code) {
     out.unreadable(PathBuf::from("."), Kind::Dir, code, detail.to_string());
-    out.summary
 }
 
 /// An item present on one side only: `missing` or `extra`. When its walk failed (both sides are then pruned): a
@@ -663,7 +893,7 @@ pub fn verify_file<F: FileSystem>(
     _opts: &VerifyOptions,
     sink: &mut dyn FnMut(Record),
 ) -> Result<Summary, VerifyError> {
-    let mut out = Emitter { summary: Summary::default(), sink };
+    let mut out = Emitter { summary: Summary::default(), sink: &mut *sink };
     let name = PathBuf::from(dst.file_name().unwrap_or(dst.as_os_str()));
     let src_type = match fs.metadata(src) {
         Ok(m) => file_kind(m.file_type),
@@ -1147,6 +1377,42 @@ mod tests {
         assert_eq!((s.missing, s.extra, s.matched), (1, 1, 0));
         assert!(s.failed());
         assert!(!fs.called("open_read("));
+    }
+
+    #[test]
+    fn a_users_dot_flux_inside_a_nested_root_is_compared_and_a_partial_temporary_is_hidden() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        fs.create_dir(Path::new("/d")).unwrap();
+        tree(&fs, "/s/a", &[".flux"], &[(".flux/x", b"x"), (".flux-root.lock", b"l"), ("f", b"f")]);
+        let partial = format!("f.flux-partial.{ZEROS}");
+        tree(
+            &fs,
+            "/d/a",
+            &[".flux"],
+            &[(".flux/x", b"x"), (".flux-root.lock", b"l"), ("f", b"f"), (partial.as_str(), b"p")],
+        );
+        let mut rows = Vec::new();
+        let s = verify_tree_filtered(
+            &fs,
+            Path::new("/s/a"),
+            Path::new("/d/a"),
+            &opts(),
+            ControlFilter::NestedRoot,
+            &mut || {},
+            &mut |r| rows.push(row(&r)),
+        )
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                rec(".flux", Outcome::Match, Kind::Dir),
+                rec(".flux/x", Outcome::Match, Kind::File),
+                rec(".flux-root.lock", Outcome::Match, Kind::File),
+                rec("f", Outcome::Match, Kind::File),
+            ]
+        );
+        assert_eq!((s.matched, s.extra, s.missing), (4, 0, 0));
     }
 
     #[test]
@@ -1792,5 +2058,520 @@ mod tests {
         assert!(fs.called("metadata(/d/a)"));
         assert!(!fs.called("open_read("));
         assert_eq!((s.unreadable, s.missing, s.bytes_hashed), (1, 0, 0));
+    }
+
+    #[test]
+    fn check_pair_classifies_a_checked_an_absent_and_a_refused_pair() {
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[]);
+        tree(&fs, "/d", &[], &[]);
+        assert!(matches!(
+            check_pair(&fs, Path::new("/s"), Path::new("/d")),
+            Ok(RootVerdict::Checked { .. })
+        ));
+        assert!(matches!(
+            check_pair(&fs, Path::new("/s"), Path::new("/gone")),
+            Ok(RootVerdict::Absent)
+        ));
+        tree(&fs, "/s/d", &[], &[]);
+        let reason = check_pair(&fs, Path::new("/s"), Path::new("/s/d")).unwrap_err();
+        assert!(reason.starts_with(REFUSED_DST_IN_SRC), "{reason}");
+        match check_pair(&fs, Path::new("/nosrc"), Path::new("/d")) {
+            Ok(RootVerdict::Unreadable { side, .. }) => assert_eq!(side, SOURCE),
+            _ => panic!("an absent source must be unreadable"),
+        }
+    }
+
+    fn spec(src: &str, name: &str, kind: crate::run::SourceKind) -> crate::run::SourceSpec {
+        crate::run::SourceSpec { src: PathBuf::from(src), name: name.into(), kind }
+    }
+
+    type Several = (Vec<Row>, Vec<(String, Summary)>, Vec<String>, Summary);
+    type SeveralRaw = (Vec<Row>, Vec<(String, Summary)>, Vec<String>, Result<Summary, VerifyError>);
+
+    fn several_result(
+        fs: &FaultFs,
+        specs: Vec<crate::run::SourceSpec>,
+        dest: &str,
+        o: &VerifyOptions,
+    ) -> SeveralRaw {
+        let mut rows = Vec::new();
+        let mut roots = Vec::new();
+        let mut absent = Vec::new();
+        let total = verify_several(
+            fs,
+            specs,
+            Path::new(dest),
+            o,
+            &mut |n| absent.push(n.to_string_lossy().into_owned()),
+            &mut |n, s| roots.push((n.to_string_lossy().into_owned(), s.clone())),
+            &mut |r| rows.push(row(&r)),
+        );
+        (rows, roots, absent, total)
+    }
+
+    fn several(
+        fs: &FaultFs,
+        specs: Vec<crate::run::SourceSpec>,
+        dest: &str,
+        o: &VerifyOptions,
+    ) -> Several {
+        let (rows, roots, absent, total) = several_result(fs, specs, dest, o);
+        (rows, roots, absent, total.unwrap())
+    }
+
+    /// `/s/<n>` and `/d/<n>` for each name, empty; the case-sensitive fake models an aliasing destination through
+    /// `set_identity`.
+    fn alias_fixture(names: &[&str]) -> FaultFs {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        fs.create_dir(Path::new("/d")).unwrap();
+        for n in names {
+            tree(&fs, &format!("/s/{n}"), &[], &[]);
+            tree(&fs, &format!("/d/{n}"), &[], &[]);
+        }
+        fs
+    }
+
+    fn one_id() -> flux_fs::ObjectId {
+        flux_fs::ObjectId { volume: 1, index: 999 }
+    }
+
+    fn alias_pair(fs: &FaultFs, id: flux_fs::FileIdentity) {
+        fs.set_identity("/d/Data", id);
+        fs.set_identity("/d/data", id);
+    }
+
+    fn data_specs() -> Vec<crate::run::SourceSpec> {
+        use crate::run::SourceKind::Folder;
+        vec![spec("/s/data", "data", Folder), spec("/s/Data", "Data", Folder)]
+    }
+
+    #[test]
+    fn two_root_names_that_alias_on_the_destination_are_refused_before_any_read() {
+        let strong = flux_fs::FileIdentity::Strong(one_id());
+        // Arm 1: one Strong identity for two directories.
+        let fs = alias_fixture(&["Data", "data"]);
+        alias_pair(&fs, strong);
+        let (rows, _, _, r) = several_result(&fs, data_specs(), "/d", &opts());
+        match r {
+            Err(VerifyError::RefusedAlias { a, b }) => {
+                assert_eq!((a.to_str(), b.to_str()), (Some("Data"), Some("data")));
+            }
+            other => panic!("expected RefusedAlias, got {other:?}"),
+        }
+        assert!(!fs.called("read_dir(/s/Data)") && !fs.called("read_dir(/s/data)"));
+        assert!(!fs.called("read_dir(/d/Data)") && !fs.called("read_dir(/d/data)"));
+        assert!(rows.is_empty(), "{rows:?}");
+
+        // Arm 2: their own minted identities.
+        let fs = alias_fixture(&["Data", "data"]);
+        let (_, roots, _, r) = several_result(&fs, data_specs(), "/d", &opts());
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(roots.len(), 2);
+
+        // Arm 3: equal but Weak.
+        let fs = alias_fixture(&["Data", "data"]);
+        alias_pair(&fs, flux_fs::FileIdentity::Weak(one_id()));
+        let (_, roots, _, r) = several_result(&fs, data_specs(), "/d", &opts());
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(roots.len(), 2);
+
+        // Arm 4: equal and Strong, but Data's source is absent: no identity was obtained for it.
+        let fs = alias_fixture(&["data"]);
+        fs.create_dir(Path::new("/d/Data")).unwrap();
+        alias_pair(&fs, strong);
+        let (rows, roots, _, r) = several_result(&fs, data_specs(), "/d", &opts());
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(roots.len(), 2);
+        assert!(rows.iter().any(|x| x.0 == "Data" && x.1 == Outcome::Unreadable), "{rows:?}");
+
+        // Arm 5: an absent third root beside the aliasing pair does not hide the alias.
+        use crate::run::SourceKind::Folder;
+        let fs = alias_fixture(&["Data", "data"]);
+        alias_pair(&fs, strong);
+        let mut specs = data_specs();
+        specs.push(spec("/s/other", "other", Folder));
+        let (_, _, _, r) = several_result(&fs, specs, "/d", &opts());
+        assert!(matches!(r, Err(VerifyError::RefusedAlias { .. })), "{r:?}");
+    }
+
+    #[test]
+    fn a_refused_root_check_wins_over_an_alias_and_discards_remembered_verdicts() {
+        use crate::run::SourceKind::Folder;
+        let build = || {
+            let fs = alias_fixture(&["Data", "data"]);
+            alias_pair(&fs, flux_fs::FileIdentity::Strong(one_id()));
+            fs.create_dir(Path::new("/d/a")).unwrap();
+            fs
+        };
+        let base = || {
+            let mut specs = data_specs();
+            specs.push(spec("/s/a", "a", Folder));
+            specs
+        };
+        // Control: no refused root, so the alias is what comes back (and `a`, unreadable, is discarded).
+        let fs = build();
+        let (rows, _, _, r) = several_result(&fs, base(), "/d", &opts());
+        assert!(matches!(r, Err(VerifyError::RefusedAlias { .. })), "{r:?}");
+        assert!(rows.is_empty(), "{rows:?}");
+
+        let fs = build();
+        let mut specs = base();
+        specs.push(spec("/d", "z", Folder));
+        let (rows, _, _, r) = several_result(&fs, specs, "/d", &opts());
+        match r {
+            Err(VerifyError::RefusedRoot { name, .. }) => assert_eq!(name.to_str(), Some("z")),
+            other => panic!("expected RefusedRoot, got {other:?}"),
+        }
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    #[test]
+    fn several_roots_stream_in_prefix_order_with_re_rooted_paths() {
+        use crate::run::SourceKind::Folder;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        tree(&fs, "/d", &["a", "a-b", "b"], &[("a/x", b"1"), ("a-b/x", b"1"), ("b/x", b"1")]);
+        for n in ["a", "a-b", "b"] {
+            tree(&fs, &format!("/s/{n}"), &[], &[("x", b"1")]);
+        }
+        let specs = vec![
+            spec("/s/b", "b", Folder),
+            spec("/s/a-b", "a-b", Folder),
+            spec("/s/a", "a", Folder),
+        ];
+        let (rows, roots, absent, total) = several(&fs, specs, "/d", &opts());
+        assert_eq!(
+            rows,
+            vec![
+                rec("a/x", Outcome::Match, Kind::File),
+                rec("a-b/x", Outcome::Match, Kind::File),
+                rec("b/x", Outcome::Match, Kind::File),
+            ]
+        );
+        let names: Vec<_> = roots.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["a", "a-b", "b"]);
+        assert!(absent.is_empty());
+        assert_eq!(total.matched, 3);
+    }
+
+    #[test]
+    fn a_file_root_is_one_record_named_after_the_root() {
+        use crate::run::SourceKind::File;
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("f", b"abc")]);
+        tree(&fs, "/d", &[], &[("f", b"abc")]);
+        let (rows, roots, _, _) = several(&fs, vec![spec("/s/f", "f", File)], "/d", &opts());
+        assert_eq!(rows, vec![rec("f", Outcome::Match, Kind::File)]);
+        assert_eq!(roots.len(), 1);
+
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("f", b"abc")]);
+        tree(&fs, "/d", &[], &[]);
+        let (rows, _, _, total) = several(&fs, vec![spec("/s/f", "f", File)], "/d", &opts());
+        assert_eq!(rows, vec![rec("f", Outcome::Missing, Kind::File)]);
+        assert_eq!(total.missing, 1);
+    }
+
+    #[test]
+    fn an_absent_dest_reports_every_root_missing_and_notifies_each_folder_root() {
+        use crate::run::SourceKind::{File, Folder};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        tree(&fs, "/s/a", &[], &[("x", b"1"), ("y", b"2")]);
+        tree(&fs, "/s/b", &[], &[("z", b"3")]);
+        fs.write_file("/s/f", b"4");
+        let specs =
+            vec![spec("/s/f", "f", File), spec("/s/b", "b", Folder), spec("/s/a", "a", Folder)];
+        let (rows, _, absent, total) = several(&fs, specs, "/d", &opts());
+        assert_eq!(absent, ["a", "b"]);
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().all(|r| r.1 == Outcome::Missing), "{rows:?}");
+        assert_eq!(total.missing, 4);
+    }
+
+    #[test]
+    fn a_root_created_after_it_was_checked_absent_still_reports_missing() {
+        use crate::run::SourceKind::Folder;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        fs.create_dir(Path::new("/d")).unwrap();
+        tree(&fs, "/s/a", &[], &[("x", b"1")]);
+        let mut rows = Vec::new();
+        let total = verify_several(
+            &fs,
+            vec![spec("/s/a", "a", Folder)],
+            Path::new("/d"),
+            &opts(),
+            // The destination appears between the check phase and the walk (design 6.2: no re-probe).
+            &mut |_| tree(&fs, "/d/a", &[], &[("x", b"1")]),
+            &mut |_, _| {},
+            &mut |r| rows.push(row(&r)),
+        )
+        .unwrap();
+        assert!(fs.exists(Path::new("/d/a/x")), "the fixture must have created the destination");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!((rows[0].0.as_str(), rows[0].1), ("a/x", Outcome::Missing));
+        assert_eq!(total.missing, 1);
+        assert_eq!(total.matched, 0);
+    }
+
+    #[test]
+    fn a_mount_notice_carries_the_re_rooted_path() {
+        use crate::run::SourceKind::Folder;
+        let o = VerifyOptions { mounts: MountPolicy::Stay, ..opts() };
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        fs.create_dir(Path::new("/d")).unwrap();
+        tree(&fs, "/s/b", &["m"], &[]);
+        tree(&fs, "/d/b", &["m"], &[]);
+        fs.set_mount_root("/s/b/m", MountRoot::Yes);
+        fs.set_mount_root("/d/b/m", MountRoot::Yes);
+        let (rows, _, _, total) = several(&fs, vec![spec("/s/b", "b", Folder)], "/d", &o);
+        assert_eq!(
+            rows,
+            vec![(
+                "b/m".to_string(),
+                Outcome::Match,
+                Kind::Dir,
+                None,
+                MOUNT_NOT_ENTERED.to_string()
+            )]
+        );
+        assert_eq!(total.not_entered, 1);
+    }
+
+    #[test]
+    fn per_root_summaries_sum_to_the_total() {
+        use crate::run::SourceKind::Folder;
+        let o = VerifyOptions { mounts: MountPolicy::Stay, ..opts() };
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        fs.create_dir(Path::new("/d")).unwrap();
+        tree(&fs, "/s/a", &[], &[("p", b"aa")]);
+        tree(&fs, "/d/a", &[], &[("p", b"bb"), ("e", b"e")]);
+        tree(&fs, "/s/b", &["m"], &[("u", b"u")]);
+        tree(&fs, "/d/b", &["m"], &[]);
+        fs.set_mount_root("/s/b/m", MountRoot::Yes);
+        fs.set_mount_root("/d/b/m", MountRoot::Yes);
+        tree(&fs, "/s/c", &[], &[("k", b"kkk"), ("l", b"lll")]);
+        tree(&fs, "/d/c", &[], &[("k", b"kkk"), ("l", b"lll")]);
+        fs.create_dir(Path::new("/d/d")).unwrap();
+        let specs = ["a", "b", "c", "d"].map(|n| spec(&format!("/s/{n}"), n, Folder)).to_vec();
+        let (_, roots, _, total) = several(&fs, specs, "/d", &o);
+        let names: Vec<_> = roots.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c", "d"]);
+        let mut sum = Summary::default();
+        for (_, s) in &roots {
+            sum.matched += s.matched;
+            sum.missing += s.missing;
+            sum.mismatched += s.mismatched;
+            sum.extra += s.extra;
+            sum.unreadable += s.unreadable;
+            sum.not_entered += s.not_entered;
+            sum.bytes_hashed += s.bytes_hashed;
+        }
+        assert_eq!(sum, total);
+        for (field, v) in [
+            ("matched", total.matched),
+            ("missing", total.missing),
+            ("mismatched", total.mismatched),
+            ("extra", total.extra),
+            ("unreadable", total.unreadable),
+            ("not_entered", total.not_entered),
+            ("bytes_hashed", total.bytes_hashed),
+        ] {
+            assert!(v > 0, "{field} is zero in {total:?}");
+        }
+    }
+
+    #[test]
+    fn a_source_inside_another_source_is_its_own_root() {
+        use crate::run::SourceKind::{File, Folder};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        tree(&fs, "/s/a", &[], &[("f", b"1"), ("g", b"2")]);
+        tree(&fs, "/d", &["a"], &[("a/f", b"1"), ("a/g", b"2"), ("f", b"1")]);
+        let specs = vec![spec("/s/a/f", "f", File), spec("/s/a", "a", Folder)];
+        let (rows, _, _, _) = several(&fs, specs, "/d", &opts());
+        assert_eq!(
+            rows,
+            vec![
+                rec("a/f", Outcome::Match, Kind::File),
+                rec("a/g", Outcome::Match, Kind::File),
+                rec("f", Outcome::Match, Kind::File),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_users_dot_flux_inside_a_root_is_compared_through_verify_several() {
+        use crate::run::SourceKind::Folder;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        fs.create_dir(Path::new("/d")).unwrap();
+        tree(&fs, "/s/a", &[".flux"], &[(".flux/x", b"x"), (".flux-root.lock", b"l")]);
+        let partial = format!("f.flux-partial.{ZEROS}");
+        tree(
+            &fs,
+            "/d/a",
+            &[".flux"],
+            &[(".flux/x", b"x"), (".flux-root.lock", b"l"), (partial.as_str(), b"p")],
+        );
+        let (rows, _, _, _) = several(&fs, vec![spec("/s/a", "a", Folder)], "/d", &opts());
+        assert_eq!(
+            rows,
+            vec![
+                rec("a/.flux", Outcome::Match, Kind::Dir),
+                rec("a/.flux/x", Outcome::Match, Kind::File),
+                rec("a/.flux-root.lock", Outcome::Match, Kind::File),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_root_check_refusal_on_a_later_root_prints_nothing() {
+        use crate::run::SourceKind::Folder;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        tree(&fs, "/s/a", &[], &[("x", b"1")]);
+        tree(&fs, "/d", &["a", "b"], &[("a/x", b"1")]);
+        let specs = vec![spec("/s/a", "a", Folder), spec("/d", "b", Folder)];
+        let (rows, roots, absent, total) = several_result(&fs, specs, "/d", &opts());
+        let Err(VerifyError::RefusedRoot { name, reason }) = total else {
+            panic!("expected RefusedRoot");
+        };
+        assert_eq!(name, std::ffi::OsString::from("b"));
+        assert_eq!(reason, "the destination is the source or lies inside it");
+        assert!(rows.is_empty() && roots.is_empty() && absent.is_empty());
+    }
+
+    #[test]
+    fn two_sources_with_one_name_are_refused_before_any_read() {
+        use crate::run::SourceKind::Folder;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        tree(&fs, "/s/p", &[], &[]);
+        tree(&fs, "/s/q", &[], &[]);
+        tree(&fs, "/d", &[], &[]);
+        let specs = vec![spec("/s/p", "x", Folder), spec("/s/q", "x", Folder)];
+        let (rows, _, _, total) = several_result(&fs, specs, "/d", &opts());
+        assert!(matches!(total, Err(VerifyError::RefusedNames { .. })));
+        assert!(rows.is_empty());
+        let calls = fs.calls();
+        assert!(!calls.iter().any(|c| c.starts_with("read_dir(") || c.starts_with("open_read(")));
+    }
+    #[test]
+    fn a_root_whose_destination_has_the_wrong_type_is_one_mismatched_record_and_the_run_goes_on() {
+        use crate::run::SourceKind::{File, Folder};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        for n in ["a", "b", "c"] {
+            tree(&fs, &format!("/s/{n}"), &[], &[("x", b"1")]);
+        }
+        fs.write_file("/s/f", b"1");
+        tree(&fs, "/d", &["b", "f"], &[("b/x", b"1")]);
+        fs.write_file("/d/a", b"not a dir");
+        fs.add_symlink_to("/d/c", "/d/b", LinkKind::Dir);
+        let specs = vec![
+            spec("/s/c", "c", Folder),
+            spec("/s/b", "b", Folder),
+            spec("/s/a", "a", Folder),
+            spec("/s/f", "f", File),
+        ];
+        let (rows, roots, _, total) = several(&fs, specs, "/d", &opts());
+        assert_eq!(
+            rows,
+            vec![
+                mm("a", Kind::Dir, "source dir, destination file"),
+                rec("b/x", Outcome::Match, Kind::File),
+                mm("c", Kind::Dir, "source dir, destination symlink"),
+                mm("f", Kind::File, "source file, destination dir"),
+            ]
+        );
+        assert!(!fs.called("read_dir(/d/a)"));
+        assert!(!fs.called("read_dir(/d/c)"));
+        let names: Vec<_> = roots.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c", "f"]);
+        let one = Summary { mismatched: 1, ..Summary::default() };
+        assert_eq!(roots[0].1, one);
+        assert_eq!(roots[2].1, one);
+        assert_eq!(roots[3].1, one);
+        let mut sum = Summary::default();
+        for (_, r) in &roots {
+            sum.matched += r.matched;
+            sum.missing += r.missing;
+            sum.mismatched += r.mismatched;
+            sum.extra += r.extra;
+            sum.unreadable += r.unreadable;
+            sum.not_entered += r.not_entered;
+            sum.bytes_hashed += r.bytes_hashed;
+        }
+        assert_eq!(total, sum);
+        assert_eq!(total.mismatched, 3);
+    }
+
+    #[test]
+    fn an_unreadable_root_is_one_record_at_its_turn_and_the_others_run() {
+        use crate::run::SourceKind::Folder;
+        let build = || {
+            let fs = FaultFs::new();
+            fs.create_dir(Path::new("/s")).unwrap();
+            tree(&fs, "/s/b", &[], &[("x", b"1")]);
+            tree(&fs, "/d", &["a", "b"], &[("b/x", b"1")]);
+            fs
+        };
+        let specs = || vec![spec("/s/a", "a", Folder), spec("/s/b", "b", Folder)];
+        let check = |fs: &FaultFs, lead: &str, unreadable_code: Option<Code>| {
+            let (rows, roots, _, total) = several(fs, specs(), "/d", &opts());
+            assert_eq!(rows.len(), 2, "{rows:?}");
+            assert_eq!(rows[0].0, "a");
+            assert_eq!(rows[0].1, Outcome::Unreadable);
+            if unreadable_code.is_some() {
+                assert_eq!(rows[0].3, unreadable_code);
+            }
+            assert!(rows[0].4.starts_with(lead), "{}", rows[0].4);
+            assert_eq!(rows[1], rec("b/x", Outcome::Match, Kind::File));
+            let names: Vec<_> = roots.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(names, ["a", "b"]);
+            assert_eq!(roots[0].1.unreadable, 1);
+            assert_eq!(roots[1].1.matched, 1);
+            assert_eq!(total.unreadable, 1);
+        };
+
+        // (i) check phase: the source root is absent.
+        let fs = build();
+        check(&fs, SOURCE, None);
+
+        // (ii) probe phase: the first metadata(/d/a) of the run.
+        let fs2 = build();
+        tree(&fs2, "/s/a", &[], &[("x", b"1")]);
+        fs2.write_file("/d/a/x", b"1");
+        let _ = several(&fs2, specs(), "/d", &opts());
+        let n = fs2
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("metadata("))
+            .position(|c| c == "metadata(/d/a)")
+            .expect("the unfaulted run probes /d/a")
+            + 1;
+        let fs3 = build();
+        tree(&fs3, "/s/a", &[], &[("x", b"1")]);
+        fs3.write_file("/d/a/x", b"1");
+        fs3.fail_nth(
+            "metadata",
+            u32::try_from(n).unwrap(),
+            Code::PermissionDenied,
+            std::io::ErrorKind::PermissionDenied,
+        );
+        check(&fs3, DESTINATION, Some(Code::PermissionDenied));
+
+        // (iii) walk phase: Side::new lists the source root.
+        let fs4 = build();
+        tree(&fs4, "/s/a", &[], &[("x", b"1")]);
+        fs4.write_file("/d/a/x", b"1");
+        fs4.fail_read_dir_of("/s/a", Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+        check(&fs4, SOURCE, Some(Code::PermissionDenied));
     }
 }

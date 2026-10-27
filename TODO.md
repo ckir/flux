@@ -1196,6 +1196,7 @@ item was, not only in a commit message.
   `StreamFail::Discard`; cross-thread cancellation plumbing for the guard, the WAL writer and the sync barrier; a stop
   can hang on a stalled read or an fsync). **Reopen if:** an engine caller (a library or UI) needs to cancel a run, or
   a measured case shows operators losing work to an interrupt.
+- [x] **Several sources for `verify`** (cut 14b): shipped on branch `feat/verify-several-sources` (design `docs/superpowers/specs/2026-10-27-verify-several-sources-design.md`).
 
 ## Cut 13 open (copy-side verification; spec `docs/superpowers/specs/2026-10-26-copy-verification-design.md`)
 
@@ -1209,7 +1210,7 @@ item was, not only in a commit message.
 
 ## Cut 14 open (flux verify; spec `docs/superpowers/specs/2026-10-26-verify-command-design.md`)
 
-- [ ] **Several sources for `verify`** (cut 14b). Today `flux verify` takes one source and one DEST.
+- [ ] **A stderr advisory for DEST's top-level entries that belong to no root of a several-source verify** (design 2026-10-27 section 5: option O3 was rejected as records; an advisory line is the candidate).
 - [ ] **`--exclude` and `--recursive` through the shared walker** when phase 3 selection lands. Today both are usage
       errors (exit 2).
 - [ ] **Windows reparse points and junctions** as `Other` or `Symlink` in verify are CI evidence only; no local

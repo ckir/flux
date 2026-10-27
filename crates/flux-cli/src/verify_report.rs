@@ -9,7 +9,8 @@
 
 use flux_core::verify::{MOUNT_NOT_ENTERED, Outcome, Record, Summary};
 use serde::Serialize;
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
 /// Design 6.8, verbatim, for `--help`: one paragraph per bullet.
 pub const GUARANTEES: &str = "What a pass guarantees:
@@ -24,7 +25,9 @@ pub const GUARANTEES: &str = "What a pass guarantees:
 
 - A name that differs only in case on a case-insensitive destination is a `missing` plus an `extra`, not a `match`. The same holds for two Unicode normalisations of one name (macOS NFD against NFC): names are compared as raw bytes.
 
-- A mount point the walker did not enter (no `--cross-filesystems`) is reported `match` for its presence only; its contents were NOT compared. The summary's `not_entered` count and the notice line say so, and exit 0 does not mean those contents were verified.";
+- A mount point the walker did not enter (no `--cross-filesystems`) is reported `match` for its presence only; its contents were NOT compared. The summary's `not_entered` count and the notice line say so, and exit 0 does not mean those contents were verified.
+
+- With several sources, only `DEST/<name>` for each source is compared; other entries of DEST are neither reported nor counted.";
 
 /// Append `s` with the backslash, the control characters (U+0000-U+001F, U+007F) escaped.
 fn escape_chars(s: &str, out: &mut String) {
@@ -135,9 +138,13 @@ pub fn summary_line(s: &Summary) -> String {
     line
 }
 
+// The declaration order is the JSON key order and is part of the output contract.
 #[derive(Serialize)]
 struct SummaryBody {
-    source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sources: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
     dest: String,
     hash: &'static str,
     matched: u64,
@@ -155,17 +162,28 @@ struct SummaryJson {
     summary: SummaryBody,
 }
 
+/// The source side of the summary: one `source` string, or a `sources` array for a several-source run.
+pub enum Sources<'a> {
+    One(&'a Path),
+    Several(&'a [PathBuf]),
+}
+
 /// The final NDJSON object (no trailing newline).
 pub fn summary_json(
-    source: &Path,
+    sources: Sources<'_>,
     dest: &Path,
     hash: &'static str,
     s: &Summary,
     exit: u8,
 ) -> String {
+    let (sources, source) = match sources {
+        Sources::One(p) => (None, Some(p.display().to_string())),
+        Sources::Several(ps) => (Some(ps.iter().map(|p| p.display().to_string()).collect()), None),
+    };
     let j = SummaryJson {
         summary: SummaryBody {
-            source: source.display().to_string(),
+            sources,
+            source,
             dest: dest.display().to_string(),
             hash,
             matched: s.matched,
@@ -233,6 +251,43 @@ pub fn dest_absent_line(dest: &Path) -> String {
     )
 }
 
+/// One root's counts in a several-source run (stderr).
+pub fn root_line(name: &OsStr, s: &Summary) -> String {
+    format!(
+        "root {}: {} matched, {} missing, {} mismatched, {} extra, {} unreadable",
+        display_path(Path::new(name)),
+        s.matched,
+        s.missing,
+        s.mismatched,
+        s.extra,
+        s.unreadable
+    )
+}
+
+/// The stderr line before the walk when `DEST/<name>` does not exist.
+pub fn root_absent_line(dst: &Path, name: &OsStr) -> String {
+    format!(
+        "destination does not exist: {}/{} (every source path is reported missing)",
+        dst.display(),
+        display_path(Path::new(name))
+    )
+}
+
+/// The refusal line for one root of a several-source run.
+pub fn refused_root_line(name: &OsStr, dst: &Path, reason: &str) -> String {
+    let n = display_path(Path::new(name));
+    format!("error: root {n}: {}/{n}: {reason}; nothing was verified", dst.display())
+}
+
+/// The refusal line for two roots that are one directory on the destination.
+pub fn refused_alias_line(a: &OsStr, b: &OsStr) -> String {
+    format!(
+        "error: roots {} and {} are one directory on this filesystem; nothing was verified",
+        display_path(Path::new(a)),
+        display_path(Path::new(b))
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,7 +345,7 @@ mod tests {
             not_entered: 6,
             bytes_hashed: 7,
         };
-        let text = summary_json(Path::new("/s"), Path::new("/d"), "blake3", &s, 1);
+        let text = summary_json(Sources::One(Path::new("/s")), Path::new("/d"), "blake3", &s, 1);
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         let top: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(top, ["summary"]);
@@ -317,6 +372,89 @@ mod tests {
         assert_eq!(v["summary"]["not_entered"], 6);
         assert_eq!(v["summary"]["bytes_hashed"], 7);
         assert_eq!(v["summary"]["exit"], 1);
+    }
+
+    #[test]
+    fn summary_json_for_several_sources_omits_source_and_lists_sources() {
+        let s = Summary { matched: 1, bytes_hashed: 7, ..Summary::default() };
+        let roots = [PathBuf::from("/s/a"), PathBuf::from("/s/b")];
+        let text = summary_json(Sources::Several(&roots), Path::new("/d"), "blake3", &s, 0);
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let want = [
+            "sources",
+            "dest",
+            "hash",
+            "matched",
+            "missing",
+            "mismatched",
+            "extra",
+            "unreadable",
+            "not_entered",
+            "bytes_hashed",
+            "exit",
+        ];
+        let at: Vec<usize> =
+            want.iter().map(|k| text.find(&format!("\"{k}\":")).unwrap()).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{text}");
+        assert_eq!(v["summary"].as_object().unwrap().len(), want.len());
+        assert!(v["summary"].get("source").is_none(), "{text}");
+        assert_eq!(v["summary"]["sources"], serde_json::json!(["/s/a", "/s/b"]));
+    }
+
+    #[test]
+    fn root_line_formats_the_five_counts() {
+        let s = Summary {
+            matched: 1,
+            missing: 2,
+            mismatched: 3,
+            extra: 4,
+            unreadable: 5,
+            ..Summary::default()
+        };
+        assert_eq!(
+            root_line(std::ffi::OsStr::new("a"), &s),
+            "root a: 1 matched, 2 missing, 3 mismatched, 4 extra, 5 unreadable"
+        );
+    }
+
+    #[test]
+    fn refused_root_line_renders_the_reason_under_the_destination() {
+        assert_eq!(
+            refused_root_line(
+                std::ffi::OsStr::new("b"),
+                Path::new("/d"),
+                "the destination is the source or lies inside it"
+            ),
+            "error: root b: /d/b: the destination is the source or lies inside it; nothing was verified"
+        );
+        assert_eq!(
+            root_absent_line(Path::new("/d"), std::ffi::OsStr::new("b")),
+            "destination does not exist: /d/b (every source path is reported missing)"
+        );
+        assert_eq!(
+            refused_alias_line(std::ffi::OsStr::new("a"), std::ffi::OsStr::new("b")),
+            "error: roots a and b are one directory on this filesystem; nothing was verified"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stderr_lines_escape_the_root_name() {
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::OsStr::new("x\ny");
+        let raw = std::ffi::OsStr::from_bytes(b"z\xffw");
+        let s = Summary::default();
+        let lines = [
+            root_line(name, &s),
+            root_absent_line(Path::new("/d"), name),
+            refused_root_line(name, Path::new("/d"), "r"),
+            refused_alias_line(name, raw),
+        ];
+        for l in &lines {
+            assert!(!l.contains('\n'), "{l:?}");
+            assert!(l.contains("x\\ny"), "{l:?}");
+        }
+        assert!(lines[3].contains("z\\xffw"), "{:?}", lines[3]);
     }
 
     #[test]

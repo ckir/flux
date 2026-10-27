@@ -13,11 +13,12 @@ use flux_cli::report::{self, Report};
 use flux_cli::resolve::{self, Job, Stop};
 use flux_cli::verify_report;
 use flux_core::run::RunConfig;
+use flux_core::verify::VerifyError;
 use flux_fs::{
     Code, CopyOptions, Durability, ExistingPolicy, Links, OperationId, Preserve, Publish, Safety,
 };
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -49,20 +50,21 @@ enum Commands {
     Copy(CopyArgs),
     /// Classify and remove what earlier operations left at DEST (§24.4, §251).
     Cleanup(CleanupArgs),
-    /// Compare SOURCE with DEST by content and report what differs; nothing is written.
+    /// Compare SOURCE with DEST by content, or several sources with their `DEST/<name>`, and report what differs;
+    /// nothing is written.
     ///
     /// Every file is read in full on both sides and hashed. Exit 0: nothing missing, mismatched
-    /// or unreadable; 1: something is; 2: a usage error, or roots that are the same or nested.
+    /// or unreadable; 1: something is; 2: a usage error, roots that are the same or nested, a refused source name,
+    /// two sources that take one name or are one directory on the destination.
     #[command(after_long_help = verify_report::GUARANTEES)]
     Verify(VerifyArgs),
 }
 
 #[derive(Args)]
 struct VerifyArgs {
-    /// The source file or folder.
-    source: PathBuf,
-    /// The destination to compare it with (§4.1's mapping).
-    dest: PathBuf,
+    /// One or more sources, then DEST (the last path): each source is compared with DEST (§4.1's mapping); with several, with `DEST/<name>`.
+    #[arg(value_name = "SOURCE... DEST", required = true, num_args = 2..)]
+    paths: Vec<PathBuf>,
     /// `copy` (the default) compares a symlink's payload; `skip` leaves source symlinks out.
     #[arg(long, value_enum, default_value_t = LinksArg::Copy)]
     links: LinksArg,
@@ -629,6 +631,7 @@ fn copy_several(args: &CopyArgs) -> u8 {
         sources,
         &destination[0],
         flux_core::run::source_cap(cfg.descriptor_limit),
+        "copied onto",
     ) {
         Ok(planned) => planned,
         Err(Stop::Usage(msg)) => {
@@ -753,14 +756,22 @@ fn verify_options(args: &VerifyArgs) -> flux_core::verify::VerifyOptions {
 
 /// `flux verify` (cut 14): design 6.1 and 6.6. Records go to stdout; stderr carries only operational lines.
 fn verify(args: &VerifyArgs) -> u8 {
-    use flux_core::verify::VerifyError;
+    if args.paths.len() == 2 {
+        verify_one(args, &args.paths[0], &args.paths[1])
+    } else {
+        verify_several_cli(args)
+    }
+}
+
+/// `flux verify SOURCE DEST`.
+fn verify_one(args: &VerifyArgs, source: &Path, dest: &Path) -> u8 {
     // `--json` still prints a summary when the run stops before any walk with exit 1 (plan R7).
     let stopped = || {
         if args.json {
             let s = flux_core::verify::Summary::default();
             stdout_or_exit(&verify_report::summary_json(
-                &args.source,
-                &args.dest,
+                verify_report::Sources::One(source),
+                dest,
                 "blake3",
                 &s,
                 exit_code::FAILED,
@@ -768,7 +779,7 @@ fn verify(args: &VerifyArgs) -> u8 {
         }
         exit_code::FAILED
     };
-    let job = match resolve::job(&args.source, &args.dest) {
+    let job = match resolve::job(source, dest) {
         Ok(job) => job,
         Err(Stop::Usage(msg)) => {
             err(&format!("error: {msg}"));
@@ -778,7 +789,7 @@ fn verify(args: &VerifyArgs) -> u8 {
             err(&format!(
                 "{}: {}: {}",
                 Code::SymlinkCreationUnavailable.as_str(),
-                args.source.display(),
+                source.display(),
                 report::SYMLINK_WHY
             ));
             return stopped();
@@ -818,19 +829,122 @@ fn verify(args: &VerifyArgs) -> u8 {
     };
     let summary = match result {
         Ok(summary) => summary,
-        Err(VerifyError::RefusedRoots { reason }) => {
-            err(&format!("error: {reason}"));
+        Err(e) => {
+            err(&refusal_line(&e, &dst));
             return exit_code::USAGE;
         }
     };
     let code = exit_code::for_verify(&summary);
     let line = if args.json {
-        verify_report::summary_json(&src, &dst, "blake3", &summary, code)
+        verify_report::summary_json(
+            verify_report::Sources::One(&src),
+            &dst,
+            "blake3",
+            &summary,
+            code,
+        )
     } else {
         verify_report::summary_line(&summary)
     };
     stdout_or_exit(&line);
     code
+}
+
+/// `flux verify SOURCE... DEST` with two or more sources (design 6.1, 6.5, 6.6): each root against `DEST/<name>`.
+fn verify_several_cli(args: &VerifyArgs) -> u8 {
+    let (sources, destination) = args.paths.split_at(args.paths.len() - 1);
+    let destination = &destination[0];
+    let stopped = || {
+        if args.json {
+            stdout_or_exit(&verify_report::summary_json(
+                verify_report::Sources::Several(sources),
+                destination,
+                "blake3",
+                &flux_core::verify::Summary::default(),
+                exit_code::FAILED,
+            ));
+        }
+        exit_code::FAILED
+    };
+    let (specs, dst) = match resolve::several(sources, destination, usize::MAX, "verified against")
+    {
+        Ok(planned) => planned,
+        Err(Stop::Usage(msg)) => {
+            err(&format!("error: {msg}"));
+            return exit_code::USAGE;
+        }
+        Err(Stop::SymlinkSource) => {
+            let named = resolve::first_symlink(sources).map(|p| p.display().to_string());
+            err(&format!(
+                "{}: {}: {}",
+                Code::SymlinkCreationUnavailable.as_str(),
+                named.unwrap_or_default(),
+                report::SYMLINK_WHY
+            ));
+            return stopped();
+        }
+        Err(Stop::Failed(line)) => {
+            err(&line);
+            return stopped();
+        }
+    };
+    // `verify_several` takes the specs by value and reorders them; the summary lists them as typed.
+    let collected: Vec<PathBuf> = specs.iter().map(|s| s.src.clone()).collect();
+    let opts = verify_options(args);
+    let mut sink = |r: flux_core::verify::Record| {
+        let routed = verify_report::route_record(&r, args.json, args.verbose);
+        if let Some(line) = &routed.stdout {
+            stdout_or_exit(line);
+        }
+        lines(routed.stderr);
+    };
+    let mut on_absent = |name: &std::ffi::OsStr| err(&verify_report::root_absent_line(&dst, name));
+    let mut on_root_done = |name: &std::ffi::OsStr, s: &flux_core::verify::Summary| {
+        err(&verify_report::root_line(name, s))
+    };
+    let fs = flux_platform::StdFileSystem;
+    let total = match flux_core::verify::verify_several(
+        &fs,
+        specs,
+        &dst,
+        &opts,
+        &mut on_absent,
+        &mut on_root_done,
+        &mut sink,
+    ) {
+        Ok(total) => total,
+        Err(e) => {
+            err(&refusal_line(&e, &dst));
+            return exit_code::USAGE;
+        }
+    };
+    let code = exit_code::for_verify(&total);
+    let line = if args.json {
+        verify_report::summary_json(
+            verify_report::Sources::Several(&collected),
+            &dst,
+            "blake3",
+            &total,
+            code,
+        )
+    } else {
+        verify_report::summary_line(&total)
+    };
+    stdout_or_exit(&line);
+    code
+}
+
+/// The one error line for a verify that did not run (exit 2); `dst` is the canonical destination.
+fn refusal_line(e: &VerifyError, dst: &Path) -> String {
+    match e {
+        VerifyError::RefusedRoots { reason } | VerifyError::RefusedNames { reason } => {
+            format!("error: {reason}")
+        }
+        VerifyError::RefusedRoot { name, reason } => {
+            verify_report::refused_root_line(name, dst, reason)
+        }
+        VerifyError::RefusedAlias { a, b } => verify_report::refused_alias_line(a, b),
+    }
 }
 
 /// One line of `flux verify`'s output to stdout. A failed write (a closed pipe, a full disk) ends the run at once with
@@ -900,10 +1014,10 @@ mod tests {
     }
 
     #[test]
-    fn verify_parses_its_flags_and_needs_exactly_two_paths() {
+    fn verify_parses_its_flags_and_needs_at_least_two_paths() {
         let bare = parse_verify(&["flux", "verify", "s", "d"]);
-        assert_eq!(bare.source, PathBuf::from("s"));
-        assert_eq!(bare.dest, PathBuf::from("d"));
+        assert_eq!(bare.paths[0], PathBuf::from("s"));
+        assert_eq!(bare.paths[1], PathBuf::from("d"));
         assert!(matches!(bare.links, LinksArg::Copy));
         assert!(!bare.cross_filesystems && !bare.json && !bare.verbose);
         let all = parse_verify(&[
@@ -921,12 +1035,12 @@ mod tests {
         assert!(all.cross_filesystems && all.json && all.verbose);
         for argv in [
             &["flux", "verify", "s"][..],
-            &["flux", "verify", "s", "d", "e"],
             &["flux", "verify", "s", "d", "--resume"],
             &["flux", "verify", "s", "d", "--exclude", "x"],
         ] {
             assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
         }
+        assert_eq!(parse_verify(&["flux", "verify", "s", "t", "d"]).paths.len(), 3);
     }
 
     fn parse_cleanup(argv: &[&str]) -> CleanupArgs {

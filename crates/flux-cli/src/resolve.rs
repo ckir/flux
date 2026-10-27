@@ -72,11 +72,13 @@ pub fn job(source: &Path, dest: &Path) -> Result<Job, Stop> {
 /// §4.1's last row for two or more sources (spec 3.2): each is resolved as `job` resolves one, in this order:
 /// `symlink_metadata` on the path as given, then its kind, then canonicalisation for the name (the canonical path's
 /// final component). DEST is classified as `job` does, and returned canonical with its absent remainder appended.
-/// `cap` is `source_cap`'s figure.
+/// `cap` is `source_cap`'s figure. `verb` fills the usage message `several sources cannot be {verb} the existing file
+/// <DEST>` (copy passes "copied onto", verify "verified against").
 pub fn several(
     sources: &[PathBuf],
     dest: &Path,
     cap: usize,
+    verb: &str,
 ) -> Result<(Vec<SourceSpec>, PathBuf), Stop> {
     if sources.len() < 2 {
         return Err(Stop::Usage("several sources need at least two sources".to_string()));
@@ -112,7 +114,7 @@ pub fn several(
     }
     if matches!(std::fs::metadata(dest), Ok(m) if !m.is_dir()) {
         return Err(Stop::Usage(format!(
-            "several sources cannot be copied onto the existing file {}",
+            "several sources cannot be {verb} the existing file {}",
             dest.display()
         )));
     }
@@ -311,7 +313,7 @@ mod tests {
             tmp.join("dir").join("..").join("f"),
         ];
 
-        let (specs, dst) = several(&sources, &tmp.join("out"), 10).unwrap();
+        let (specs, dst) = several(&sources, &tmp.join("out"), 10, "copied onto").unwrap();
 
         let got: Vec<_> = specs.iter().map(|s| (s.name.clone(), s.kind, s.src.clone())).collect();
         assert_eq!(
@@ -337,7 +339,10 @@ mod tests {
         for link in ["to-dir", "dangling"] {
             let sources = paths(&tmp, &["ok", link]);
             assert!(
-                matches!(several(&sources, &tmp.join("out"), 10), Err(Stop::SymlinkSource)),
+                matches!(
+                    several(&sources, &tmp.join("out"), 10, "copied onto"),
+                    Err(Stop::SymlinkSource)
+                ),
                 "{link}"
             );
             assert_eq!(first_symlink(&sources), Some(tmp.join(link).as_path()), "{link}");
@@ -349,7 +354,7 @@ mod tests {
     fn a_missing_source_is_failed_naming_it() {
         let (_d, tmp) = canonical_tmp();
         std::fs::create_dir(tmp.join("ok")).unwrap();
-        match several(&paths(&tmp, &["ok", "nope"]), &tmp.join("out"), 10) {
+        match several(&paths(&tmp, &["ok", "nope"]), &tmp.join("out"), 10, "copied onto") {
             Err(Stop::Failed(line)) => {
                 assert!(line.starts_with("IO_ERROR: "), "{line}");
                 assert!(line.contains("nope"), "{line}");
@@ -364,8 +369,14 @@ mod tests {
         std::fs::create_dir(tmp.join("a")).unwrap();
         std::fs::create_dir(tmp.join("b")).unwrap();
         std::fs::write(tmp.join("f"), b"x").unwrap();
-        match several(&paths(&tmp, &["a", "b"]), &tmp.join("f"), 10) {
-            Err(Stop::Usage(msg)) => assert!(msg.contains("existing file"), "{msg}"),
+        match several(&paths(&tmp, &["a", "b"]), &tmp.join("f"), 10, "copied onto") {
+            Err(Stop::Usage(msg)) => {
+                assert!(msg.contains("existing file"), "{msg}");
+                assert!(
+                    msg.starts_with("several sources cannot be copied onto the existing file"),
+                    "{msg}"
+                );
+            }
             other => panic!("expected Usage, got {other:?}"),
         }
     }
@@ -377,8 +388,11 @@ mod tests {
             std::fs::create_dir(tmp.join(n)).unwrap();
         }
         let out = tmp.join("out");
-        assert_eq!(several(&paths(&tmp, &["a", "b", "c"]), &out, 3).unwrap().0.len(), 3);
-        match several(&paths(&tmp, &["a", "b", "c", "d"]), &out, 3) {
+        assert_eq!(
+            several(&paths(&tmp, &["a", "b", "c"]), &out, 3, "copied onto").unwrap().0.len(),
+            3
+        );
+        match several(&paths(&tmp, &["a", "b", "c", "d"]), &out, 3, "copied onto") {
             Err(Stop::Usage(msg)) => assert!(msg.contains('3') && msg.contains('4'), "{msg}"),
             other => panic!("expected Usage, got {other:?}"),
         }
@@ -388,7 +402,10 @@ mod tests {
     fn fewer_than_two_sources_is_a_usage_error() {
         let (_d, tmp) = canonical_tmp();
         std::fs::create_dir(tmp.join("a")).unwrap();
-        assert!(matches!(several(&paths(&tmp, &["a"]), &tmp.join("o"), 10), Err(Stop::Usage(_))));
+        assert!(matches!(
+            several(&paths(&tmp, &["a"]), &tmp.join("o"), 10, "copied onto"),
+            Err(Stop::Usage(_))
+        ));
     }
 
     #[cfg(unix)]
@@ -397,7 +414,7 @@ mod tests {
         let (_d, tmp) = canonical_tmp();
         std::fs::create_dir(tmp.join("ok")).unwrap();
         let sources = vec![tmp.join("ok"), PathBuf::from("/")];
-        match several(&sources, &tmp.join("out"), 10) {
+        match several(&sources, &tmp.join("out"), 10, "copied onto") {
             Err(Stop::Failed(line)) => {
                 assert!(line.contains("no file name") && line.contains('/'), "{line}");
             }
