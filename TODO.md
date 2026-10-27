@@ -9,8 +9,8 @@ Near-term work. Release-level scope lives in [ROADMAP.md](ROADMAP.md).
       member crates (`crates/flux-cli/Cargo.toml`, `crates/flux-fs/Cargo.toml`), and
       `walkdir`/`jwalk` were decided against (see the walker decision above). Still
       undecided and depended on by no member crate: `rayon`, `crossbeam-channel`,
-      `blake3`, `indicatif`, `tracing`, `tracing-subscriber`, `anyhow`, `serde`,
-      `serde_json`. Each must be judged on performance, correctness, portability,
+      `indicatif`, `tracing`, `tracing-subscriber`, `anyhow` (`blake3`, `serde` and
+      `serde_json` are adopted; `just unused-deps` keeps this list honest). Each must be judged on performance, correctness, portability,
       maintenance, licensing and API stability before adoption.
       (Narrowed 2026-09-26: `clap`/`thiserror` adopted and `walkdir`/`jwalk`
       rejected already; the remaining nine candidates are unchanged.)

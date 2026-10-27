@@ -63,8 +63,12 @@ lint-workflows:
 deny:
     cargo deny check
 
-# The local gate: fmt + clippy + typos + doc-check + license + test
-check: fmt-check clippy typos doc-check license test
+# Unused dependencies (cargo shear; `cargo shear --fix` removes them). Exceptions: [workspace.metadata.cargo-shear] in Cargo.toml
+unused-deps:
+    cargo shear
+
+# The local gate: fmt + clippy + typos + unused-deps + doc-check + license + test
+check: fmt-check clippy typos unused-deps doc-check license test
 
 # --- Cross-platform legs of the local gate ---------------------------------
 # `just check` compiles and tests for THIS machine only, so a `#[cfg]` mistake for

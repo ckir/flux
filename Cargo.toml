@@ -76,7 +76,6 @@ toml = "1.1"
 rustix = { version = "1.1", features = ["fs"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_Security", "Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_SystemInformation"] }
 libc = "0.2"
-walkdir = "2.5"
 # crates/flux-platform/src/claims.rs: the claim store (cut 8b)
 redb = "4.3"
 # jwalk is in the spec §67 candidate list but crates.io currently ships it with the
@@ -110,3 +109,11 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# `just unused-deps` (cargo shear) fails on a dependency nothing uses. The pins above are spec §67
+# candidates that no member crate has adopted yet (TODO.md, "Final dependency selection"), and
+# flux-ui is an empty crate until progress output lands, so they are listed here until adopted.
+# Delete an entry the moment a member crate adopts the crate.
+[workspace.metadata.cargo-shear]
+ignored = ["anyhow", "crossbeam-channel", "flux-ui", "indicatif", "rayon", "tracing", "tracing-subscriber"]
+ignored-paths = ["crates/flux-ui/src/lib.rs"]

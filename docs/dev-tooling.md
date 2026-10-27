@@ -64,6 +64,7 @@ the tables above carry the reasons.
 | `lefthook` | `cargo binstall -y lefthook` | on `PATH` as `lefthook` |
 | `cargo-deny` | `cargo binstall -y cargo-deny` | on `PATH` as `cargo-deny` |
 | `typos` | `cargo binstall -y typos-cli` | on `PATH` as `typos` |
+| `cargo-shear` | `cargo binstall -y cargo-shear` | on `PATH` as `cargo-shear` |
 | `bacon` | `cargo binstall -y bacon` | on `PATH` as `bacon` |
 | `release-plz` | `cargo binstall -y release-plz` | on `PATH` as `release-plz` |
 | `cargo-mutants` | `cargo binstall -y cargo-mutants` | on `PATH` as `cargo-mutants` |
