@@ -3743,6 +3743,17 @@ fn an_own_created_claim_with_matching_size_and_mtime_is_skipped_as_resumed() {
     adopted(&r, 5, Some(1));
 }
 
+/// Cut 15 (R1): a complete file skipped as resumed under a verify level is not hashed, so it is not counted.
+#[test]
+fn resume_verify_does_not_count_a_skipped_complete_file() {
+    let o = verifying(opts());
+    let fs = resumable_with(&o, 100, b"o", 101, ClaimStatus::Created);
+    let (r, got) = run_tree_with(&fs, &resume(), &o);
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!((out.files_resumed, out.files_verified, out.files_mismatched), (1, 1, 0));
+}
+
 #[test]
 fn an_mtime_outside_two_seconds_is_recopied_and_two_seconds_counts_as_equal() {
     // (source mtime, destination mtime, resumed)

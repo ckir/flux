@@ -400,12 +400,6 @@ fn copy(args: &CopyArgs) -> u8 {
         );
         return exit_code::USAGE;
     }
-    if args.resume && args.verify.is_some_and(|v| v.level() != flux_fs::VerifyLevel::None) {
-        err(
-            "error: --resume cannot be combined with --verify in this version; verify a resumed copy afterwards, or use --restart",
-        );
-        return exit_code::USAGE;
-    }
     if args.paths.len() > 2 {
         return copy_several(args);
     }
