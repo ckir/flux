@@ -2085,4 +2085,109 @@ mod trees_tests {
         assert_eq!(fs.read_file("/p/dest/f").as_deref(), Some(&b"F"[..]));
         assert_eq!(out.excluded, 2, "a's two tmp files; the file root f adds none");
     }
+
+    /// Run `names` on `fs` and die at the `nth` call to `op`, as a crashed process would: unwinding drops the run's
+    /// `FakeLock`s (the OS locks go, every file stays) and no `settle` runs, so the prefix lock files, the destination
+    /// lock and the TRANSFERRING manifest are left behind.
+    fn crash(fs: &FaultFs, names: &[&str], op: &str, nth: u32) {
+        fs.on_nth(op, nth, |_| panic!("the test's crash point"));
+        let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| go(fs, names)));
+        assert!(died.is_err(), "the run was meant to die at {op} #{nth}");
+    }
+
+    fn restart_cfg(n: u8) -> RunConfig {
+        RunConfig { operation_id: format!("{:032x}", n), restart: true, ..cfg() }
+    }
+
+    /// A fake whose `["a", "b"]` run died at the publish of `a/x`.
+    fn crashed_ab() -> FaultFs {
+        let n = reference(fake, &["a", "b"], "rename_no_replace", "/p/dest/a/x");
+        let fs = fake();
+        crash(&fs, &["a", "b"], "rename_no_replace", n);
+        fs
+    }
+
+    #[test]
+    fn a_several_source_restart_supersedes_a_crashed_run_abandoning_it_first() {
+        let fs = crashed_ab();
+        assert!(fs.exists(format!("/p/dest/a/x.flux-partial.{ID}")));
+        assert_eq!(manifest(&fs).state, OpState::Transferring);
+        assert_eq!(prefix_lock_files(&fs).len(), 2, "{:?}", prefix_lock_files(&fs));
+        assert!(fs.exists(LOCK));
+
+        // The reference restart, on a fake crashed the same way, says which `rename_no_replace` retires the prior.
+        let fs2 = crashed_ab();
+        let (r2, _) = go_with(&fs2, ["a", "b"].map(spec).to_vec(), &opts(), &restart_cfg(0x22));
+        ok(&r2);
+        let k = nth_of(&fs2, "rename_no_replace", &format!("operations/{ID}.removing"));
+
+        let seen = watch_manifest(&fs, "rename_no_replace", k);
+        let mark = fs.calls().len();
+        let (r, _) = go_with(&fs, ["a", "b"].map(spec).to_vec(), &opts(), &restart_cfg(0x22));
+        ok(&r);
+
+        let prior = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the prior's manifest was read at the retiring rename");
+        assert_eq!(prior.state, OpState::Abandoned);
+        assert_eq!(prior.superseded_by.as_deref(), Some(format!("{:032x}", 0x22).as_str()));
+        assert!(!fs.exists(format!("/p/dest/a/x.flux-partial.{ID}")));
+        assert!(!fs.exists(format!("/p/dest/.flux/operations/{ID}")));
+        assert_eq!(fs.read_file("/p/dest/a/x").as_deref(), Some(&b"ax"[..]));
+        assert_eq!(fs.read_file("/p/dest/b/k").as_deref(), Some(&b"bk"[..]));
+
+        // ORDER: the restart's own destination lock is created before either prefix lock is released.
+        let log = calls(&fs);
+        let after = &log[mark..];
+        let own_lock = after
+            .iter()
+            .position(|c| {
+                c.starts_with("create_new(") && !c.starts_with("create_new(/p/dest/.flux")
+            })
+            .expect("the restart creates a lock");
+        for name in ["a", "b"] {
+            let release = format!("remove_file(/p/dest/{name}.flux-lock)");
+            let at =
+                after.iter().position(|c| *c == release).unwrap_or_else(|| panic!("no {release}"));
+            assert!(
+                own_lock < at,
+                "{name}: the lock was created at {own_lock}, released at {at}: {after:?}"
+            );
+        }
+
+        assert!(lock_files(&fs).is_empty(), "{:?}", lock_files(&fs));
+        for name in ["a", "b"] {
+            assert!(!fs.exists(format!("/p/dest/{name}.flux-lock.broken.{:032x}", 0x22)));
+        }
+    }
+
+    #[test]
+    fn a_restart_right_after_a_crash_does_not_wait_for_a_lease() {
+        let fs = crashed_ab();
+        let bytes = fs.read_file(LOCK).expect("the crashed run left its destination lock");
+        let crate::lock::record::Decoded::Record(rec) = crate::lock::record::decode(&bytes) else {
+            panic!("the destination lock is not a record");
+        };
+        // A "now" heartbeat: nothing has aged. `classify`'s `Dead` arm reads no heartbeat (classify.rs:54-57), so the
+        // restart must take the lock at once; the mutant is the cleanup lease gate (obtain.rs:239-249) applied to
+        // `obtain`'s `Dead` arm.
+        assert_eq!(rec.last_heartbeat_wall_time, rec.creation_wall_time);
+        let (r, _) = go_with(&fs, ["a", "b"].map(spec).to_vec(), &opts(), &restart_cfg(0x23));
+        ok(&r);
+    }
+
+    #[test]
+    fn a_restart_with_other_sources_leaves_the_unused_prefix_lock_and_succeeds() {
+        let fs = crashed_ab();
+        let (r, _) = go_with(&fs, ["a", "c"].map(spec).to_vec(), &opts(), &restart_cfg(0x24));
+        ok(&r);
+        // L6 residue, named on purpose: the prior's `b` lock belongs to no root of this run, so nothing releases it.
+        assert!(fs.exists("/p/dest/b.flux-lock"));
+        assert!(!fs.exists("/p/dest/a.flux-lock"));
+        assert!(!fs.exists("/p/dest/c.flux-lock"));
+        assert!(!fs.exists(LOCK));
+        assert_eq!(fs.read_file("/p/dest/c/z").as_deref(), Some(&b"cz"[..]));
+    }
 }
