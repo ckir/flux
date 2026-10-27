@@ -1235,7 +1235,8 @@ fn exclude_star_star_copies_nothing_and_exits_0() {
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let v = json(&out);
     assert_eq!(v["files_copied"].as_u64(), Some(0), "{v}");
-    assert!(v["excluded"].as_u64().unwrap() >= 1, "{v}");
+    // `tree_in` has two top-level entries (`a` and `sub`); `**` removes both and enters neither.
+    assert_eq!(v["excluded"].as_u64(), Some(2), "{v}");
     assert!(!dst.join("a").exists() && !dst.join("sub").exists());
 }
 

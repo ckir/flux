@@ -80,20 +80,20 @@ struct VerifyArgs {
     /// Also print each `match` record (the default prints only what is not a match).
     #[arg(long)]
     verbose: bool,
-    /// Leave out every entry whose name or path matches PATTERN (repeatable; matched entries are neither copied nor
-    /// entered, and are counted as `excluded`). A pattern without `/` is matched against each entry's own name at any
+    /// Leave out every entry whose name or path matches PATTERN (repeatable; matched entries are neither compared nor
+    /// reported, and not entered, on either side, and are counted as `excluded`). A pattern without `/` is matched against each entry's own name at any
     /// depth (`*.tmp`); with a leading or inner `/` it is anchored and matched against the whole path below the source
     /// root (`/build`, `docs/*.md`). `*` matches any run of characters within one name, `?` exactly one; a `**` segment
     /// matches whole path components (`a/**/b`; a trailing `**` matches everything inside). A trailing `/` limits the
     /// pattern to directories. Matching is case-sensitive. A pattern that starts with `-` is written
     /// `--exclude=-foo`. The characters `! [ ] \` are reserved and cannot be written: reach a name that has one with
-    /// `?` or `*`. A source that is a file is not filtered.
+    /// `?` or `*`. A source that is a file is not filtered, and a source operand itself (file or folder) is never matched; patterns apply below it.
     #[arg(long, value_name = "PATTERN", action = ArgAction::Append, value_parser = parse_exclude)]
     exclude: Vec<String>,
     /// Descend into subdirectories (the default; this flag only says so). Conflicts with --no-recursive.
     #[arg(long, conflicts_with = "no_recursive")]
     recursive: bool,
-    /// Take only the top level of each source folder: its files and links, no subdirectory is created or entered.
+    /// Take only the top level of each source folder: only the top level of each side is compared; no subdirectory is entered.
     #[arg(long)]
     no_recursive: bool,
 }
@@ -203,7 +203,7 @@ struct CopyArgs {
     /// matches whole path components (`a/**/b`; a trailing `**` matches everything inside). A trailing `/` limits the
     /// pattern to directories. Matching is case-sensitive. A pattern that starts with `-` is written
     /// `--exclude=-foo`. The characters `! [ ] \` are reserved and cannot be written: reach a name that has one with
-    /// `?` or `*`. A source that is a file is not filtered.
+    /// `?` or `*`. A source that is a file is not filtered, and a source operand itself (file or folder) is never matched; patterns apply below it.
     #[arg(long, value_name = "PATTERN", action = ArgAction::Append, value_parser = parse_exclude)]
     exclude: Vec<String>,
     /// Descend into subdirectories (the default; this flag only says so). Conflicts with --no-recursive.

@@ -87,7 +87,7 @@ has one with `?` or `*`, and write a pattern that starts with `-` as `--exclude=
 entered) and the two flags conflict. The report counts what `--exclude` removed in `excluded` (absent at zero; the
 summary line appends `; N excluded`); subdirectories skipped by `--no-recursive` are not counted. `--exclude` and
 `--recursive` are part of the resume fingerprint: `--resume` with a different selection is refused. A source that is a
-file is not filtered.
+file is not filtered, and a source operand itself (file or folder) is never matched; patterns apply below it.
 
 ### Verification
 

@@ -822,6 +822,18 @@ fn verify_accepts_exclude_and_ignores_excluded_names_on_both_sides() {
     let out = c.output().unwrap();
     assert_eq!(out.status.code(), Some(0), "{} {}", stdout(&out), stderr(&out));
     assert!(!stdout(&out).contains(".tmp"), "{}", stdout(&out));
+
+    // Only the SOURCE side's excluded entries are counted: `only-src.tmp` and `sub/both.tmp` (not `only-dst.tmp`).
+    let out = flux()
+        .arg("verify")
+        .arg(&src)
+        .arg(&dst)
+        .args(["--exclude", "*.tmp", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{} {}", stdout(&out), stderr(&out));
+    let summary = ndjson(&out).pop().unwrap()["summary"].clone();
+    assert_eq!(summary["excluded"].as_u64(), Some(2), "{summary}");
 }
 
 #[test]
@@ -862,7 +874,7 @@ fn the_summary_json_has_excluded_only_when_non_zero() {
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let last = ndjson(&out).pop().unwrap();
     let summary = &last["summary"];
-    assert!(summary["excluded"].as_u64().unwrap() >= 1, "{summary}");
+    assert_eq!(summary["excluded"].as_u64(), Some(1), "{summary}");
     assert_eq!(keys(summary).len(), SUMMARY_KEYS.len() + 1);
 }
 

@@ -1222,5 +1222,9 @@ item was, not only in a commit message.
 - [ ] **`--max-depth`**: limit descent to N levels (`--no-recursive` is the only bound today).
 - [ ] **A per-pattern or per-entry selection summary in the `--json` report** (today one `excluded` total).
 - [ ] **`--exclude` matching of a file operand** (R7): a file source is not filtered today.
+- [ ] **Selection::select decodes every path component per entry** (crates/flux-fs/src/select.rs, `select_with`): decode only `file_name()` when no pattern is anchored (precompute at compile), and skip decoding when every pattern is dir-only and the entry is not a Dir; measure a 1M-entry `--dry-run` with and without `--exclude '*.tmp'` first (timing needs the owner's OK and an idle machine).
+- [ ] **select.rs `invalid_patterns_are_refused_with_a_reason`**: assert the SelectError variant per row, not only is_err.
+- [ ] **select.rs: 17 copies of one 1024-byte pattern must be refused** (the byte cap is applied before dedup, pin it).
+- [ ] **A selection on a single-file source still enters the resume fingerprint** (a --resume without the flag is refused with exit 3 although the flag had no effect on a file operand; consistent with cross_filesystems): document it in --help or relax the fingerprint for file roots.
 - [ ] **Windows reparse points and junctions** as `Other` or `Symlink` in verify are CI evidence only; no local
       Windows run has shown how the walker classifies them.

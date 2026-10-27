@@ -27,6 +27,11 @@ fn incompatible(detail: String) -> RunError {
     refused(LockCode::IncompatibleState, detail)
 }
 
+/// The display form of a recorded pattern list: space-joined, or `(none)` for an empty list.
+fn exclude_display(patterns: &[String]) -> String {
+    if patterns.is_empty() { "(none)".to_string() } else { patterns.join(" ") }
+}
+
 /// A stored `native_hex` path as the message shows it: decoded, or the hex itself when it does not decode.
 fn shown(hex: &str) -> String {
     from_native_hex(hex).map_or_else(|| hex.to_string(), |p| p.display().to_string())
@@ -124,8 +129,8 @@ pub(crate) fn validate(
     if then.exclude != now.exclude {
         return Err(incompatible(format!(
             "exclude: the operation runs with {}, this run asks {}; run again with the same option, or with --restart to supersede it",
-            then.exclude.join(" "),
-            now.exclude.join(" ")
+            exclude_display(&then.exclude),
+            exclude_display(&now.exclude)
         )));
     }
     if then.recursive != now.recursive {
@@ -438,6 +443,11 @@ mod tests {
             run(&prior_selecting(&["a", "b"], true), &roots_now(), &selecting(&["c"], true)).0,
         );
         assert!(detail.contains("runs with a b, this run asks c"), "{detail}");
+        let (_, detail) =
+            refused(run(&prior_selecting(&[], true), &roots_now(), &selecting(&["a"], true)).0);
+        assert!(detail.contains("runs with (none), this run asks a"), "{detail}");
+        let (_, detail) = refused(run(&prior_selecting(&["a"], true), &roots_now(), &opts()).0);
+        assert!(detail.contains("runs with a, this run asks (none)"), "{detail}");
     }
 
     #[test]

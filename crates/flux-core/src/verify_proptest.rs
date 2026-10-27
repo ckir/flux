@@ -289,6 +289,7 @@ fn reference(case: &Case) -> (Vec<Record>, Summary) {
     keys.dedup();
     let mut pruned: Option<Vec<u8>> = None;
     let mut out = Vec::new();
+    // The model runs with the default selection, so `excluded` stays 0 by construction.
     let mut sum = Summary::default();
     for k in keys {
         if pruned.as_ref().is_some_and(|p| under(k, p)) {
