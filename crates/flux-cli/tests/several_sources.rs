@@ -151,7 +151,7 @@ fn resume_restart_and_dry_run_exit_2_naming_the_flag() {
     let d = TempDir::new().unwrap();
     let (alpha, beta) = (folder(d.path(), "alpha"), folder(d.path(), "beta"));
     let out_dir = d.path().join("out");
-    for flag in ["--resume", "--restart", "--dry-run"] {
+    for flag in ["--resume", "--dry-run"] {
         let out = flux()
             .arg("copy")
             .arg(flag)
@@ -167,14 +167,48 @@ fn resume_restart_and_dry_run_exit_2_naming_the_flag() {
             err.contains(&format!("error: {flag} with several sources is not supported yet")),
             "{flag}: {err}"
         );
+        assert!(!err.contains("cleanup"), "{flag}: {err}");
         assert_eq!(
-            err.contains("flux cleanup --force"),
-            flag == "--restart",
-            "only --restart carries the cleanup hint: {flag}: {err}"
+            err.contains("run again with --restart"),
+            flag == "--resume",
+            "only --resume names --restart: {flag}: {err}"
         );
         assert!(out.stdout.is_empty(), "{flag}: a usage error prints no JSON");
         assert!(!out_dir.exists(), "{flag}: nothing may be created");
     }
+    // --restart passes the gate, so --restart --dry-run is refused for --dry-run.
+    let out = flux()
+        .args(["copy", "--restart", "--dry-run", "--json"])
+        .arg(&alpha)
+        .arg(&beta)
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("--dry-run with several sources is not supported yet"), "{err}");
+    assert!(out.stdout.is_empty(), "a usage error prints no JSON");
+    assert!(!out_dir.exists(), "nothing may be created");
+}
+
+#[test]
+fn restart_with_break_lock_is_accepted_on_a_clean_dest() {
+    let d = TempDir::new().unwrap();
+    let (alpha, beta) = (folder(d.path(), "alpha"), folder(d.path(), "beta"));
+    let out_dir = d.path().join("out");
+
+    let out = flux()
+        .args(["copy", "--restart", "--break-lock", "--json"])
+        .arg(&alpha)
+        .arg(&beta)
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(snapshot(&out_dir.join("alpha")), snapshot(&alpha));
+    assert_eq!(snapshot(&out_dir.join("beta")), snapshot(&beta));
+    let _ = json(&out);
 }
 
 #[test]

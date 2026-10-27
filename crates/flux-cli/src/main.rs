@@ -36,7 +36,8 @@ enum Commands {
     /// With one SOURCE, a file is copied to DEST and a folder's contents onto DEST. With
     /// several (`flux copy SOURCE... DEST`; the last path is DEST) each source, a file or
     /// a folder, is copied to `DEST/<its name>` in one operation; DEST is created if missing.
-    /// --resume, --restart and --dry-run need exactly one source. In a several-source run
+    /// --resume and --dry-run need exactly one source; --restart supersedes several-source
+    /// priors too. In a several-source run
     /// a file source that already exists at `DEST/<name>` is skipped without the identity
     /// check a single file gets, and when DEST's filesystem gives no strong file identity
     /// an existing file is reported as a collision.
@@ -154,7 +155,8 @@ struct CopyArgs {
     /// checkpoint log, and keeps the equal prefix; `metadata` is not implemented in this version.
     #[arg(long, value_enum, requires = "resume")]
     resume_verify: Option<ResumeVerifyArg>,
-    /// With --restart: take over a lock that a crashed run left empty or unreadable (§240.5).
+    /// With --restart: take over the DESTINATION lock that a crashed run left empty or unreadable (§240.5); a prefix
+    /// lock is never taken over.
     #[arg(long, requires = "restart")]
     break_lock: bool,
     /// Replace a file that already exists at DEST (the default; §5.1).
@@ -643,20 +645,19 @@ fn tree_output(
     json(args, &rep);
 }
 
-/// Why `--X` cannot go with several sources: exit 2 and no JSON, as every usage error.
+/// Why `--resume` and `--dry-run` cannot go with several sources: exit 2 and no JSON, as every usage error.
+/// `--restart` is allowed: it supersedes an aborted several-source run.
 fn several_flag_gate(args: &CopyArgs) -> Option<String> {
     let flag = if args.resume {
         "--resume"
-    } else if args.restart {
-        "--restart"
     } else if args.dry_run {
         "--dry-run"
     } else {
         return None;
     };
     let mut msg = format!("error: {flag} with several sources is not supported yet");
-    if args.restart {
-        msg.push_str("; run flux cleanup --force DEST to remove an aborted several-source run");
+    if args.resume {
+        msg.push_str("; run again with --restart to supersede an aborted several-source run");
     }
     Some(msg)
 }

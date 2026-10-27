@@ -929,16 +929,18 @@ pub fn resume_verify_lines(outcome: &TreeOutcome, full: bool) -> Vec<String> {
 
 /// Cut 9f-1: the line that follows an aborting error when it is a checkpoint-write failure. `several` is the
 /// destination of a several-source run, whose operation `--resume` refuses (spec L1): it is pointed at
-/// `flux cleanup --force` instead.
+/// `--restart` instead.
 pub fn abort_hint_lines(error: &CopyError, several: Option<&Path>) -> Vec<String> {
     if error.code() != Code::WalWriteFailed {
         return Vec::new();
     }
     match several {
-        Some(dest) => vec![format!(
-            "run flux cleanup --force {} to remove the aborted run, then run again",
-            dest.display()
-        )],
+        Some(_) => {
+            vec![
+                "run again with --restart and the same sources to supersede the aborted run"
+                    .to_string(),
+            ]
+        }
         None => {
             vec!["run again with --resume to continue from the last durable checkpoint".to_string()]
         }
@@ -1845,10 +1847,10 @@ mod tests {
     }
 
     #[test]
-    fn a_wal_write_failure_hint_names_cleanup_force_for_several_sources() {
+    fn a_wal_write_failure_hint_names_restart_for_several_sources() {
         assert_eq!(
             abort_hint_lines(&wal_failure(), Some(Path::new("out/dir"))),
-            ["run flux cleanup --force out/dir to remove the aborted run, then run again"]
+            ["run again with --restart and the same sources to supersede the aborted run"]
         );
         let other = CopyError {
             cause: FsError::new(Code::IoError, io("x")),
