@@ -9,12 +9,14 @@
 //! Two walks, one per root, are merged in lockstep by `FluxPathKey` bytes. Each record is handed to the sink as soon
 //! as it is decided; the engine holds no list of records.
 
+use crate::run::{RunError, SourceKind, SourceSpec, plan_roots};
 use crate::walk::{DEFAULT_MAX_DEPTH, MountPolicy, Walk, WalkEvent, WalkOptions, walk_with};
 use flux_fs::{
     Code, DestinationRoot, DirHandle, FileIdentity, FileSystem, FileType, FluxPathKey, FsError,
     HashAlgorithm, Links, Safety,
 };
 use std::cmp::Ordering;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 /// What a path turned out to be.
@@ -114,6 +116,13 @@ pub struct VerifyOptions {
 pub enum VerifyError {
     /// Exit 2: the two roots are the same object, or one lies inside the other; nothing was read (design 6.1).
     RefusedRoots { reason: String },
+    /// Exit 2 (several sources): the root check of the source named `name` refused; `reason` is the clause without its
+    /// `; nothing was compared` tail, the by-path-alone note (if any) kept. Nothing was walked.
+    RefusedRoot { name: OsString, reason: String },
+    /// Exit 2 (several sources): the planner refused the names; `reason` is its detail.
+    RefusedNames { reason: String },
+    /// Exit 2 (several sources): two roots are one directory on this filesystem.
+    RefusedAlias { a: OsString, b: OsString },
 }
 
 /// One entry of one side's walk, in the form the merge compares.
@@ -415,6 +424,90 @@ pub(crate) fn verify_tree_filtered<F: DestinationRoot>(
     }
     walk_checked(fs, src, dst, opts, filter, verdict, &mut out);
     Ok(out.summary)
+}
+
+const NOTHING_COMPARED: &str = "; nothing was compared";
+
+/// A root-check refusal `reason` without its `; nothing was compared` tail; what follows the tail is kept.
+fn strip_compared_tail(reason: &str) -> String {
+    match reason.split_once(NOTHING_COMPARED) {
+        Some((head, rest)) => format!("{head}{rest}"),
+        None => reason.to_string(),
+    }
+}
+
+/// Several sources against `dest` (design 6.2 to 6.5): each root is compared with `dest/<name>`, in the order of the
+/// copy's root planner. Every root is checked before any is walked, so a refusal prints nothing. A folder root's paths
+/// are re-rooted under its name; a file root's single record already carries it. `on_absent` fires for a folder
+/// root whose destination does not exist, `on_root_done` after each root with that root's counts.
+pub fn verify_several<F: DestinationRoot>(
+    fs: &F,
+    specs: Vec<SourceSpec>,
+    dest: &Path,
+    opts: &VerifyOptions,
+    on_absent: &mut dyn FnMut(&OsStr),
+    on_root_done: &mut dyn FnMut(&OsStr, &Summary),
+    sink: &mut dyn FnMut(Record),
+) -> Result<Summary, VerifyError> {
+    let specs = plan_roots(specs).map_err(|e| match e {
+        RunError::Refused { refusal, .. } => VerifyError::RefusedNames { reason: refusal.detail },
+        RunError::Failed { .. } => unreachable!("the root planner only refuses"),
+    })?;
+    let mut verdicts = Vec::with_capacity(specs.len());
+    for spec in &specs {
+        let verdict = match spec.kind {
+            SourceKind::Folder => {
+                Some(check_pair(fs, &spec.src, &dest.join(&spec.name)).map_err(|reason| {
+                    VerifyError::RefusedRoot {
+                        name: spec.name.clone(),
+                        reason: strip_compared_tail(&reason),
+                    }
+                })?)
+            }
+            SourceKind::File => None,
+        };
+        verdicts.push(verdict);
+    }
+    let mut total = Summary::default();
+    for (spec, verdict) in specs.iter().zip(verdicts) {
+        let dst = dest.join(&spec.name);
+        let root = match verdict {
+            Some(verdict) => {
+                if matches!(verdict, RootVerdict::Absent) {
+                    on_absent(&spec.name);
+                }
+                let mut reroot = |mut r: Record| {
+                    r.path = if r.path == Path::new(".") {
+                        PathBuf::from(&spec.name)
+                    } else {
+                        Path::new(&spec.name).join(&r.path)
+                    };
+                    sink(r);
+                };
+                let mut out = Emitter { summary: Summary::default(), sink: &mut reroot };
+                walk_checked(
+                    fs,
+                    &spec.src,
+                    &dst,
+                    opts,
+                    ControlFilter::NestedRoot,
+                    verdict,
+                    &mut out,
+                );
+                out.summary
+            }
+            None => verify_file(fs, &spec.src, &dst, opts, sink)?,
+        };
+        on_root_done(&spec.name, &root);
+        total.matched += root.matched;
+        total.missing += root.missing;
+        total.mismatched += root.mismatched;
+        total.extra += root.extra;
+        total.unreadable += root.unreadable;
+        total.not_entered += root.not_entered;
+        total.bytes_hashed += root.bytes_hashed;
+    }
+    Ok(total)
 }
 
 /// What the root check decided for one source and destination pair.
@@ -1935,5 +2028,253 @@ mod tests {
             Ok(RootVerdict::Unreadable { side, .. }) => assert_eq!(side, SOURCE),
             _ => panic!("an absent source must be unreadable"),
         }
+    }
+
+    fn spec(src: &str, name: &str, kind: crate::run::SourceKind) -> crate::run::SourceSpec {
+        crate::run::SourceSpec { src: PathBuf::from(src), name: name.into(), kind }
+    }
+
+    type Several = (Vec<Row>, Vec<(String, Summary)>, Vec<String>, Summary);
+    type SeveralRaw = (Vec<Row>, Vec<(String, Summary)>, Vec<String>, Result<Summary, VerifyError>);
+
+    fn several_result(
+        fs: &FaultFs,
+        specs: Vec<crate::run::SourceSpec>,
+        dest: &str,
+        o: &VerifyOptions,
+    ) -> SeveralRaw {
+        let mut rows = Vec::new();
+        let mut roots = Vec::new();
+        let mut absent = Vec::new();
+        let total = verify_several(
+            fs,
+            specs,
+            Path::new(dest),
+            o,
+            &mut |n| absent.push(n.to_string_lossy().into_owned()),
+            &mut |n, s| roots.push((n.to_string_lossy().into_owned(), s.clone())),
+            &mut |r| rows.push(row(&r)),
+        );
+        (rows, roots, absent, total)
+    }
+
+    fn several(
+        fs: &FaultFs,
+        specs: Vec<crate::run::SourceSpec>,
+        dest: &str,
+        o: &VerifyOptions,
+    ) -> Several {
+        let (rows, roots, absent, total) = several_result(fs, specs, dest, o);
+        (rows, roots, absent, total.unwrap())
+    }
+
+    #[test]
+    fn several_roots_stream_in_prefix_order_with_re_rooted_paths() {
+        use crate::run::SourceKind::Folder;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        tree(&fs, "/d", &["a", "a-b", "b"], &[("a/x", b"1"), ("a-b/x", b"1"), ("b/x", b"1")]);
+        for n in ["a", "a-b", "b"] {
+            tree(&fs, &format!("/s/{n}"), &[], &[("x", b"1")]);
+        }
+        let specs = vec![
+            spec("/s/b", "b", Folder),
+            spec("/s/a-b", "a-b", Folder),
+            spec("/s/a", "a", Folder),
+        ];
+        let (rows, roots, absent, total) = several(&fs, specs, "/d", &opts());
+        assert_eq!(
+            rows,
+            vec![
+                rec("a/x", Outcome::Match, Kind::File),
+                rec("a-b/x", Outcome::Match, Kind::File),
+                rec("b/x", Outcome::Match, Kind::File),
+            ]
+        );
+        let names: Vec<_> = roots.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["a", "a-b", "b"]);
+        assert!(absent.is_empty());
+        assert_eq!(total.matched, 3);
+    }
+
+    #[test]
+    fn a_file_root_is_one_record_named_after_the_root() {
+        use crate::run::SourceKind::File;
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("f", b"abc")]);
+        tree(&fs, "/d", &[], &[("f", b"abc")]);
+        let (rows, roots, _, _) = several(&fs, vec![spec("/s/f", "f", File)], "/d", &opts());
+        assert_eq!(rows, vec![rec("f", Outcome::Match, Kind::File)]);
+        assert_eq!(roots.len(), 1);
+
+        let fs = FaultFs::new();
+        tree(&fs, "/s", &[], &[("f", b"abc")]);
+        tree(&fs, "/d", &[], &[]);
+        let (rows, _, _, total) = several(&fs, vec![spec("/s/f", "f", File)], "/d", &opts());
+        assert_eq!(rows, vec![rec("f", Outcome::Missing, Kind::File)]);
+        assert_eq!(total.missing, 1);
+    }
+
+    #[test]
+    fn an_absent_dest_reports_every_root_missing_and_notifies_each_folder_root() {
+        use crate::run::SourceKind::{File, Folder};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        tree(&fs, "/s/a", &[], &[("x", b"1"), ("y", b"2")]);
+        tree(&fs, "/s/b", &[], &[("z", b"3")]);
+        fs.write_file("/s/f", b"4");
+        let specs =
+            vec![spec("/s/f", "f", File), spec("/s/b", "b", Folder), spec("/s/a", "a", Folder)];
+        let (rows, _, absent, total) = several(&fs, specs, "/d", &opts());
+        assert_eq!(absent, ["a", "b"]);
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().all(|r| r.1 == Outcome::Missing), "{rows:?}");
+        assert_eq!(total.missing, 4);
+    }
+
+    #[test]
+    fn a_mount_notice_carries_the_re_rooted_path() {
+        use crate::run::SourceKind::Folder;
+        let o = VerifyOptions { mounts: MountPolicy::Stay, ..opts() };
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        fs.create_dir(Path::new("/d")).unwrap();
+        tree(&fs, "/s/b", &["m"], &[]);
+        tree(&fs, "/d/b", &["m"], &[]);
+        fs.set_mount_root("/s/b/m", MountRoot::Yes);
+        fs.set_mount_root("/d/b/m", MountRoot::Yes);
+        let (rows, _, _, total) = several(&fs, vec![spec("/s/b", "b", Folder)], "/d", &o);
+        assert_eq!(
+            rows,
+            vec![(
+                "b/m".to_string(),
+                Outcome::Match,
+                Kind::Dir,
+                None,
+                MOUNT_NOT_ENTERED.to_string()
+            )]
+        );
+        assert_eq!(total.not_entered, 1);
+    }
+
+    #[test]
+    fn per_root_summaries_sum_to_the_total() {
+        use crate::run::SourceKind::Folder;
+        let o = VerifyOptions { mounts: MountPolicy::Stay, ..opts() };
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        fs.create_dir(Path::new("/d")).unwrap();
+        tree(&fs, "/s/a", &[], &[("p", b"aa")]);
+        tree(&fs, "/d/a", &[], &[("p", b"bb"), ("e", b"e")]);
+        tree(&fs, "/s/b", &["m"], &[("u", b"u")]);
+        tree(&fs, "/d/b", &["m"], &[]);
+        fs.set_mount_root("/s/b/m", MountRoot::Yes);
+        fs.set_mount_root("/d/b/m", MountRoot::Yes);
+        tree(&fs, "/s/c", &[], &[("k", b"kkk"), ("l", b"lll")]);
+        tree(&fs, "/d/c", &[], &[("k", b"kkk"), ("l", b"lll")]);
+        fs.create_dir(Path::new("/d/d")).unwrap();
+        let specs = ["a", "b", "c", "d"].map(|n| spec(&format!("/s/{n}"), n, Folder)).to_vec();
+        let (_, roots, _, total) = several(&fs, specs, "/d", &o);
+        let names: Vec<_> = roots.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c", "d"]);
+        let mut sum = Summary::default();
+        for (_, s) in &roots {
+            sum.matched += s.matched;
+            sum.missing += s.missing;
+            sum.mismatched += s.mismatched;
+            sum.extra += s.extra;
+            sum.unreadable += s.unreadable;
+            sum.not_entered += s.not_entered;
+            sum.bytes_hashed += s.bytes_hashed;
+        }
+        assert_eq!(sum, total);
+        for (field, v) in [
+            ("matched", total.matched),
+            ("missing", total.missing),
+            ("mismatched", total.mismatched),
+            ("extra", total.extra),
+            ("unreadable", total.unreadable),
+            ("not_entered", total.not_entered),
+            ("bytes_hashed", total.bytes_hashed),
+        ] {
+            assert!(v > 0, "{field} is zero in {total:?}");
+        }
+    }
+
+    #[test]
+    fn a_source_inside_another_source_is_its_own_root() {
+        use crate::run::SourceKind::{File, Folder};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        tree(&fs, "/s/a", &[], &[("f", b"1"), ("g", b"2")]);
+        tree(&fs, "/d", &["a"], &[("a/f", b"1"), ("a/g", b"2"), ("f", b"1")]);
+        let specs = vec![spec("/s/a/f", "f", File), spec("/s/a", "a", Folder)];
+        let (rows, _, _, _) = several(&fs, specs, "/d", &opts());
+        assert_eq!(
+            rows,
+            vec![
+                rec("a/f", Outcome::Match, Kind::File),
+                rec("a/g", Outcome::Match, Kind::File),
+                rec("f", Outcome::Match, Kind::File),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_users_dot_flux_inside_a_root_is_compared_through_verify_several() {
+        use crate::run::SourceKind::Folder;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        fs.create_dir(Path::new("/d")).unwrap();
+        tree(&fs, "/s/a", &[".flux"], &[(".flux/x", b"x"), (".flux-root.lock", b"l")]);
+        let partial = format!("f.flux-partial.{ZEROS}");
+        tree(
+            &fs,
+            "/d/a",
+            &[".flux"],
+            &[(".flux/x", b"x"), (".flux-root.lock", b"l"), (partial.as_str(), b"p")],
+        );
+        let (rows, _, _, _) = several(&fs, vec![spec("/s/a", "a", Folder)], "/d", &opts());
+        assert_eq!(
+            rows,
+            vec![
+                rec("a/.flux", Outcome::Match, Kind::Dir),
+                rec("a/.flux/x", Outcome::Match, Kind::File),
+                rec("a/.flux-root.lock", Outcome::Match, Kind::File),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_root_check_refusal_on_a_later_root_prints_nothing() {
+        use crate::run::SourceKind::Folder;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        tree(&fs, "/s/a", &[], &[("x", b"1")]);
+        tree(&fs, "/d", &["a", "b"], &[("a/x", b"1")]);
+        let specs = vec![spec("/s/a", "a", Folder), spec("/d", "b", Folder)];
+        let (rows, roots, absent, total) = several_result(&fs, specs, "/d", &opts());
+        let Err(VerifyError::RefusedRoot { name, reason }) = total else {
+            panic!("expected RefusedRoot");
+        };
+        assert_eq!(name, std::ffi::OsString::from("b"));
+        assert_eq!(reason, "the destination is the source or lies inside it");
+        assert!(rows.is_empty() && roots.is_empty() && absent.is_empty());
+    }
+
+    #[test]
+    fn two_sources_with_one_name_are_refused_before_any_read() {
+        use crate::run::SourceKind::Folder;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        tree(&fs, "/s/p", &[], &[]);
+        tree(&fs, "/s/q", &[], &[]);
+        tree(&fs, "/d", &[], &[]);
+        let specs = vec![spec("/s/p", "x", Folder), spec("/s/q", "x", Folder)];
+        let (rows, _, _, total) = several_result(&fs, specs, "/d", &opts());
+        assert!(matches!(total, Err(VerifyError::RefusedNames { .. })));
+        assert!(rows.is_empty());
+        let calls = fs.calls();
+        assert!(!calls.iter().any(|c| c.starts_with("read_dir(") || c.starts_with("open_read(")));
     }
 }

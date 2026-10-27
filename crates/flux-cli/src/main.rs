@@ -13,11 +13,12 @@ use flux_cli::report::{self, Report};
 use flux_cli::resolve::{self, Job, Stop};
 use flux_cli::verify_report;
 use flux_core::run::RunConfig;
+use flux_core::verify::VerifyError;
 use flux_fs::{
     Code, CopyOptions, Durability, ExistingPolicy, Links, OperationId, Preserve, Publish, Safety,
 };
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -753,7 +754,6 @@ fn verify_options(args: &VerifyArgs) -> flux_core::verify::VerifyOptions {
 
 /// `flux verify` (cut 14): design 6.1 and 6.6. Records go to stdout; stderr carries only operational lines.
 fn verify(args: &VerifyArgs) -> u8 {
-    use flux_core::verify::VerifyError;
     // `--json` still prints a summary when the run stops before any walk with exit 1 (plan R7).
     let stopped = || {
         if args.json {
@@ -818,8 +818,8 @@ fn verify(args: &VerifyArgs) -> u8 {
     };
     let summary = match result {
         Ok(summary) => summary,
-        Err(VerifyError::RefusedRoots { reason }) => {
-            err(&format!("error: {reason}"));
+        Err(e) => {
+            err(&refusal_line(&e, &dst));
             return exit_code::USAGE;
         }
     };
@@ -831,6 +831,28 @@ fn verify(args: &VerifyArgs) -> u8 {
     };
     stdout_or_exit(&line);
     code
+}
+
+/// The one error line for a verify that did not run (exit 2); `dst` is the canonical destination.
+fn refusal_line(e: &VerifyError, dst: &Path) -> String {
+    match e {
+        VerifyError::RefusedRoots { reason } | VerifyError::RefusedNames { reason } => {
+            format!("error: {reason}")
+        }
+        VerifyError::RefusedRoot { name, reason } => {
+            let n = verify_report::display_path(Path::new(name));
+            format!("error: root {n}: {}/{n}: {reason}; nothing was verified", dst.display())
+        }
+        VerifyError::RefusedAlias { a, b } => {
+            let (a, b) = (
+                verify_report::display_path(Path::new(a)),
+                verify_report::display_path(Path::new(b)),
+            );
+            format!(
+                "error: roots {a} and {b} are one directory on this filesystem; nothing was verified"
+            )
+        }
+    }
 }
 
 /// One line of `flux verify`'s output to stdout. A failed write (a closed pipe, a full disk) ends the run at once with

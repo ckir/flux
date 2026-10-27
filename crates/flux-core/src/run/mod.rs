@@ -54,6 +54,7 @@ use flux_fs::{
 };
 pub use multi::{MultiRun, RootReport, trees};
 use place::{FilePlace, Place, TreePlace, locate_tree};
+pub(crate) use roots::plan_roots;
 pub use roots::{SourceKind, SourceSpec, source_cap};
 
 pub use crate::tree::RootStatus;
