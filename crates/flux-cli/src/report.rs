@@ -927,9 +927,9 @@ pub fn resume_verify_lines(outcome: &TreeOutcome, full: bool) -> Vec<String> {
     if resume_verify_used(outcome, full) { vec![FULL_LEVEL_LINE.to_string()] } else { Vec::new() }
 }
 
-/// Cut 9f-1: the line that follows an aborting error when it is a checkpoint-write failure. `several` is the
-/// destination of a several-source run, whose operation `--resume` refuses (spec L1): it is pointed at
-/// `--restart` instead.
+/// Cut 9f-1: the line that follows an aborting error when it is a checkpoint-write failure. `several` is `Some`
+/// for a several-source run, whose operation `--resume` refuses (spec L1): it is pointed at `--restart` with
+/// the same sources instead; the path itself is not used.
 pub fn abort_hint_lines(error: &CopyError, several: Option<&Path>) -> Vec<String> {
     if error.code() != Code::WalWriteFailed {
         return Vec::new();

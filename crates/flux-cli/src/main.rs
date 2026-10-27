@@ -36,11 +36,11 @@ enum Commands {
     /// With one SOURCE, a file is copied to DEST and a folder's contents onto DEST. With
     /// several (`flux copy SOURCE... DEST`; the last path is DEST) each source, a file or
     /// a folder, is copied to `DEST/<its name>` in one operation; DEST is created if missing.
-    /// --resume and --dry-run need exactly one source; --restart supersedes several-source
-    /// priors too. In a several-source run
-    /// a file source that already exists at `DEST/<name>` is skipped without the identity
-    /// check a single file gets, and when DEST's filesystem gives no strong file identity
-    /// an existing file is reported as a collision.
+    /// --restart and --break-lock work with one or several sources; --resume and --dry-run
+    /// need exactly one source. In a several-source run a file source that already exists at
+    /// `DEST/<name>` is skipped without the identity check a single file gets, and when
+    /// DEST's filesystem gives no strong file identity an existing file is reported as a
+    /// collision.
     ///
     /// What happens to a file that already exists at DEST is chosen by one of
     /// --overwrite (the default: replace it), --update (replace it when the source is

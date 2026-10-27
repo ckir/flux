@@ -2138,22 +2138,24 @@ mod trees_tests {
         assert_eq!(fs.read_file("/p/dest/a/x").as_deref(), Some(&b"ax"[..]));
         assert_eq!(fs.read_file("/p/dest/b/k").as_deref(), Some(&b"bk"[..]));
 
-        // ORDER: the restart's own destination lock is created before either prefix lock is released.
+        // ORDER: the first `create_new` outside `DEST/.flux` is the first partial of the copy; no prefix lock of a
+        // name this run uses may be released before it (anti-goal A1). This probe is the only guard of A1 at this
+        // level.
         let log = calls(&fs);
         let after = &log[mark..];
-        let own_lock = after
+        let first_copy_write = after
             .iter()
             .position(|c| {
                 c.starts_with("create_new(") && !c.starts_with("create_new(/p/dest/.flux")
             })
-            .expect("the restart creates a lock");
+            .expect("the restart creates a partial file");
         for name in ["a", "b"] {
             let release = format!("remove_file(/p/dest/{name}.flux-lock)");
             let at =
                 after.iter().position(|c| *c == release).unwrap_or_else(|| panic!("no {release}"));
             assert!(
-                own_lock < at,
-                "{name}: the lock was created at {own_lock}, released at {at}: {after:?}"
+                first_copy_write < at,
+                "{name}: the first partial was created at {first_copy_write}, released at {at}: {after:?}"
             );
         }
 
@@ -2171,8 +2173,10 @@ mod trees_tests {
             panic!("the destination lock is not a record");
         };
         // A "now" heartbeat: nothing has aged. `classify`'s `Dead` arm reads no heartbeat (classify.rs:54-57), so the
-        // restart must take the lock at once; the mutant is the cleanup lease gate (obtain.rs:239-249) applied to
-        // `obtain`'s `Dead` arm.
+        // restart must take the lock at once. The mutant that proves it is a STAND-IN (refuse when the record's last
+        // heartbeat equals its creation time), because `obtain` takes no clock; the real lease gate would be
+        // `obtain_cleanup_lock`'s (`crates/flux-core/src/lock/obtain.rs`). The premise that the heartbeat is "now"
+        // holds because the crashed run wrote it with the real clock.
         assert_eq!(rec.last_heartbeat_wall_time, rec.creation_wall_time);
         let (r, _) = go_with(&fs, ["a", "b"].map(spec).to_vec(), &opts(), &restart_cfg(0x23));
         ok(&r);
@@ -2317,7 +2321,7 @@ mod trees_tests {
     }
 
     #[test]
-    fn a_several_source_restart_supersedes_a_failed_one_source_tree_run() {
+    fn a_several_source_restart_supersedes_a_crashed_one_source_tree_run() {
         let tree = |fs: &FaultFs, c: &RunConfig| {
             crate::run::tree(fs, Path::new("/src/a"), Path::new("/p/dest"), &opts(), c, &mut |_| {})
         };

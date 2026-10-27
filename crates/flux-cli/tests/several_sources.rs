@@ -148,7 +148,7 @@ fn dest_that_is_a_file_exits_2() {
 }
 
 #[test]
-fn resume_restart_and_dry_run_exit_2_naming_the_flag() {
+fn resume_and_dry_run_exit_2_naming_the_flag() {
     let d = TempDir::new().unwrap();
     let (alpha, beta) = (folder(d.path(), "alpha"), folder(d.path(), "beta"));
     let out_dir = d.path().join("out");
@@ -509,6 +509,11 @@ impl Drop for Stalled {
 
 /// The stall index for `[alpha, beta]` into `out` (measured 2026-10-27 on the debug binary, Linux): the run stops
 /// with `out/alpha/a.flux-partial.<id>`, `out/alpha.flux-lock`, `out/beta.flux-lock` and `out.flux-lock` on disk.
+///
+/// Measured on Linux with the debug binary. To re-measure: run the debug binary with FLUX_TEST_STALL_AT=<n> (n from
+/// 1), FLUX_TEST_STALL_FILE=<marks>/stalled-<n>, FLUX_TEST_BATCH_AGE_MS=3600000 and FLUX_TEST_OPEN_WRITERS=256
+/// against two folders, kill each stalled run, and take the first n whose destination holds alpha/a.flux-partial.*
+/// with both prefix locks on disk.
 const STALL_AT: u32 = 4;
 
 /// Whether some file named `a.flux-partial.*` sits directly in `dir`.
