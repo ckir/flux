@@ -59,7 +59,7 @@ Anti-goals
   non-directory entries the walk yielded (`tree.rs:54-56`), so a walk-level skip leaves excluded entries out of it.
 - Options travel as `CopyOptions` (`crates/flux-fs/src/options.rs:119`, `Clone`, not `Copy`) from
   `options(&CopyArgs)` (`crates/flux-cli/src/main.rs:265`) through `run::tree` / `run::trees`, `prepare_source`
-  (`run/mod.rs:320`, `run/multi.rs:476`). `VerifyOptions` is `Copy` (`verify.rs:108-113`), built at `main.rs:739`.
+  (`run/mod.rs:320`, `run/multi.rs:476`). `VerifyOptions` is `Copy` (at the base commit, before this cut; `verify.rs:108-113`), built at `main.rs:739`.
 - Fingerprint: `Options` (`crates/flux-core/src/state.rs:94-125`, `deny_unknown_fields`) is built by `Options::of`
   (`state.rs:128-160`); `canonical_bytes` (`state.rs:165-179`) adds `links=skip` and `cross_filesystems=true` only when
   non-default. `validate` compares six values and refuses with `INCOMPATIBLE_STATE` (`run/resume.rs:104-120`), exit 3
@@ -141,7 +141,7 @@ Plan rulings recorded here: P1 (the matcher and the compiled field live in `flux
 
 ### 5.4 Copy, dry run, resume
 
-All walks start in `prepare_source` (`tree.rs:418`), so passing the selection there covers live, dry and resume runs,
+All walks are built through `prepare_source` (`tree.rs:418`), and the selection is attached right after it with `Walk::set_selection` at its three production sites (`run_tree` in `tree.rs`, `tree_with` in `run/mod.rs`, and the `Ok(mut source)` arm in `run/multi.rs`), which covers live, dry and resume runs,
 single and several sources. Several sources: the patterns apply to EACH source root, relative to that root. A source that is itself a FILE (single-file source, or a file among several sources) has no relative path and is copied whatever the patterns say (call R7). No per-entry logic in `copy_tree` changes: it never sees an excluded entry (only the count's plumbing does, section 5.9). `--exclude 'private/**'` still enters `private`, so an unreadable `private` is a reported failure (exit 1) and the empty `private/` is created; `--exclude private/` avoids both. `files_total` therefore counts selected entries only.
 
 ### 5.5 Resume fingerprint
@@ -257,7 +257,7 @@ make `?` a byte; drop `recursive=false` from `canonical_bytes`; drop the destina
   mount directory yields no note (nothing was looked at). Pinned by a walker test.
 - The root itself is never filtered (`--exclude .` is rejected; `**` cannot match the root).
 - Depth: an excluded-but-too-deep directory no longer raises the depth `WalkError` (the filter runs first); intended.
-- `Config::new` / `Options { .. }` literals in tests need the two new fields: the compiler names every one (FILES clause
+- `Config::new` / state `Options { .. }` literals in tests need the two new fields (`exclude`, `recursive`), and `CopyOptions` / `VerifyOptions` literals need `selection`: the compiler names every one (FILES clause
   for the plan lists them).
 - Windows: the walker's `rel` uses `\`; the matcher reads `components()`, so a `/`-separated pattern segment meets a component, not a byte (section 5.3). A name with a lone surrogate fails `to_str` and is matched in byte mode on its WTF-8 form (`?` then matches one WTF-8 byte). Section 6's table fixtures build `rel` with `PathBuf::join`, and one walker test uses an anchored multi-component pattern at depth 2, so Windows CI exercises the real input; it is the only evidence for the Windows legs.
 
