@@ -13,9 +13,10 @@ use crate::run::{RunError, SourceKind, SourceSpec, plan_roots};
 use crate::walk::{DEFAULT_MAX_DEPTH, MountPolicy, Walk, WalkEvent, WalkOptions, walk_with};
 use flux_fs::{
     Code, DestinationRoot, DirHandle, FileIdentity, FileSystem, FileType, FluxPathKey, FsError,
-    HashAlgorithm, Links, Safety,
+    HashAlgorithm, Links, ObjectId, Safety,
 };
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
@@ -478,6 +479,21 @@ pub fn verify_several<F: DestinationRoot>(
         };
         verdicts.push(verdict);
     }
+    // Two folder roots that are one directory on the destination (design 6.2): the first name per Strong identity.
+    // Run after the whole loop so a refused root wins, and before any walk so nothing remembered is emitted.
+    let mut seen: HashMap<ObjectId, OsString> = HashMap::new();
+    for (spec, verdict) in specs.iter().zip(&verdicts) {
+        if let Some(RootVerdict::Checked { dest_identity: Some(id) }) = verdict {
+            match seen.get(id) {
+                Some(a) => {
+                    return Err(VerifyError::RefusedAlias { a: a.clone(), b: spec.name.clone() });
+                }
+                None => {
+                    seen.insert(*id, spec.name.clone());
+                }
+            }
+        }
+    }
     let mut total = Summary::default();
     for (spec, verdict) in specs.iter().zip(verdicts) {
         let dst = dest.join(&spec.name);
@@ -541,15 +557,21 @@ enum RootVerdict {
     /// A folder root's destination exists but is not a directory (several sources only; never produced by
     /// `check_pair`).
     WrongType(Kind),
-    /// The roots are distinct and both exist.
-    Checked,
+    /// The roots are distinct and both exist. `dest_identity` is the destination directory's identity when it is
+    /// `Strong`, the only kind the alias rule trusts.
+    Checked { dest_identity: Option<ObjectId> },
 }
 
 /// The root check of one pair (design 6.2): no directory is listed. `Err(reason)` is a refusal.
 fn check_pair<F: DestinationRoot>(fs: &F, src: &Path, dst: &Path) -> Result<RootVerdict, String> {
     match check_roots(fs, src, dst) {
         Ok(Presence::Absent) => Ok(RootVerdict::Absent),
-        Ok(Presence::Present(_)) => Ok(RootVerdict::Checked),
+        Ok(Presence::Present(identity)) => Ok(RootVerdict::Checked {
+            dest_identity: match identity {
+                FileIdentity::Strong(id) => Some(id),
+                FileIdentity::Weak(_) | FileIdentity::Unavailable => None,
+            },
+        }),
         Err(RootsCheck::Refused(reason)) => Err(reason),
         Err(RootsCheck::Unreadable(side, error)) => Ok(RootVerdict::Unreadable { side, error }),
     }
@@ -571,7 +593,7 @@ fn walk_checked<F: DestinationRoot>(
             return;
         }
         RootVerdict::Absent => true,
-        RootVerdict::Checked => false,
+        RootVerdict::Checked { .. } => false,
         RootVerdict::WrongType(_) => {
             unreachable!("only verify_several probes the type, and it reports it itself")
         }
@@ -668,8 +690,7 @@ fn sided_check<F: DestinationRoot>(
 /// What the root check found at the destination.
 enum Presence {
     Absent,
-    /// The destination's identity; nothing reads it until the several-sources check keeps it.
-    #[allow(dead_code)]
+    /// The destination's identity.
     Present(FileIdentity),
 }
 
@@ -2042,7 +2063,7 @@ mod tests {
         tree(&fs, "/d", &[], &[]);
         assert!(matches!(
             check_pair(&fs, Path::new("/s"), Path::new("/d")),
-            Ok(RootVerdict::Checked)
+            Ok(RootVerdict::Checked { .. })
         ));
         assert!(matches!(
             check_pair(&fs, Path::new("/s"), Path::new("/gone")),
@@ -2093,6 +2114,113 @@ mod tests {
     ) -> Several {
         let (rows, roots, absent, total) = several_result(fs, specs, dest, o);
         (rows, roots, absent, total.unwrap())
+    }
+
+    /// `/s/<n>` and `/d/<n>` for each name, empty; the case-sensitive fake models an aliasing destination through
+    /// `set_identity`.
+    fn alias_fixture(names: &[&str]) -> FaultFs {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        fs.create_dir(Path::new("/d")).unwrap();
+        for n in names {
+            tree(&fs, &format!("/s/{n}"), &[], &[]);
+            tree(&fs, &format!("/d/{n}"), &[], &[]);
+        }
+        fs
+    }
+
+    fn one_id() -> flux_fs::ObjectId {
+        flux_fs::ObjectId { volume: 1, index: 999 }
+    }
+
+    fn alias_pair(fs: &FaultFs, id: flux_fs::FileIdentity) {
+        fs.set_identity("/d/Data", id);
+        fs.set_identity("/d/data", id);
+    }
+
+    fn data_specs() -> Vec<crate::run::SourceSpec> {
+        use crate::run::SourceKind::Folder;
+        vec![spec("/s/data", "data", Folder), spec("/s/Data", "Data", Folder)]
+    }
+
+    #[test]
+    fn two_root_names_that_alias_on_the_destination_are_refused_before_any_read() {
+        let strong = flux_fs::FileIdentity::Strong(one_id());
+        // Arm 1: one Strong identity for two directories.
+        let fs = alias_fixture(&["Data", "data"]);
+        alias_pair(&fs, strong);
+        let (rows, _, _, r) = several_result(&fs, data_specs(), "/d", &opts());
+        match r {
+            Err(VerifyError::RefusedAlias { a, b }) => {
+                assert_eq!((a.to_str(), b.to_str()), (Some("Data"), Some("data")));
+            }
+            other => panic!("expected RefusedAlias, got {other:?}"),
+        }
+        assert!(!fs.called("read_dir(/s/Data)") && !fs.called("read_dir(/s/data)"));
+        assert!(!fs.called("read_dir(/d/Data)") && !fs.called("read_dir(/d/data)"));
+        assert!(rows.is_empty(), "{rows:?}");
+
+        // Arm 2: their own minted identities.
+        let fs = alias_fixture(&["Data", "data"]);
+        let (_, roots, _, r) = several_result(&fs, data_specs(), "/d", &opts());
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(roots.len(), 2);
+
+        // Arm 3: equal but Weak.
+        let fs = alias_fixture(&["Data", "data"]);
+        alias_pair(&fs, flux_fs::FileIdentity::Weak(one_id()));
+        let (_, roots, _, r) = several_result(&fs, data_specs(), "/d", &opts());
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(roots.len(), 2);
+
+        // Arm 4: equal and Strong, but Data's source is absent: no identity was obtained for it.
+        let fs = alias_fixture(&["data"]);
+        fs.create_dir(Path::new("/d/Data")).unwrap();
+        alias_pair(&fs, strong);
+        let (rows, roots, _, r) = several_result(&fs, data_specs(), "/d", &opts());
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(roots.len(), 2);
+        assert!(rows.iter().any(|x| x.0 == "Data" && x.1 == Outcome::Unreadable), "{rows:?}");
+
+        // Arm 5: an absent third root beside the aliasing pair does not hide the alias.
+        use crate::run::SourceKind::Folder;
+        let fs = alias_fixture(&["Data", "data"]);
+        alias_pair(&fs, strong);
+        let mut specs = data_specs();
+        specs.push(spec("/s/other", "other", Folder));
+        let (_, _, _, r) = several_result(&fs, specs, "/d", &opts());
+        assert!(matches!(r, Err(VerifyError::RefusedAlias { .. })), "{r:?}");
+    }
+
+    #[test]
+    fn a_refused_root_check_wins_over_an_alias_and_discards_remembered_verdicts() {
+        use crate::run::SourceKind::Folder;
+        let build = || {
+            let fs = alias_fixture(&["Data", "data"]);
+            alias_pair(&fs, flux_fs::FileIdentity::Strong(one_id()));
+            fs.create_dir(Path::new("/d/a")).unwrap();
+            fs
+        };
+        let base = || {
+            let mut specs = data_specs();
+            specs.push(spec("/s/a", "a", Folder));
+            specs
+        };
+        // Control: no refused root, so the alias is what comes back (and `a`, unreadable, is discarded).
+        let fs = build();
+        let (rows, _, _, r) = several_result(&fs, base(), "/d", &opts());
+        assert!(matches!(r, Err(VerifyError::RefusedAlias { .. })), "{r:?}");
+        assert!(rows.is_empty(), "{rows:?}");
+
+        let fs = build();
+        let mut specs = base();
+        specs.push(spec("/d", "z", Folder));
+        let (rows, _, _, r) = several_result(&fs, specs, "/d", &opts());
+        match r {
+            Err(VerifyError::RefusedRoot { name, .. }) => assert_eq!(name.to_str(), Some("z")),
+            other => panic!("expected RefusedRoot, got {other:?}"),
+        }
+        assert!(rows.is_empty(), "{rows:?}");
     }
 
     #[test]
