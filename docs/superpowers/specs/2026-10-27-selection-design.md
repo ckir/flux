@@ -1,9 +1,9 @@
 # Selection: `--exclude` and `--recursive` / `--no-recursive` (cut 16) - design
 
-Status: DRAFT, 2026-10-27, branch `feat/exclude` (off main 67a03b8f6d9520e6d0cb5cdce7806bfb4b778620).
+Status: DRAFT (panel rounds 1-2 folded), 2026-10-27, branch `feat/exclude` (off main 67a03b8f6d9520e6d0cb5cdce7806bfb4b778620).
 Owner decisions already taken in conversation (not open): the cut is selection through the shared walker; the `--exclude`
 grammar of section 5.1; `--recursive` is the default and `--no-recursive` copies only the top level; skipped
-subdirectories stay SILENT. Every other open call is the author's (section 7), for the owner to override.
+subdirectories stay SILENT; ONE `excluded` counter reports what `--exclude` removed (call R4). Every other open call is the author's (section 7), for the owner to override.
 Peer consults (AGY-FIRST): `.clavity/seams/next-cut-fork-6.md` (order: selection, then several-source
 `--restart`/`--dry-run`, then progress), `.clavity/seams/exclude-grammar-fork.md`, `.clavity/seams/recursive-fork.md`.
 Prior art: `TODO.md:1214`, `ROADMAP.md:43,45`, spec Sections 5 (options, `:685-700`), 14 (`:1162-1198`), 15, 19
@@ -20,6 +20,7 @@ already-filtered stream.
 ## 2. Goals, non-goals, anti-goals
 
 Goals
+- A mistyped or over-broad `--exclude` is visible: the report carries ONE `excluded` count (section 5.9).
 - `--exclude PATTERN` (repeatable) and `--recursive` / `--no-recursive` on `flux copy` (single source, several sources,
   `--dry-run`, `--resume`) and on `flux verify` (one and several sources).
 - One predicate in the walker decides selection, so that every consumer sees only selected entries. An excluded
@@ -32,7 +33,7 @@ Goals
 Non-goals
 - Negation (`!`), character classes (`[...]`), `--exclude-from FILE`, `--exclude-dir` / `--exclude-file`, `--max-depth`.
   Reserved syntax is rejected now so a later release can add it without changing a working command line.
-- An `EXCLUDE` record per excluded entry and an excluded counter in the report (call R4).
+- An `EXCLUDE` record per excluded entry, or any per-entry listing of what was excluded (call R4 chose a count only).
 - Parallel workers, bounded queues, a planner (Phase 3 remainder). A matcher dependency crate (call R10).
 - `--cross-filesystems` and `--links` are unchanged; they already exist.
 
@@ -64,6 +65,7 @@ Anti-goals
   non-default. `validate` compares six values and refuses with `INCOMPATIBLE_STATE` (`run/resume.rs:104-120`), exit 3
   (`flux-cli/src/exit_code.rs:76`). `Config::new` takes an `Options` VALUE (`state.rs:197-200`), so adding fields leaves its ~15 call sites alone; only literal `Options { .. }` constructions break, and the compiler names every one (the plan's FILES clause lists them).
 - `STATE_LIMIT` is 64 KiB: `decode` rejects a longer manifest as `Corrupt` (`state.rs:34`, `state.rs:477-478`) and the read is capped at the same size (`state.rs:936`); nothing checks the size when the state is WRITTEN.
+- Precedent for an optional report counter: `mounts_skipped` (`crates/flux-cli/src/report.rs:55`, absent from JSON at zero, test at `report.rs:1029`); verify prints `not_entered` only when non-zero (`crates/flux-cli/src/verify_report.rs:135-136`).
 - Verify merges two sorted walks and reports `Missing`, `Extra`, `Mismatched`, `Unreadable`, `Match`
   (`verify.rs:626-648`); extras print but never fail the run (`verify.rs:101-104`). The destination `Side` takes a
   `ControlFilter` (`verify.rs:617`).
@@ -158,6 +160,19 @@ every state written before this cut keeps its hash. `validate` compares both and
 at `verify.rs:607` and `verify.rs:617`), so a destination entry that is excluded, or lies below the first level under `--no-recursive`, is neither `Extra` nor compared (call R6). The predicate looks at each entry's OWN kind, so it can select the two sides of one name differently: a source FILE `foo` against a destination DIRECTORY `foo` under the dir-only pattern `foo/` (or under `--no-recursive`) reports `Missing` for `foo`, not a type mismatch, and the mirror case reports `Extra`. That is by design and pinned by a test. `verify_file` ignores the options as today. Several sources:
 each source root is walked with the selection, as in copy.
 
+### 5.9 The `excluded` count (owner decision, call R4)
+
+`Walk` keeps a `u64` of the entries the `--exclude` patterns removed, readable after the walk. An entry counts ONCE at the
+point the walker drops it: a pruned directory counts as 1 (not its subtree, which is never visited), a skipped file as 1.
+Entries removed by `--no-recursive` do NOT count (owner ruling: silent). `TreeOutcome` gains `excluded`, summed across the
+roots of a several-source run; the `--json` copy report gains `excluded` (omitted at zero, like `mounts_skipped`); the text
+report prints one summary line, in the style of the existing summary lines, only when it is non-zero. `flux verify`
+counts the SOURCE walk only: `Summary` gains `excluded`, shown in the JSON summary and as a clause on the summary line only
+when non-zero; destination-side removals are not counted (they are not source entries). Dry run, live run and resume count
+alike because they share the walk. `files_total` and every other counter are unchanged in meaning. A typo that matches
+nothing therefore shows as no `excluded` line (and `excluded` absent from the JSON), and `--exclude '**'` as the number of
+top-level entries it removed.
+
 ### 5.7 CLI and docs
 
 - `--exclude <PATTERN>` (repeatable, `ArgAction::Append`), `--recursive`, `--no-recursive` on `CopyArgs` and `VerifyArgs`,
@@ -188,6 +203,7 @@ Each test is pinned by a named case; the plan assigns the exact names. Matcher (
   still completes within a bounded step count (linearity).
 Walker (`walk.rs`): a SYMLINK and an `Other` entry are excluded by name; an excluded directory at depth 2 (not only at the root) yields no event and the `FaultFs` call log shows no `read_dir` / `metadata`
 for it; `private/**` still yields `private` and filters its children; `--no-recursive` yields only top-level non-directories and does NOT trip the depth cap, and a top-level symlink to a directory is yielded as a symlink (and copied as one under `--links=copy`); an excluded directory deeper than the cap raises no depth error; the root is never filtered; selection plus mounts.
+Count (`excluded`): a pruned directory with a large subtree counts 1; a file excluded by name counts 1; `--no-recursive` subdirectories count 0; no pattern means `excluded` is absent from the JSON report and no summary line prints; a typo pattern that matches nothing is absent likewise; `--exclude '**'` counts the top-level entries; the count is summed over two roots; dry run, live and resume agree; verify counts source-side removals only and an excluded name at the destination does not count.
 Copy (`tree.rs` / run tests): exclusion leaves the destination without the entries; hardlink group with one excluded
 member copies the remaining member as an ordinary file (`files_hardlinked == 0`, no degradation, strict mode passes),
 two selected members still link, with one case excluding the FIRST-walked (canonical) member and another the last; `files_total` counts selected only; `--no-recursive` creates no subdirectory; dry run
@@ -206,7 +222,7 @@ make `?` a byte; drop `recursive=false` from `canonical_bytes`; drop the destina
 - R1. Case-sensitive on every platform, no Unicode normalisation (so an NFC pattern misses an NFD name on macOS). Case-insensitivity is a property of the volume, not the OS; a later `--exclude-ignore-case` can add it.
 - R2. `?` is one Unicode scalar for valid UTF-8 names, one byte otherwise.
 - R3. Control characters (including newline) are rejected in a pattern, so a fingerprint line is unambiguous.
-- R4. OPEN FOR THE OWNER (O1, not yet decided). Both panels found that a typo (`--exclude .tmp` for `*.tmp`) or `--exclude '**'` exits 0 with no hint. The spec's example prints `EXCLUDE private/file` (`:1186`) but no per-entry record exists for success today. The owner's silence ruling (R5) covers skipped subdirectories only. Author's recommendation: ONE counter, `excluded`, the entries the filter removed (a pruned directory counts once, not its subtree), in the `--json` report when non-zero and as a single summary line in the text report only when non-zero; no per-entry record. It costs one `u64` in the walker. Options: (a) that, (b) silent as first written.
+- R4. (Owner decision: option (a).) One `excluded` count, no per-entry record and no `EXCLUDE` line; the spec's example output (`:1186`) is illustrative and no per-entry success record exists today. Counted once per removal, a pruned directory as one, `--no-recursive` removals not counted (R5). Verify counts the source side only (section 5.9).
 - R5. (Owner ruling.) Skipped subdirectories under `--no-recursive` are silent.
 - R6. Verify applies the selection to both sides, so nothing selected-out shows as `extra`.
 - R7. On a single-file source, and on a file among several sources, `--exclude` and the recursion flags are accepted and ignored: an operand the user named explicitly is their own selection and has no path relative to a source root. `--help` says so. (rsync applies the pattern to the name; the alternative is to match unanchored patterns against it.)
@@ -231,7 +247,7 @@ make `?` a byte; drop `recursive=false` from `canonical_bytes`; drop the destina
 
 ## Stand-downs
 
-- `EXCLUDE` record / excluded counter (R4); `--exclude-from`, negation, classes, ignore-case; `--max-depth`; selection
+- A per-entry `EXCLUDE` record or listing (R4); `--exclude-from`, negation, classes, ignore-case; `--max-depth`; selection
   summary in the `--json` report. Each gets a TODO line in this cut's docs task.
 
 ## Panel record (AGY-AFTER)
@@ -249,4 +265,4 @@ Rounds 1 and 2 (each: a solo Sonnet panel and the agy peer), then one negotiatio
   `components()` mechanism.
 - DISCARDED-BELOW-FLOOR: the clap error echoes the rejected pattern including a control character (stderr cosmetic, no
   state is touched before argument parsing); case-sensitive matching surprising users on NTFS (decided, R1).
-- OPEN: call R4 / O1 (an `excluded` counter) awaits the owner.
+- OWNER DECISION (R4): one `excluded` counter, folded as section 5.9 after round 2; round 3 reviews it.
