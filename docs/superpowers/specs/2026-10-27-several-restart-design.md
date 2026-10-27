@@ -1,6 +1,6 @@
 # `flux copy --restart` (and `--break-lock`) with several sources - design (cut 17)
 
-Status: DRAFT for the owner. Author calls are marked **(call)**. Owner decisions are marked **(owner)**.
+Status: approved by the owner 2026-10-27; design panel GREEN at d2246b55c71c52bb0655293dd30aeb3606542ba2. Author calls are marked **(call)**. Owner decisions are marked **(owner)**.
 Builds on `docs/superpowers/specs/2026-10-22-several-sources-design.md` (cut 11c; N1 and L1 there) and spec section 21.1.
 
 ## 1. Intent and why
@@ -64,7 +64,7 @@ Spec 21.1 steps are unchanged: `still_owned` is checked before every mutation in
 No new flag, report field or JSON key. A restart reports as a one-source restart does today.
 
 ### 3.7 Documentation
-`README.md` where `flux copy` with several sources is described (its usage lines; there is no dedicated section), `docs/accepted-boundaries.md:106` (its L1 text says `--restart` is refused with several sources), the `--help` texts, `TODO.md` L1 (close the `--restart` and `--break-lock` part, keep `--resume` and `--dry-run`), `ROADMAP.md` where it lists several sources, and `docs/superpowers/specs/2026-10-22-several-sources-design.md` (a dated note under N1 and L1, not a rewrite).
+README.md has no sentence about several sources and `--restart` (its only several-source text is the `flux verify` section, `README.md:105-141`), so it does not change. The other files are `docs/accepted-boundaries.md:106` (its L1 text says `--restart` is refused with several sources), the `--help` texts, `TODO.md` L1 (close the `--restart` and `--break-lock` part, keep `--resume` and `--dry-run`), `ROADMAP.md` where it lists several sources, and `docs/superpowers/specs/2026-10-22-several-sources-design.md` (a dated note under N1 and L1, not a rewrite).
 
 ## 4. Approaches considered
 - **A. Narrow engine fix (chosen; agy and the author agree).** Lift the CLI refusal, make `MultiPlace::remove` id-aware, keep `--break-lock` on the destination lock, fix the messages. About one cut (agy's estimate, 350-450 lines, unmeasured).
