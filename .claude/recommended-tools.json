@@ -30,6 +30,12 @@
     "in_path": "typos"
   },
   {
+    "name": "cargo-shear",
+    "why": "Fails `just unused-deps` (part of `just check`, and the Unused dependencies job in ci.yml) on a dependency no code uses. Exceptions live in [workspace.metadata.cargo-shear] in Cargo.toml. `cargo shear --fix` removes what it finds.",
+    "install": "cargo binstall -y cargo-shear",
+    "in_path": "cargo-shear"
+  },
+  {
     "name": "bacon",
     "why": "Background check/clippy/test watcher during development. Configured by bacon.toml; default job is check-all.",
     "install": "cargo binstall -y bacon",

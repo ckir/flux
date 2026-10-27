@@ -168,7 +168,7 @@ Requires Rust 1.98.1+ (edition 2024).
 
 ```
 cargo build --workspace
-just check              # the local gate: fmt + clippy + typos + test
+just check              # the local gate: fmt + clippy + typos + unused-deps + test
 ```
 
 Tooling is listed in [`docs/dev-tooling.md`](docs/dev-tooling.md); see
