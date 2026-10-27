@@ -160,19 +160,6 @@ every state written before this cut keeps its hash. `validate` compares both and
 at `verify.rs:607` and `verify.rs:617`), so a destination entry that is excluded, or lies below the first level under `--no-recursive`, is neither `Extra` nor compared (call R6). The predicate looks at each entry's OWN kind, so it can select the two sides of one name differently: a source FILE `foo` against a destination DIRECTORY `foo` under the dir-only pattern `foo/` (or under `--no-recursive`) reports `Missing` for `foo`, not a type mismatch, and the mirror case reports `Extra`. That is by design and pinned by a test. `verify_file` ignores the options as today. Several sources:
 each source root is walked with the selection, as in copy.
 
-### 5.9 The `excluded` count (owner decision, call R4)
-
-`Walk` keeps a `u64` of the entries the `--exclude` patterns removed, readable after the walk. An entry counts ONCE at the
-point the walker drops it: a pruned directory counts as 1 (not its subtree, which is never visited), a skipped file as 1.
-Entries removed by `--no-recursive` do NOT count (owner ruling: silent). `TreeOutcome` gains `excluded`, summed across the
-roots of a several-source run; the `--json` copy report gains `excluded` (omitted at zero, like `mounts_skipped`); the text
-report prints one summary line, in the style of the existing summary lines, only when it is non-zero. `flux verify`
-counts the SOURCE walk only: `Summary` gains `excluded`, shown in the JSON summary and as a clause on the summary line only
-when non-zero; destination-side removals are not counted (they are not source entries). Dry run, live run and resume count
-alike because they share the walk. `files_total` and every other counter are unchanged in meaning. A typo that matches
-nothing therefore shows as no `excluded` line (and `excluded` absent from the JSON), and `--exclude '**'` as the number of
-top-level entries it removed.
-
 ### 5.7 CLI and docs
 
 - `--exclude <PATTERN>` (repeatable, `ArgAction::Append`), `--recursive`, `--no-recursive` on `CopyArgs` and `VerifyArgs`,
@@ -184,6 +171,36 @@ top-level entries it removed.
 ### 5.8 Cleanup folded in
 
 The doc comments at `state.rs:164` (omits `cross_filesystems`) and `run/resume.rs:35` ("the four exact-match options", six are compared today and eight after this cut) are corrected where this cut edits those functions.
+
+### 5.9 The `excluded` count (owner decision, call R4)
+
+What it counts. The entries the `--exclude` patterns removed, counted ONCE at the point the walker drops an entry: a pruned
+directory is 1 (its subtree is never visited), a skipped file, symlink or other entry is 1, an entry matched by two patterns
+is 1. Entries removed by `--no-recursive` do NOT count (owner ruling: silent). The count is "entries excluded among those
+the run reached": a root that never started (`NotStarted`, `tree.rs:779-828`) contributes 0, and exclusions inside a subtree
+whose directory failed still count, as `files_total` does. It is never persisted: not in `Options`, the manifest, the
+fingerprint or the WAL; a resume recounts it from its own walk.
+
+Plumbing (copy). `Walk` holds a `u64` and an accessor. `walk_into` consumes the walk with `for item in events`
+(`tree.rs:1053`), so the loop becomes `events.by_ref()` (or the walk is borrowed) and the count is added to
+`TreeOutcome.excluded` AFTER the loop on every exit path, including an abort: a `TreeAbort` carries the count reached so far.
+`copy_roots_at` sums it across roots. The tests pin the abort path.
+
+Plumbing (verify). `Side::new` (`verify.rs:174`) builds both sides alike; the verify engine reads the SOURCE side's count and
+ignores the destination side's. `Summary` gains `excluded`. It is folded field by field at `verify.rs:540-548` (and in the
+test folds at `verify.rs:2372` and `verify_proptest.rs:329`), which is NOT compiler-visible, so the plan lists every fold in
+its FILES clause and a two-root test pins the sum.
+
+Report. Copy JSON: `excluded: u64` after `mounts_skipped`, `skip_serializing_if` zero, so the pinned 18-key set
+(`report.rs:~946`, `tests/copy.rs:288,315`) holds when it is zero. Verify JSON: `excluded` in `SummaryBody` after `not_entered`,
+ALSO omitted at zero (unlike `not_entered`, which is always present), so `SUMMARY_KEYS` and `SEVERAL_SUMMARY_KEYS`
+(`tests/verify.rs:55,562`) hold at zero; with a non-zero count the key is present and the key-order test names its position.
+Text: a `; N excluded` suffix, only when non-zero, on `summary_line` (`report.rs:478`, joined to its suffix loop),
+on `dry_run_summary_line` (`report.rs:499`) and on verify's summary line (`verify_report.rs:~135`, after the
+`mount points not entered` clause). `RootJson` and `root_lines` (several sources) gain NO per-root count; the resume lines are
+unchanged. `files_total`, `files_skipped` and every other counter keep their meaning (`excluded` never leaks into
+`files_skipped`). A typo pattern that matches nothing therefore shows no `excluded` anywhere, and `--exclude '**'` shows the
+number of top-level entries removed.
 
 ## 6. Tests (the oracle; written before the code, named)
 
@@ -203,7 +220,7 @@ Each test is pinned by a named case; the plan assigns the exact names. Matcher (
   still completes within a bounded step count (linearity).
 Walker (`walk.rs`): a SYMLINK and an `Other` entry are excluded by name; an excluded directory at depth 2 (not only at the root) yields no event and the `FaultFs` call log shows no `read_dir` / `metadata`
 for it; `private/**` still yields `private` and filters its children; `--no-recursive` yields only top-level non-directories and does NOT trip the depth cap, and a top-level symlink to a directory is yielded as a symlink (and copied as one under `--links=copy`); an excluded directory deeper than the cap raises no depth error; the root is never filtered; selection plus mounts.
-Count (`excluded`): a pruned directory with a large subtree counts 1; a file excluded by name counts 1; `--no-recursive` subdirectories count 0; no pattern means `excluded` is absent from the JSON report and no summary line prints; a typo pattern that matches nothing is absent likewise; `--exclude '**'` counts the top-level entries; the count is summed over two roots; dry run, live and resume agree; verify counts source-side removals only and an excluded name at the destination does not count.
+Count (`excluded`): a pruned directory with a large subtree counts 1; a file, a symlink and an `Other` entry excluded by name count 1 each; one entry matched by two patterns counts 1; two excluded entries in one directory count 2 (not `= 1`); `--no-recursive` alone counts 0 and `--no-recursive` with a pattern counts only the pattern's removals; no pattern, or a typo pattern that matches nothing, leaves `excluded` absent from the JSON and off every summary line (JSON AND text asserted); `--exclude '**'` counts the top-level entries INCLUDING a directory; it is added to `files_skipped` never; summed over two roots where only the second excludes (kills `=` for `+=`); an abort mid-walk after an excluded entry still reports the count; a failed first root leaves later roots at 0; an excluded directory that is the only entry counts 1 with `files_total` 0; exclusions inside a failed subtree count; a file operand adds 0; dry run, live and resume report the same NON-ZERO number (resume with already-completed files must not add `files_resumed`); verify counts source-side removals only with ASYMMETRIC sides (source 1, destination 2), sums two roots, shows the clause on the text summary and the key in JSON only when non-zero; the `a_summary_json_has_exactly_the_eleven_fields` literal at `verify_report.rs:339` and the `Report::zero()` literal (`report.rs:104-127`) are updated.
 Copy (`tree.rs` / run tests): exclusion leaves the destination without the entries; hardlink group with one excluded
 member copies the remaining member as an ordinary file (`files_hardlinked == 0`, no degradation, strict mode passes),
 two selected members still link, with one case excluding the FIRST-walked (canonical) member and another the last; `files_total` counts selected only; `--no-recursive` creates no subdirectory; dry run
@@ -265,4 +282,8 @@ Rounds 1 and 2 (each: a solo Sonnet panel and the agy peer), then one negotiatio
   `components()` mechanism.
 - DISCARDED-BELOW-FLOOR: the clap error echoes the rejected pattern including a control character (stderr cosmetic, no
   state is touched before argument parsing); case-sensitive matching surprising users on NTFS (decided, R1).
-- OWNER DECISION (R4): one `excluded` counter, folded as section 5.9 after round 2; round 3 reviews it.
+- FOLDED (round 3, solo): the count's path out of the consumed walk (including abort), the verify fold with no compiler oracle,
+  the verify and copy JSON zero-omission against the pinned key sets, the summary-line suffix and dry-run line, per-root
+  representation, the meaning under a failed root, count tests. agy round 3 (complete, ALIGNED) found only the same
+  `Summary` literal and per-root points as minor.
+- OWNER DECISION (R4): one `excluded` counter (section 5.9).
