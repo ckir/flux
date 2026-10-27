@@ -233,3 +233,20 @@ make `?` a byte; drop `recursive=false` from `canonical_bytes`; drop the destina
 
 - `EXCLUDE` record / excluded counter (R4); `--exclude-from`, negation, classes, ignore-case; `--max-depth`; selection
   summary in the `--json` report. Each gets a TODO line in this cut's docs task.
+
+## Panel record (AGY-AFTER)
+
+Rounds 1 and 2 (each: a solo Sonnet panel and the agy peer), then one negotiation turn on the Windows separator.
+- FOLDED (round 1): wrong citations; `#[serde(default)]` on both new `Options` fields; the 64-pattern / 16 KiB cap against
+  `STATE_LIMIT`; `decode` recompiling stored patterns; the EBNF restated; `?` rows; kind-dependent verify predicate;
+  unreadable `private`; single-file operands; extra mutants and rows.
+- FOLDED (round 2): the matcher reads `rel.components()` (`walk.rs:326` builds `rel` with the OS separator); `**/` versus
+  bare `**`; anchoring after the trailing `/`; per-component `?` mode; cost mechanics and the `Sync` step counter; the
+  stale-docs list; missing test rows.
+- NEGOTIATED: agy's round-2 fix (treat `0x2F` and `0x5C` both as separators) was REJECTED with a measured reason, a Linux
+  name may contain `\` (`crates/flux-fs/src/name.rs:19-22`, `crates/flux-core/src/walk.rs:176-179`: `is_one_component`
+  accepts it on Linux), so `a\b` would match `a/b`. agy re-read those lines and withdrew it; both sides now hold the
+  `components()` mechanism.
+- DISCARDED-BELOW-FLOOR: the clap error echoes the rejected pattern including a control character (stderr cosmetic, no
+  state is touched before argument parsing); case-sensitive matching surprising users on NTFS (decided, R1).
+- OPEN: call R4 / O1 (an `excluded` counter) awaits the owner.
