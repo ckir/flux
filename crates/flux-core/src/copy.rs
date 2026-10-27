@@ -688,9 +688,9 @@ fn plan_resume<D: DirHandle + Send + 'static, R: std::io::Read>(
     // `state` is `Some` exactly under `chunks`.
     let decided = match (state, partial_len, partial_reader.as_mut()) {
         (Some(state), partial_len, partial) => {
-            decide(&state, &gate, partial_len, reader, partial, &watched)
+            decide(&state, &gate, partial_len, reader, partial, &watched, None)
         }
-        (None, Some(len), Some(p)) => decide_full(src_meta.len, len, reader, p, &watched),
+        (None, Some(len), Some(p)) => decide_full(src_meta.len, len, reader, p, &watched, None),
         // `full` with no partial: the log is consulted only to choose the report (a log that began the file says
         // the partial went missing; no log at all is a plain fresh copy).
         (None, _, _) => {

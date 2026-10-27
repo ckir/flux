@@ -69,6 +69,9 @@ fn hash(bytes: &[u8]) -> Digest {
     *blake3::hash(bytes).as_bytes()
 }
 
+/// `prefix`, when given, is fed the source bytes of every accepted chunk. On `Start::Resume { offset }` it has been
+/// fed exactly source bytes `[0, offset)`; on `Start::Fresh` it has been fed nothing; the failing chunk is never
+/// fed (it comes back as `carry`).
 pub(crate) fn decide<S: Read, P: Read>(
     state: &FileState,
     gate: &Gate<'_>,
@@ -76,6 +79,7 @@ pub(crate) fn decide<S: Read, P: Read>(
     source: &mut S,
     partial: Option<&mut P>,
     beat: &Heartbeat<'_>,
+    mut prefix: Option<&mut flux_hash::Hasher>,
 ) -> Result<Verdict, FsError> {
     let fresh =
         |discard| Verdict { start: Start::Fresh, carry: Vec::new(), discard, proven: Vec::new() };
@@ -129,6 +133,9 @@ pub(crate) fn decide<S: Read, P: Read>(
             let start = if k == 0 { Start::Fresh } else { Start::Resume { offset: start } };
             return Ok(Verdict { start, carry, discard, proven: Vec::new() });
         }
+        if let Some(h) = prefix.as_deref_mut() {
+            h.update(&source_buf[..len]);
+        }
         pos = start + len as u64;
     }
     let discard = shorter.then_some(Discard::PartialShorter { kept: pos });
@@ -139,12 +146,16 @@ pub(crate) fn decide<S: Read, P: Read>(
 /// The WAL-free proof (cut 9f-2): a chunk of the partial is trusted only when it is byte-equal (by BLAKE3) to the
 /// same chunk of the source as it is now. No recorded digests are consulted; the source is the only oracle.
 /// For both starts the source reader is left at `start_offset + carry.len()`, as for `decide`.
+/// `prefix`, when given, is fed the source bytes of every accepted chunk. On `Start::Resume { offset }` it has been
+/// fed exactly source bytes `[0, offset)`; on `Start::Fresh` it has been fed nothing; the failing chunk is never
+/// fed (it comes back as `carry`).
 pub(crate) fn decide_full<S: Read, P: Read>(
     source_len: u64,
     partial_len: u64,
     source: &mut S,
     partial: &mut P,
     beat: &Heartbeat<'_>,
+    mut prefix: Option<&mut flux_hash::Hasher>,
 ) -> Result<Verdict, FsError> {
     let mut pos = 0u64;
     let mut shorter = false;
@@ -171,6 +182,9 @@ pub(crate) fn decide_full<S: Read, P: Read>(
             return Ok(Verdict { start, carry, discard, proven });
         }
         proven.push(digest);
+        if let Some(h) = prefix.as_deref_mut() {
+            h.update(&source_buf[..len]);
+        }
         pos = start + len as u64;
         k += 1;
     }
@@ -254,8 +268,16 @@ mod tests {
     ) -> (Verdict, Counting<Cursor<Vec<u8>>>) {
         let mut s = counting(source);
         let mut p = Cursor::new(partial.to_vec());
-        let v = decide(st, &gate(len), Some(partial.len() as u64), &mut s, Some(&mut p), &ok_beat)
-            .expect("decide");
+        let v = decide(
+            st,
+            &gate(len),
+            Some(partial.len() as u64),
+            &mut s,
+            Some(&mut p),
+            &ok_beat,
+            None,
+        )
+        .expect("decide");
         (v, s)
     }
 
@@ -385,8 +407,8 @@ mod tests {
         for (g, why) in cases {
             let mut s = counting(&src);
             let mut p = Cursor::new(src.clone());
-            let v =
-                decide(&st, &g, Some(src.len() as u64), &mut s, Some(&mut p), &ok_beat).unwrap();
+            let v = decide(&st, &g, Some(src.len() as u64), &mut s, Some(&mut p), &ok_beat, None)
+                .unwrap();
             assert_eq!(v.start, Start::Fresh);
             assert!(v.carry.is_empty());
             assert_eq!(v.discard, Some(Discard::SourceChanged(why)));
@@ -399,8 +421,9 @@ mod tests {
         let src = source_bytes(2 * MIB);
         let st = state(src.len(), digests_of(&src));
         let mut s = counting(&src);
-        let v = decide::<_, Cursor<Vec<u8>>>(&st, &gate(src.len()), None, &mut s, None, &ok_beat)
-            .unwrap();
+        let v =
+            decide::<_, Cursor<Vec<u8>>>(&st, &gate(src.len()), None, &mut s, None, &ok_beat, None)
+                .unwrap();
         assert_eq!(v.start, Start::Fresh);
         assert!(v.carry.is_empty());
         assert_eq!(v.discard, Some(Discard::PartialMissing));
@@ -449,7 +472,7 @@ mod tests {
         };
         let mut s = counting(&src);
         let mut p = Cursor::new(src.clone());
-        decide(&st, &gate(src.len()), Some(src.len() as u64), &mut s, Some(&mut p), &counted)
+        decide(&st, &gate(src.len()), Some(src.len() as u64), &mut s, Some(&mut p), &counted, None)
             .unwrap();
         assert_eq!(calls.get(), 5);
 
@@ -464,8 +487,15 @@ mod tests {
         };
         let mut s = counting(&src);
         let mut p = Cursor::new(src.clone());
-        let r =
-            decide(&st, &gate(src.len()), Some(src.len() as u64), &mut s, Some(&mut p), &failing);
+        let r = decide(
+            &st,
+            &gate(src.len()),
+            Some(src.len() as u64),
+            &mut s,
+            Some(&mut p),
+            &failing,
+            None,
+        );
         assert!(r.is_err());
         assert_eq!(calls.get(), 3);
     }
@@ -493,9 +523,16 @@ mod tests {
         let st = state(src.len(), digests_of(&src));
         let mut s = counting(&src);
         let mut p = FailAfter { inner: Cursor::new(src.clone()), good: 2 * MIB + 10 };
-        let v =
-            decide(&st, &gate(src.len()), Some(src.len() as u64), &mut s, Some(&mut p), &ok_beat)
-                .unwrap();
+        let v = decide(
+            &st,
+            &gate(src.len()),
+            Some(src.len() as u64),
+            &mut s,
+            Some(&mut p),
+            &ok_beat,
+            None,
+        )
+        .unwrap();
         assert_eq!(v.start, Start::Resume { offset: 2 * MIB as u64 });
         assert_eq!(v.carry, src[2 * MIB..3 * MIB]);
         assert_eq!(v.discard, Some(Discard::MismatchAt(2 * MIB as u64)));
@@ -537,9 +574,16 @@ mod tests {
         let short = &src[..2 * MIB + MIB / 2];
         let mut s = counting(short);
         let mut p = Cursor::new(src.clone());
-        let v =
-            decide(&st, &gate(src.len()), Some(src.len() as u64), &mut s, Some(&mut p), &ok_beat)
-                .unwrap();
+        let v = decide(
+            &st,
+            &gate(src.len()),
+            Some(src.len() as u64),
+            &mut s,
+            Some(&mut p),
+            &ok_beat,
+            None,
+        )
+        .unwrap();
         assert_eq!(v.start, Start::Resume { offset: 2 * MIB as u64 });
         assert_eq!(v.discard, Some(Discard::MismatchAt(2 * MIB as u64)));
         assert_eq!(v.carry.len(), MIB / 2);
@@ -575,7 +619,7 @@ mod tests {
     fn run_full(len: usize, source: &[u8], partial: &[u8]) -> (Verdict, Counting<Cursor<Vec<u8>>>) {
         let mut s = counting(source);
         let mut p = Cursor::new(partial.to_vec());
-        let v = decide_full(len as u64, partial.len() as u64, &mut s, &mut p, &ok_beat)
+        let v = decide_full(len as u64, partial.len() as u64, &mut s, &mut p, &ok_beat, None)
             .expect("decide_full");
         (v, s)
     }
@@ -634,7 +678,8 @@ mod tests {
         let short = &src[..2 * MIB + 100];
         let mut s = counting(short);
         let mut p = Cursor::new(src.clone());
-        let v = decide_full(src.len() as u64, src.len() as u64, &mut s, &mut p, &ok_beat).unwrap();
+        let v = decide_full(src.len() as u64, src.len() as u64, &mut s, &mut p, &ok_beat, None)
+            .unwrap();
         assert_eq!(v.start, Start::Resume { offset: 2 * MIB as u64 });
         assert_eq!(v.discard, Some(Discard::MismatchAt(2 * MIB as u64)));
         assert_eq!(v.carry.len(), 100);
@@ -647,7 +692,8 @@ mod tests {
         let src = source_bytes(4 * MIB);
         let mut s = counting(&src);
         let mut p = FailAfter { inner: Cursor::new(src.clone()), good: MIB + 10 };
-        let v = decide_full(src.len() as u64, src.len() as u64, &mut s, &mut p, &ok_beat).unwrap();
+        let v = decide_full(src.len() as u64, src.len() as u64, &mut s, &mut p, &ok_beat, None)
+            .unwrap();
         assert_eq!(v.start, Start::Resume { offset: MIB as u64 });
         assert_eq!(v.discard, Some(Discard::MismatchAt(MIB as u64)));
         assert_eq!(v.carry, src[MIB..2 * MIB]);
@@ -683,7 +729,7 @@ mod tests {
         };
         let mut s = counting(&src);
         let mut p = Cursor::new(src.clone());
-        decide_full(src.len() as u64, src.len() as u64, &mut s, &mut p, &counted).unwrap();
+        decide_full(src.len() as u64, src.len() as u64, &mut s, &mut p, &counted, None).unwrap();
         assert_eq!(calls.get(), 5);
 
         calls.set(0);
@@ -697,7 +743,7 @@ mod tests {
         };
         let mut s = counting(&src);
         let mut p = Cursor::new(src.clone());
-        let r = decide_full(src.len() as u64, src.len() as u64, &mut s, &mut p, &failing);
+        let r = decide_full(src.len() as u64, src.len() as u64, &mut s, &mut p, &failing, None);
         assert!(r.is_err());
         assert_eq!(calls.get(), 3);
     }
@@ -707,7 +753,156 @@ mod tests {
         let src = source_bytes(4 * MIB);
         let mut s = FailAfter { inner: Cursor::new(src.clone()), good: MIB + 10 };
         let mut p = Cursor::new(src.clone());
-        let r = decide_full(src.len() as u64, src.len() as u64, &mut s, &mut p, &ok_beat);
+        let r = decide_full(src.len() as u64, src.len() as u64, &mut s, &mut p, &ok_beat, None);
         assert!(r.is_err());
+    }
+
+    fn whole(b: &[u8]) -> [u8; 32] {
+        *blake3::hash(b).as_bytes()
+    }
+
+    /// Runs `decide` with a prefix hasher; returns the verdict and the hasher's digest.
+    fn run_prefix(
+        st: &FileState,
+        len: usize,
+        source: &[u8],
+        partial: &[u8],
+    ) -> (Verdict, flux_hash::Digest) {
+        let mut s = counting(source);
+        let mut p = Cursor::new(partial.to_vec());
+        let mut h = flux_hash::Hasher::new();
+        let v = decide(
+            st,
+            &gate(len),
+            Some(partial.len() as u64),
+            &mut s,
+            Some(&mut p),
+            &ok_beat,
+            Some(&mut h),
+        )
+        .expect("decide");
+        (v, h.finalize())
+    }
+
+    /// Runs `decide_full` with a prefix hasher; returns the verdict and the hasher's digest.
+    fn run_full_prefix(len: usize, source: &[u8], partial: &[u8]) -> (Verdict, flux_hash::Digest) {
+        let mut s = counting(source);
+        let mut p = Cursor::new(partial.to_vec());
+        let mut h = flux_hash::Hasher::new();
+        let v =
+            decide_full(len as u64, partial.len() as u64, &mut s, &mut p, &ok_beat, Some(&mut h))
+                .expect("decide_full");
+        (v, h.finalize())
+    }
+
+    #[test]
+    fn prefix_hasher_holds_the_accepted_source_chunks_only() {
+        let src = source_bytes(5 * MIB);
+        let mut partial = src.clone();
+        partial[2 * MIB + 7] ^= 1;
+        let st = state(src.len(), digests_of(&src));
+        let (v, d) = run_prefix(&st, src.len(), &src, &partial);
+        assert_eq!(v.start, Start::Resume { offset: 2 * MIB as u64 });
+        assert_eq!(v.carry, src[2 * MIB..3 * MIB]);
+        assert_eq!(d.as_bytes(), &whole(&src[..2 * MIB]));
+        let (v, d) = run_full_prefix(src.len(), &src, &partial);
+        assert_eq!(v.start, Start::Resume { offset: 2 * MIB as u64 });
+        assert_eq!(v.carry, src[2 * MIB..3 * MIB]);
+        assert_eq!(d.as_bytes(), &whole(&src[..2 * MIB]));
+    }
+
+    #[test]
+    fn prefix_hasher_covers_a_short_final_chunk() {
+        let src = source_bytes(2 * MIB + 1000);
+        let st = state(src.len(), digests_of(&src));
+        let (v, d) = run_prefix(&st, src.len(), &src, &src);
+        assert_eq!(v.start, Start::Resume { offset: src.len() as u64 });
+        assert_eq!(d.as_bytes(), &whole(&src));
+        let (v, d) = run_full_prefix(src.len(), &src, &src);
+        assert_eq!(v.start, Start::Resume { offset: src.len() as u64 });
+        assert_eq!(d.as_bytes(), &whole(&src));
+    }
+
+    #[test]
+    fn prefix_hasher_covers_only_the_logged_prefix() {
+        let src = source_bytes(5 * MIB);
+        let mut dg = digests_of(&src);
+        dg.retain(|k, _| *k < 3);
+        let st = state(src.len(), dg);
+        let (v, d) = run_prefix(&st, src.len(), &src, &src);
+        assert_eq!(v.start, Start::Resume { offset: 3 * MIB as u64 });
+        assert_eq!(d.as_bytes(), &whole(&src[..3 * MIB]));
+    }
+
+    #[test]
+    fn prefix_hasher_ignores_a_partial_longer_than_the_source() {
+        let src = source_bytes(5 * MIB);
+        let mut longer = src.clone();
+        longer.extend([1u8, 2, 3]);
+        let (v, d) = run_full_prefix(src.len(), &src, &longer);
+        assert_eq!(v.start, Start::Resume { offset: 5 * MIB as u64 });
+        assert_eq!(d.as_bytes(), &whole(&src));
+    }
+
+    #[test]
+    fn prefix_hasher_is_untouched_when_the_verdict_is_fresh() {
+        let src = source_bytes(5 * MIB);
+        let st = state(src.len(), digests_of(&src));
+        let nothing = whole(b"");
+        // A chunk-0 mismatch, under both deciders.
+        let mut partial = src.clone();
+        partial[3] ^= 1;
+        let (v, d) = run_prefix(&st, src.len(), &src, &partial);
+        assert_eq!(v.start, Start::Fresh);
+        assert_eq!(d.as_bytes(), &nothing);
+        let (v, d) = run_full_prefix(src.len(), &src, &partial);
+        assert_eq!(v.start, Start::Fresh);
+        assert_eq!(d.as_bytes(), &nothing);
+        // The three SourceChanged gates.
+        let small = source_bytes(2 * MIB);
+        let small_st = state(small.len(), digests_of(&small));
+        let cases = [
+            Gate { len: small.len() as u64 + 1, mtime: MTIME, identity: IDENTITY },
+            Gate { len: small.len() as u64, mtime: Some((1, 1)), identity: IDENTITY },
+            Gate { len: small.len() as u64, mtime: MTIME, identity: b"other" },
+        ];
+        for g in cases {
+            let mut s = counting(&small);
+            let mut p = Cursor::new(small.clone());
+            let mut h = flux_hash::Hasher::new();
+            let v = decide(
+                &small_st,
+                &g,
+                Some(small.len() as u64),
+                &mut s,
+                Some(&mut p),
+                &ok_beat,
+                Some(&mut h),
+            )
+            .unwrap();
+            assert_eq!(v.start, Start::Fresh);
+            assert!(matches!(v.discard, Some(Discard::SourceChanged(_))));
+            assert_eq!(h.finalize().as_bytes(), &nothing);
+        }
+        // No partial.
+        let mut s = counting(&src);
+        let mut h = flux_hash::Hasher::new();
+        let v = decide::<_, Cursor<Vec<u8>>>(
+            &st,
+            &gate(src.len()),
+            None,
+            &mut s,
+            None,
+            &ok_beat,
+            Some(&mut h),
+        )
+        .unwrap();
+        assert_eq!(v.start, Start::Fresh);
+        assert_eq!(h.finalize().as_bytes(), &nothing);
+        // An empty digest map.
+        let empty = state(src.len(), BTreeMap::new());
+        let (v, d) = run_prefix(&empty, src.len(), &src, &src);
+        assert_eq!(v.start, Start::Fresh);
+        assert_eq!(d.as_bytes(), &nothing);
     }
 }
