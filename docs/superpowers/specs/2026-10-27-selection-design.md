@@ -1,6 +1,6 @@
 # Selection: `--exclude` and `--recursive` / `--no-recursive` (cut 16) - design
 
-Status: DRAFT (panel rounds 1-2 folded), 2026-10-27, branch `feat/exclude` (off main 67a03b8f6d9520e6d0cb5cdce7806bfb4b778620).
+Status: DRAFT (panel rounds 1-4 folded), 2026-10-27, branch `feat/exclude` (off main 67a03b8f6d9520e6d0cb5cdce7806bfb4b778620).
 Owner decisions already taken in conversation (not open): the cut is selection through the shared walker; the `--exclude`
 grammar of section 5.1; `--recursive` is the default and `--no-recursive` copies only the top level; skipped
 subdirectories stay SILENT; ONE `excluded` counter reports what `--exclude` removed (call R4). Every other open call is the author's (section 7), for the owner to override.
@@ -133,7 +133,7 @@ entered, silently (owner ruling). A symlink to a directory is `FileType::Symlink
 ### 5.3 Where it lives
 
 New `crates/flux-core/src/select.rs`: `Selection` (compiled patterns, `recursive: bool`), `Selection::compile(&[String],
-recursive) -> Result<Selection, SelectError>`, and `Selection::is_selected(&self, rel: &Path, ft: FileType) -> bool`. `rel` is the `PathBuf` that `Walk::next` builds with `join` (`walk.rs:326`): its separator is the OS one (`\` on Windows), with no prefix and no leading separator. The matcher therefore walks `rel.components()` (`Component::Normal` names) and NEVER splits the path's bytes on `/`; treating `\` as a second separator would be wrong on Linux, where a name may contain one. Per entry it decides the byte-or-scalar mode once per component, takes only `file_name()` for unanchored patterns, and returns early when there are no patterns and recursion is on (the walker then holds `None`). `Selection` stays `Sync` (Phase 3 shares it); the test-only step count comes from a counted generic entry point, not a `Cell`.
+recursive) -> Result<Selection, SelectError>`, and `Selection::select(&self, rel: &Path, ft: FileType) -> Verdict`, where `Verdict` is `Keep`, `Excluded` (a pattern matched) or `Skipped` (`--no-recursive` dropped a directory). Patterns are tested FIRST, so an entry both a pattern and `--no-recursive` would remove is `Excluded` and counts (call R11). The walker `continue`s on both removals and counts only `Excluded`. `rel` is the `PathBuf` that `Walk::next` builds with `join` (`walk.rs:326`): its separator is the OS one (`\` on Windows), with no prefix and no leading separator. The matcher therefore walks `rel.components()` (`Component::Normal` names) and NEVER splits the path's bytes on `/`; treating `\` as a second separator would be wrong on Linux, where a name may contain one. Per entry it decides the byte-or-scalar mode once per component, takes only `file_name()` for unanchored patterns, and returns early when there are no patterns and recursion is on (the walker then holds `None`). `Selection` stays `Sync` (Phase 3 shares it); the test-only step count comes from a counted generic entry point, not a `Cell`.
 `WalkOptions` gains an optional borrowed handle to it (`Option<&'a Selection>` keeps the struct `Copy`; the plan
 decides the lifetime plumbing). `Walk::next` calls it for every entry before `match step` and `continue`s on `false`.
 The CLI validates each `--exclude` argument with the same parser (a clap `value_parser`) so a bad pattern fails at
@@ -144,7 +144,7 @@ argument time with exit 2; the engine receives `CopyOptions.exclude: Vec<String>
 ### 5.4 Copy, dry run, resume
 
 All walks start in `prepare_source` (`tree.rs:418`), so passing the selection there covers live, dry and resume runs,
-single and several sources. Several sources: the patterns apply to EACH source root, relative to that root. A source that is itself a FILE (single-file source, or a file among several sources) has no relative path and is copied whatever the patterns say (call R7). Nothing in `copy_tree` changes: it never sees an excluded entry. `--exclude 'private/**'` still enters `private`, so an unreadable `private` is a reported failure (exit 1) and the empty `private/` is created; `--exclude private/` avoids both. `files_total` therefore counts selected entries only.
+single and several sources. Several sources: the patterns apply to EACH source root, relative to that root. A source that is itself a FILE (single-file source, or a file among several sources) has no relative path and is copied whatever the patterns say (call R7). No per-entry logic in `copy_tree` changes: it never sees an excluded entry (only the count's plumbing does, section 5.9). `--exclude 'private/**'` still enters `private`, so an unreadable `private` is a reported failure (exit 1) and the empty `private/` is created; `--exclude private/` avoids both. `files_total` therefore counts selected entries only.
 
 ### 5.5 Resume fingerprint
 
@@ -181,22 +181,23 @@ the run reached": a root that never started (`NotStarted`, `tree.rs:779-828`) co
 whose directory failed still count, as `files_total` does. It is never persisted: not in `Options`, the manifest, the
 fingerprint or the WAL; a resume recounts it from its own walk.
 
-Plumbing (copy). `Walk` holds a `u64` and an accessor. `walk_into` consumes the walk with `for item in events`
-(`tree.rs:1053`), so the loop becomes `events.by_ref()` (or the walk is borrowed) and the count is added to
-`TreeOutcome.excluded` AFTER the loop on every exit path, including an abort: a `TreeAbort` carries the count reached so far.
-`copy_roots_at` sums it across roots. The tests pin the abort path.
+Plumbing (copy). `walk_into` (`tree.rs:1043`, "every `?` here is an abort") owns the `Walk` and drops it on every return, so
+the count cannot be added after its loop. Instead `walk_into` takes `&mut Walk` and `copy_tree_frames` (`tree.rs:950`) adds
+`out.excluded += events.excluded()` immediately after `let walked = walk_into(..)` (`tree.rs:971`), before `drain_mode`.
+`out` is the `TreeOutcome` every caller moves into `TreeAbort { error, outcome }`, so an abort carries the count reached so
+far. `copy_roots_at` needs no extra sum (`out` is shared across roots). A root that fails before its walk starts
+(`tree.rs:706`, `:850`, `:962`, `run/mod.rs:1486`) contributes 0. The tests pin the abort path.
 
-Plumbing (verify). `Side::new` (`verify.rs:174`) builds both sides alike; the verify engine reads the SOURCE side's count and
-ignores the destination side's. `Summary` gains `excluded`. It is folded field by field at `verify.rs:540-548` (and in the
-test folds at `verify.rs:2372` and `verify_proptest.rs:329`), which is NOT compiler-visible, so the plan lists every fold in
+Plumbing (verify). `Side::new` (`verify.rs:174`) builds both sides alike; the verify engine reads the SOURCE side's count before `verify_root` returns and ignores the destination side's; `Side::empty()` (no walk) reports 0. `Summary` gains `excluded`. It is folded field by field at `verify.rs:540-548` (and in the
+test fold at `verify.rs:2372` and the proptest model's own running sum at `crates/flux-core/src/verify_proptest.rs:329`), which is NOT compiler-visible, so the plan lists every fold in
 its FILES clause and a two-root test pins the sum.
 
-Report. Copy JSON: `excluded: u64` after `mounts_skipped`, `skip_serializing_if` zero, so the pinned 18-key set
-(`report.rs:~946`, `tests/copy.rs:288,315`) holds when it is zero. Verify JSON: `excluded` in `SummaryBody` after `not_entered`,
+Report. Copy JSON: `excluded: u64` after `mounts_skipped` (so `mounts_skipped < excluded < hardlinks_degraded`, pinned beside `report.rs:2380`), `skip_serializing_if` zero, so the pinned 18-key set
+(`report.rs:~946`, `tests/copy.rs:288,315`) holds when it is zero. Verify JSON: `excluded` in `SummaryBody` after `not_entered` and before `bytes_hashed`,
 ALSO omitted at zero (unlike `not_entered`, which is always present), so `SUMMARY_KEYS` and `SEVERAL_SUMMARY_KEYS`
 (`tests/verify.rs:55,562`) hold at zero; with a non-zero count the key is present and the key-order test names its position.
-Text: a `; N excluded` suffix, only when non-zero, on `summary_line` (`report.rs:478`, joined to its suffix loop),
-on `dry_run_summary_line` (`report.rs:499`) and on verify's summary line (`verify_report.rs:~135`, after the
+Text: a `; N excluded` suffix, only when non-zero, on `summary_line` (`report.rs:478`, the LAST entry of its suffix loop, after `mismatched`),
+on `dry_run_summary_line` (`report.rs:499`, appended at the end of the line) and on verify's summary line (`verify_report.rs:~135`, after the
 `mount points not entered` clause). `RootJson` and `root_lines` (several sources) gain NO per-root count; the resume lines are
 unchanged. `files_total`, `files_skipped` and every other counter keep their meaning (`excluded` never leaks into
 `files_skipped`). A typo pattern that matches nothing therefore shows no `excluded` anywhere, and `--exclude '**'` shows the
@@ -220,7 +221,7 @@ Each test is pinned by a named case; the plan assigns the exact names. Matcher (
   still completes within a bounded step count (linearity).
 Walker (`walk.rs`): a SYMLINK and an `Other` entry are excluded by name; an excluded directory at depth 2 (not only at the root) yields no event and the `FaultFs` call log shows no `read_dir` / `metadata`
 for it; `private/**` still yields `private` and filters its children; `--no-recursive` yields only top-level non-directories and does NOT trip the depth cap, and a top-level symlink to a directory is yielded as a symlink (and copied as one under `--links=copy`); an excluded directory deeper than the cap raises no depth error; the root is never filtered; selection plus mounts.
-Count (`excluded`): a pruned directory with a large subtree counts 1; a file, a symlink and an `Other` entry excluded by name count 1 each; one entry matched by two patterns counts 1; two excluded entries in one directory count 2 (not `= 1`); `--no-recursive` alone counts 0 and `--no-recursive` with a pattern counts only the pattern's removals; no pattern, or a typo pattern that matches nothing, leaves `excluded` absent from the JSON and off every summary line (JSON AND text asserted); `--exclude '**'` counts the top-level entries INCLUDING a directory; it is added to `files_skipped` never; summed over two roots where only the second excludes (kills `=` for `+=`); an abort mid-walk after an excluded entry still reports the count; a failed first root leaves later roots at 0; an excluded directory that is the only entry counts 1 with `files_total` 0; exclusions inside a failed subtree count; a file operand adds 0; dry run, live and resume report the same NON-ZERO number (resume with already-completed files must not add `files_resumed`); verify counts source-side removals only with ASYMMETRIC sides (source 1, destination 2), sums two roots, shows the clause on the text summary and the key in JSON only when non-zero; the `a_summary_json_has_exactly_the_eleven_fields` literal at `verify_report.rs:339` and the `Report::zero()` literal (`report.rs:104-127`) are updated.
+Count (`excluded`): a pruned directory with a large subtree counts 1; a file, a symlink and an `Other` entry excluded by name count 1 each; one entry matched by two patterns counts 1; two excluded entries in one directory count 2 (not `= 1`); `--no-recursive` alone counts 0 and `--no-recursive` with a pattern counts only the pattern's removals; no pattern, or a typo pattern that matches nothing, leaves `excluded` absent from the JSON and off every summary line (JSON AND text asserted); `--exclude '**'` counts the top-level entries INCLUDING a directory; it is added to `files_skipped` never; summed over two roots where the FIRST excludes and the second does not, and where both do (kills `=` for `+=`); a directory removed by BOTH a pattern and `--no-recursive` counts 1 (patterns first), and a top-level symlink to a directory under `--no-recursive` counts 0; verify with an absent destination (`Side::empty`) and a non-zero source count; an abort mid-walk after an excluded entry still reports the count; a failed first root leaves later roots at 0; an excluded directory that is the only entry counts 1 with `files_total` 0; exclusions inside a failed subtree count; a file operand adds 0; dry run, live and resume report the same NON-ZERO number (resume with already-completed files must not add `files_resumed`); verify counts source-side removals only with ASYMMETRIC sides (source 1, destination 2), sums two roots, shows the clause on the text summary and the key in JSON only when non-zero; the `a_summary_json_has_exactly_the_eleven_fields` literal at `verify_report.rs:339` and the `Report::zero()` literal (`report.rs:104-127`) are updated.
 Copy (`tree.rs` / run tests): exclusion leaves the destination without the entries; hardlink group with one excluded
 member copies the remaining member as an ordinary file (`files_hardlinked == 0`, no degradation, strict mode passes),
 two selected members still link, with one case excluding the FIRST-walked (canonical) member and another the last; `files_total` counts selected only; `--no-recursive` creates no subdirectory; dry run
@@ -239,6 +240,7 @@ make `?` a byte; drop `recursive=false` from `canonical_bytes`; drop the destina
 - R1. Case-sensitive on every platform, no Unicode normalisation (so an NFC pattern misses an NFD name on macOS). Case-insensitivity is a property of the volume, not the OS; a later `--exclude-ignore-case` can add it.
 - R2. `?` is one Unicode scalar for valid UTF-8 names, one byte otherwise.
 - R3. Control characters (including newline) are rejected in a pattern, so a fingerprint line is unambiguous.
+- R11. Precedence: patterns are tested before `--no-recursive`, so an entry both would remove counts once as `Excluded` (the user's pattern did match it); pure recursion removals never count.
 - R4. (Owner decision: option (a).) One `excluded` count, no per-entry record and no `EXCLUDE` line; the spec's example output (`:1186`) is illustrative and no per-entry success record exists today. Counted once per removal, a pruned directory as one, `--no-recursive` removals not counted (R5). Verify counts the source side only (section 5.9).
 - R5. (Owner ruling.) Skipped subdirectories under `--no-recursive` are silent.
 - R6. Verify applies the selection to both sides, so nothing selected-out shows as `extra`.
@@ -264,8 +266,7 @@ make `?` a byte; drop `recursive=false` from `canonical_bytes`; drop the destina
 
 ## Stand-downs
 
-- A per-entry `EXCLUDE` record or listing (R4); `--exclude-from`, negation, classes, ignore-case; `--max-depth`; selection
-  summary in the `--json` report. Each gets a TODO line in this cut's docs task.
+- A per-entry `EXCLUDE` record or listing (R4); `--exclude-from`, negation, classes, ignore-case; `--max-depth`; a per-pattern or per-entry selection summary in the `--json` report. Each gets a TODO line in this cut's docs task.
 
 ## Panel record (AGY-AFTER)
 
