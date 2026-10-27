@@ -416,7 +416,7 @@ pub(crate) fn verify_tree_filtered<F: DestinationRoot>(
     on_absent: &mut dyn FnMut(),
     sink: &mut dyn FnMut(Record),
 ) -> Result<Summary, VerifyError> {
-    let mut out = Emitter { summary: Summary::default(), sink };
+    let mut out = Emitter { summary: Summary::default(), sink: &mut *sink };
     let verdict =
         check_pair(fs, src, dst).map_err(|reason| VerifyError::RefusedRoots { reason })?;
     if matches!(verdict, RootVerdict::Absent) {
@@ -457,12 +457,22 @@ pub fn verify_several<F: DestinationRoot>(
     for spec in &specs {
         let verdict = match spec.kind {
             SourceKind::Folder => {
-                Some(check_pair(fs, &spec.src, &dest.join(&spec.name)).map_err(|reason| {
-                    VerifyError::RefusedRoot {
-                        name: spec.name.clone(),
-                        reason: strip_compared_tail(&reason),
+                let dst = dest.join(&spec.name);
+                // The destination's own type, not its target's: a link at `DEST/<name>` is a wrong type.
+                match fs.metadata(&dst) {
+                    Ok(m) if m.file_type != FileType::Dir => {
+                        Some(RootVerdict::WrongType(file_kind(m.file_type)))
                     }
-                })?)
+                    Err(e) if e.source.kind() != std::io::ErrorKind::NotFound => {
+                        Some(RootVerdict::Unreadable { side: DESTINATION, error: e })
+                    }
+                    _ => Some(check_pair(fs, &spec.src, &dst).map_err(|reason| {
+                        VerifyError::RefusedRoot {
+                            name: spec.name.clone(),
+                            reason: strip_compared_tail(&reason),
+                        }
+                    })?),
+                }
             }
             SourceKind::File => None,
         };
@@ -472,6 +482,17 @@ pub fn verify_several<F: DestinationRoot>(
     for (spec, verdict) in specs.iter().zip(verdicts) {
         let dst = dest.join(&spec.name);
         let root = match verdict {
+            Some(RootVerdict::WrongType(k)) => {
+                let mut out = Emitter { summary: Summary::default(), sink: &mut *sink };
+                out.emit(Record {
+                    path: PathBuf::from(&spec.name),
+                    outcome: Outcome::Mismatched,
+                    kind: Kind::Dir,
+                    code: Some(Code::VerifyMismatch),
+                    detail: format!("source dir, destination {}", k.as_str()),
+                });
+                out.summary
+            }
             Some(verdict) => {
                 if matches!(verdict, RootVerdict::Absent) {
                     on_absent(&spec.name);
@@ -517,6 +538,9 @@ enum RootVerdict {
     Absent,
     /// A root could not be examined: the root record `.` is reported, nothing is walked.
     Unreadable { side: &'static str, error: FsError },
+    /// A folder root's destination exists but is not a directory (several sources only; never produced by
+    /// `check_pair`).
+    WrongType(Kind),
     /// The roots are distinct and both exist.
     Checked,
 }
@@ -548,6 +572,9 @@ fn walk_checked<F: DestinationRoot>(
         }
         RootVerdict::Absent => true,
         RootVerdict::Checked => false,
+        RootVerdict::WrongType(_) => {
+            unreachable!("only verify_several probes the type, and it reports it itself")
+        }
     };
     // The source walk is built first, then the destination's (a test pins the `read_dir` order).
     let mut a =
@@ -841,7 +868,7 @@ pub fn verify_file<F: FileSystem>(
     _opts: &VerifyOptions,
     sink: &mut dyn FnMut(Record),
 ) -> Result<Summary, VerifyError> {
-    let mut out = Emitter { summary: Summary::default(), sink };
+    let mut out = Emitter { summary: Summary::default(), sink: &mut *sink };
     let name = PathBuf::from(dst.file_name().unwrap_or(dst.as_os_str()));
     let src_type = match fs.metadata(src) {
         Ok(m) => file_kind(m.file_type),
@@ -2276,5 +2303,117 @@ mod tests {
         assert!(rows.is_empty());
         let calls = fs.calls();
         assert!(!calls.iter().any(|c| c.starts_with("read_dir(") || c.starts_with("open_read(")));
+    }
+    #[test]
+    fn a_root_whose_destination_has_the_wrong_type_is_one_mismatched_record_and_the_run_goes_on() {
+        use crate::run::SourceKind::{File, Folder};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        for n in ["a", "b", "c"] {
+            tree(&fs, &format!("/s/{n}"), &[], &[("x", b"1")]);
+        }
+        fs.write_file("/s/f", b"1");
+        tree(&fs, "/d", &["b", "f"], &[("b/x", b"1")]);
+        fs.write_file("/d/a", b"not a dir");
+        fs.add_symlink_to("/d/c", "/d/b", LinkKind::Dir);
+        let specs = vec![
+            spec("/s/c", "c", Folder),
+            spec("/s/b", "b", Folder),
+            spec("/s/a", "a", Folder),
+            spec("/s/f", "f", File),
+        ];
+        let (rows, roots, _, total) = several(&fs, specs, "/d", &opts());
+        assert_eq!(
+            rows,
+            vec![
+                mm("a", Kind::Dir, "source dir, destination file"),
+                rec("b/x", Outcome::Match, Kind::File),
+                mm("c", Kind::Dir, "source dir, destination symlink"),
+                mm("f", Kind::File, "source file, destination dir"),
+            ]
+        );
+        assert!(!fs.called("read_dir(/d/a)"));
+        assert!(!fs.called("read_dir(/d/c)"));
+        let names: Vec<_> = roots.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c", "f"]);
+        let one = Summary { mismatched: 1, ..Summary::default() };
+        assert_eq!(roots[0].1, one);
+        assert_eq!(roots[2].1, one);
+        assert_eq!(roots[3].1, one);
+        let mut sum = Summary::default();
+        for (_, r) in &roots {
+            sum.matched += r.matched;
+            sum.missing += r.missing;
+            sum.mismatched += r.mismatched;
+            sum.extra += r.extra;
+            sum.unreadable += r.unreadable;
+            sum.not_entered += r.not_entered;
+            sum.bytes_hashed += r.bytes_hashed;
+        }
+        assert_eq!(total, sum);
+        assert_eq!(total.mismatched, 3);
+    }
+
+    #[test]
+    fn an_unreadable_root_is_one_record_at_its_turn_and_the_others_run() {
+        use crate::run::SourceKind::Folder;
+        let build = || {
+            let fs = FaultFs::new();
+            fs.create_dir(Path::new("/s")).unwrap();
+            tree(&fs, "/s/b", &[], &[("x", b"1")]);
+            tree(&fs, "/d", &["a", "b"], &[("b/x", b"1")]);
+            fs
+        };
+        let specs = || vec![spec("/s/a", "a", Folder), spec("/s/b", "b", Folder)];
+        let check = |fs: &FaultFs, lead: &str, unreadable_code: Option<Code>| {
+            let (rows, roots, _, total) = several(fs, specs(), "/d", &opts());
+            assert_eq!(rows.len(), 2, "{rows:?}");
+            assert_eq!(rows[0].0, "a");
+            assert_eq!(rows[0].1, Outcome::Unreadable);
+            if unreadable_code.is_some() {
+                assert_eq!(rows[0].3, unreadable_code);
+            }
+            assert!(rows[0].4.starts_with(lead), "{}", rows[0].4);
+            assert_eq!(rows[1], rec("b/x", Outcome::Match, Kind::File));
+            let names: Vec<_> = roots.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(names, ["a", "b"]);
+            assert_eq!(roots[0].1.unreadable, 1);
+            assert_eq!(roots[1].1.matched, 1);
+            assert_eq!(total.unreadable, 1);
+        };
+
+        // (i) check phase: the source root is absent.
+        let fs = build();
+        check(&fs, SOURCE, None);
+
+        // (ii) probe phase: the first metadata(/d/a) of the run.
+        let fs2 = build();
+        tree(&fs2, "/s/a", &[], &[("x", b"1")]);
+        fs2.write_file("/d/a/x", b"1");
+        let _ = several(&fs2, specs(), "/d", &opts());
+        let n = fs2
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("metadata("))
+            .position(|c| c == "metadata(/d/a)")
+            .expect("the unfaulted run probes /d/a")
+            + 1;
+        let fs3 = build();
+        tree(&fs3, "/s/a", &[], &[("x", b"1")]);
+        fs3.write_file("/d/a/x", b"1");
+        fs3.fail_nth(
+            "metadata",
+            u32::try_from(n).unwrap(),
+            Code::PermissionDenied,
+            std::io::ErrorKind::PermissionDenied,
+        );
+        check(&fs3, DESTINATION, Some(Code::PermissionDenied));
+
+        // (iii) walk phase: Side::new lists the source root.
+        let fs4 = build();
+        tree(&fs4, "/s/a", &[], &[("x", b"1")]);
+        fs4.write_file("/d/a/x", b"1");
+        fs4.fail_read_dir_of("/s/a", Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+        check(&fs4, SOURCE, Some(Code::PermissionDenied));
     }
 }
