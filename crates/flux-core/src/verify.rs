@@ -2292,6 +2292,32 @@ mod tests {
     }
 
     #[test]
+    fn a_root_created_after_it_was_checked_absent_still_reports_missing() {
+        use crate::run::SourceKind::Folder;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        fs.create_dir(Path::new("/d")).unwrap();
+        tree(&fs, "/s/a", &[], &[("x", b"1")]);
+        let mut rows = Vec::new();
+        let total = verify_several(
+            &fs,
+            vec![spec("/s/a", "a", Folder)],
+            Path::new("/d"),
+            &opts(),
+            // The destination appears between the check phase and the walk (design 6.2: no re-probe).
+            &mut |_| tree(&fs, "/d/a", &[], &[("x", b"1")]),
+            &mut |_, _| {},
+            &mut |r| rows.push(row(&r)),
+        )
+        .unwrap();
+        assert!(fs.exists(Path::new("/d/a/x")), "the fixture must have created the destination");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!((rows[0].0.as_str(), rows[0].1), ("a/x", Outcome::Missing));
+        assert_eq!(total.missing, 1);
+        assert_eq!(total.matched, 0);
+    }
+
+    #[test]
     fn a_mount_notice_carries_the_re_rooted_path() {
         use crate::run::SourceKind::Folder;
         let o = VerifyOptions { mounts: MountPolicy::Stay, ..opts() };
