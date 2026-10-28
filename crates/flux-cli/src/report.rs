@@ -262,18 +262,18 @@ impl Report {
 }
 
 /// The stderr lines for a several-source run's roots (spec 3.7, 3.8): one per finished root, then one naming the roots
-/// that were not started.
-pub fn root_lines(roots: &[RootReport]) -> Vec<String> {
+/// that were not started. A dry run words the counts as what would happen.
+pub fn root_lines(roots: &[RootReport], dry: bool) -> Vec<String> {
     let mut v: Vec<String> = roots
         .iter()
         .filter(|r| r.status != RootStatus::NotStarted)
         .map(|r| {
-            format!(
-                "root {}: {} copied, {} failed",
-                r.name.to_string_lossy(),
-                r.files_copied,
-                r.files_failed
-            )
+            let (name, copied, failed) = (r.name.to_string_lossy(), r.files_copied, r.files_failed);
+            if dry {
+                format!("root {name}: would copy {copied}, {failed} would fail")
+            } else {
+                format!("root {name}: {copied} copied, {failed} failed")
+            }
         })
         .collect();
     let unstarted: Vec<_> = roots
@@ -796,6 +796,10 @@ pub fn run_warning_line(w: &RunWarning) -> String {
         RunWarning::DryRunBrokenLeftover { name } => {
             format!("note: an interrupted lock recovery left {name}; a real run classifies it")
         }
+        RunWarning::DryRunPrefixLocks { names } => format!(
+            "note: the prefix lock records of {} are readable; their owners' liveness was not probed; a real run refuses with TARGET_LOCK_BUSY for each whose OS lock is held",
+            names.join(", ")
+        ),
         RunWarning::DryRunDebris { name } => {
             format!("note: a real run would remove the workspace debris {name}")
         }
@@ -2174,6 +2178,17 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_prefix_locks_renders_its_names_joined() {
+        let w = RunWarning::DryRunPrefixLocks { names: vec!["a".into(), "b".into()] };
+        assert_eq!(
+            run_warning_line(&w),
+            "note: the prefix lock records of a, b are readable; their owners' liveness was not probed; a real run refuses with TARGET_LOCK_BUSY for each whose OS lock is held"
+        );
+        let one = RunWarning::DryRunPrefixLocks { names: vec!["only".into()] };
+        assert!(run_warning_line(&one).starts_with("note: the prefix lock records of only are"));
+    }
+
+    #[test]
     fn dry_prior_lines_say_what_a_resume_or_restart_would_do() {
         use flux_core::state::OpState;
         assert_eq!(dry_prior_lines(&DryPrior::StartedNew), ["no prior operation; starting new"]);
@@ -2411,21 +2426,38 @@ mod tests {
 
     #[test]
     fn root_lines_name_the_not_started_roots() {
-        let lines = root_lines(&[
-            root("a", RootStatus::Completed, 2, 0),
-            root("b", RootStatus::Failed, 1, 3),
-            root("c", RootStatus::NotStarted, 0, 0),
-            root("d", RootStatus::NotStarted, 0, 0),
-        ]);
+        let lines = root_lines(
+            &[
+                root("a", RootStatus::Completed, 2, 0),
+                root("b", RootStatus::Failed, 1, 3),
+                root("c", RootStatus::NotStarted, 0, 0),
+                root("d", RootStatus::NotStarted, 0, 0),
+            ],
+            false,
+        );
         assert_eq!(
             lines,
             ["root a: 2 copied, 0 failed", "root b: 1 copied, 3 failed", "not started: c, d"]
         );
         assert_eq!(
-            root_lines(&[root("a", RootStatus::Completed, 1, 0)]),
+            root_lines(&[root("a", RootStatus::Completed, 1, 0)], false),
             ["root a: 1 copied, 0 failed"]
         );
-        assert!(root_lines(&[]).is_empty());
+        assert!(root_lines(&[], false).is_empty());
+    }
+
+    #[test]
+    fn root_lines_read_would_copy_in_a_dry_run() {
+        let roots =
+            [root("alpha", RootStatus::Completed, 2, 1), root("zed", RootStatus::NotStarted, 0, 0)];
+        assert_eq!(
+            root_lines(&roots, true),
+            ["root alpha: would copy 2, 1 would fail", "not started: zed"]
+        );
+        assert_eq!(
+            root_lines(&roots, false),
+            ["root alpha: 2 copied, 1 failed", "not started: zed"]
+        );
     }
 
     fn group(count: u64, example: &str) -> DegradedGroup {

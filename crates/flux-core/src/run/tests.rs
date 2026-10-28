@@ -7811,7 +7811,7 @@ fn dry() -> RunConfig {
 
 /// True for a call that names no path, or one whose path is `/p` or `/src` or below.
 /// A call that names a claim key, not a path, is always in scope.
-fn in_scope(call: &str) -> bool {
+pub(super) fn in_scope(call: &str) -> bool {
     let name = call.split('(').next().unwrap_or(call);
     if name.starts_with("claim_") || ["try_lock", "write_at_start", "lock_sync_all"].contains(&name)
     {
@@ -7865,7 +7865,7 @@ fn forbidden_for_resume(fs: &FaultFs, base: usize) {
     forbidden_in(&kept);
 }
 
-fn forbidden_in(after: &[String]) {
+pub(super) fn forbidden_in(after: &[String]) {
     let scoped: Vec<&String> = after.iter().filter(|c| in_scope(c)).collect();
     for banned in [
         "create_dir(",
@@ -8347,6 +8347,27 @@ fn dry_lock_rows_of_the_record_table() {
     assert!(matches!(got, LockPreview::Absent), "{got:?}");
     assert!(
         matches!(&w[..], [RunWarning::DryRunBrokenLeftover { name }] if *name == broken),
+        "{w:?}"
+    );
+}
+
+#[test]
+fn broken_leftovers_notes_exactly_the_entries_of_one_lock() {
+    use super::dry_prior::broken_leftovers;
+    let entry = |n: &str| flux_fs::DirEntry {
+        name: std::ffi::OsString::from(n),
+        file_type: flux_fs::FileType::File,
+    };
+    let entries = [
+        entry("a.flux-lock.broken.1"),
+        entry("a.flux-lock"),
+        entry("b.flux-lock.broken.2"),
+        entry("a.flux-lock.broken"),
+    ];
+    let mut w = Vec::new();
+    broken_leftovers(&entries, OsStr::new("a.flux-lock"), &mut w);
+    assert!(
+        matches!(w.as_slice(), [RunWarning::DryRunBrokenLeftover { name }] if name == "a.flux-lock.broken.1"),
         "{w:?}"
     );
 }

@@ -766,10 +766,12 @@ pub(crate) struct RootDone {
 /// later one `NotStarted`. Any other abort-class error (a lost lock mid-walk, a root that cannot be created) stops the
 /// loop: that root, which had begun, is `Failed` and every later one `NotStarted`. ANY counted failure (the `out.failures.total()` delta over the root) marks its root `Failed` and the loop goes
 /// on; an abort marks it `Failed` too. `TreeFailure.path` is relative to
-/// DEST for a folder root's entries (`<name>/<path>`) and is the name itself for a file root.
+/// DEST for a folder root's entries (`<name>/<path>`) and is the name itself for a file root. `dest` is
+/// `RootsDest::Existing` in a live run; `RootsDest::Planned(anchor)` only in a dry run whose DEST is absent, where every
+/// root is planned against `anchor`'s identity.
 pub(crate) fn copy_roots_at<F: DestinationRoot>(
     base: &Shared<'_, F>,
-    dest: &F::Dir,
+    dest: RootsDest<'_, F::Dir>,
     dest_created: bool,
     roots: Vec<RootInput<'_, F>>,
     out: &mut TreeOutcome,
@@ -804,11 +806,11 @@ pub(crate) fn copy_roots_at<F: DestinationRoot>(
         let (copied, failed, any) = (out.files_copied, out.failures.copy, out.failures.total());
         let result = match root {
             RootInput::Folder { name, src_root, source } => {
-                folder_root(base, dest, &name, &src_root, source, out, on_report)
+                folder_root(base, &dest, &name, &src_root, source, out, on_report)
             }
             RootInput::File { name, src_parent, identity } => file_root(
                 base,
-                dest,
+                &dest,
                 dest_created,
                 &mut files,
                 &name,
@@ -838,16 +840,74 @@ fn beat_and_guard<F: DestinationRoot>(base: &Shared<'_, F>) -> std::result::Resu
     (base.guard)().map_err(|e| CopyError::at(CopyStep::Create, e))
 }
 
-/// A folder root: `DEST/<name>` made or merged into, then the tree walk, its failures reported under `<name>`.
-fn folder_root<F: DestinationRoot>(
+/// The DEST `copy_roots_at` copies into: the directory itself, or (a dry run only) one that does not exist yet,
+/// carrying the identity its roots are judged with (the holder's, kept for its strength only).
+pub(crate) enum RootsDest<'a, D> {
+    Existing(&'a D),
+    Planned(FileIdentity),
+}
+
+/// A dry run's folder root: `DEST/<name>` looked at, never made. A name that is not there is a planned directory,
+/// counted and streamed under `<name>` itself; the walk then plans its entries against what exists.
+fn dry_folder_root<F: DestinationRoot>(
     base: &Shared<'_, F>,
-    dest: &F::Dir,
+    dest: &RootsDest<'_, F::Dir>,
     name: &OsStr,
     src_root: &Path,
     source: Source<'_, F>,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<(), CopyError> {
+    let (dir, identity) = match dest {
+        RootsDest::Existing(d) => match d.open_dir(name) {
+            Ok(dir) => {
+                let id = dir.identity().map_err(|e| CopyError::at(CopyStep::Resolve, e))?;
+                (Some(dir), RootIdentity::Existing(id))
+            }
+            Err(e) if e.source.kind() == ErrorKind::NotFound => {
+                let id = d.identity().map_err(|e| CopyError::at(CopyStep::Resolve, e))?;
+                (None, RootIdentity::Planned(id))
+            }
+            Err(e) => return Err(CopyError::at(CopyStep::Create, e)),
+        },
+        RootsDest::Planned(anchor) => (None, RootIdentity::Planned(*anchor)),
+    };
+    if dir.is_none() {
+        out.directories_created += 1;
+        report(
+            out,
+            on_report,
+            PathBuf::from(name),
+            TreeFailureCause::Planned(PlannedEntry {
+                object: PlannedObject::Dir,
+                action: PlannedAction::CreateDir,
+            }),
+        );
+    }
+    let cx = base.for_root(src_root, source.identity, Some(name));
+    let mut under_name = |mut f: TreeFailure| {
+        f.path = Path::new(name).join(&f.path);
+        on_report(f);
+    };
+    copy_tree_frames(&cx, source.events, dir, identity, false, out, &mut under_name).1
+}
+
+/// A folder root: `DEST/<name>` made or merged into, then the tree walk, its failures reported under `<name>`.
+fn folder_root<F: DestinationRoot>(
+    base: &Shared<'_, F>,
+    dest: &RootsDest<'_, F::Dir>,
+    name: &OsStr,
+    src_root: &Path,
+    source: Source<'_, F>,
+    out: &mut TreeOutcome,
+    on_report: &mut dyn FnMut(TreeFailure),
+) -> std::result::Result<(), CopyError> {
+    if base.dry_run {
+        return dry_folder_root(base, dest, name, src_root, source, out, on_report);
+    }
+    let RootsDest::Existing(dest) = dest else {
+        unreachable!("a planned DEST is a dry run's");
+    };
     let (dir, created) = match dest.create_dir(name) {
         Ok(dir) => {
             out.directories_created += 1;
@@ -874,7 +934,7 @@ fn folder_root<F: DestinationRoot>(
 #[allow(clippy::too_many_arguments)]
 fn file_root<F: DestinationRoot>(
     base: &Shared<'_, F>,
-    dest: &F::Dir,
+    dest: &RootsDest<'_, F::Dir>,
     dest_created: bool,
     state: &mut Option<RootState>,
     name: &OsStr,
@@ -885,16 +945,30 @@ fn file_root<F: DestinationRoot>(
 ) -> std::result::Result<(), CopyError> {
     let state = match state {
         Some(state) => state,
-        None => {
-            let dest_identity = dest.identity().map_err(|e| CopyError::at(CopyStep::Resolve, e))?;
-            state.insert(root_state(
+        None => match dest {
+            RootsDest::Existing(dest) => {
+                let dest_identity =
+                    dest.identity().map_err(|e| CopyError::at(CopyStep::Resolve, e))?;
+                state.insert(root_state(
+                    base,
+                    Some(dest),
+                    RootIdentity::Existing(dest_identity),
+                    dest_created,
+                    out,
+                )?)
+            }
+            RootsDest::Planned(anchor) => state.insert(root_state(
                 base,
-                Some(dest),
-                RootIdentity::Existing(dest_identity),
+                None,
+                RootIdentity::Planned(*anchor),
                 dest_created,
                 out,
-            )?)
-        }
+            )?),
+        },
+    };
+    let parent = match dest {
+        RootsDest::Existing(dest) => Some(*dest),
+        RootsDest::Planned(_) => None,
     };
     let cx = base.for_root(src_parent, identity, None);
     let RootState { names, claim_parent, fresh } = state;
@@ -906,12 +980,25 @@ fn file_root<F: DestinationRoot>(
         report(out, on_report, path, TreeFailureCause::Copy(conflict));
         Ok(())
     } else {
-        copy_one(&cx, Some(dest), names, &mut batch, *claim_parent, *fresh, path, out, on_report)
+        copy_one(&cx, parent, names, &mut batch, *claim_parent, *fresh, path, out, on_report)
     };
-    // The root has no `DirEnd`, so its batch is drained here, as `copy_tree_frames` drains its frames.
+    // The root has no `DirEnd`, so its batch is drained here, as `copy_tree_frames` drains its frames. A planned DEST
+    // is a dry run's, which never batches.
     let mut mode = drain_mode(&walked);
     let mut first = None;
-    drain_one(&cx, dest, names, &mut batch, out, on_report, walked.is_err(), &mut mode, &mut first);
+    if let Some(dest) = parent {
+        drain_one(
+            &cx,
+            dest,
+            names,
+            &mut batch,
+            out,
+            on_report,
+            walked.is_err(),
+            &mut mode,
+            &mut first,
+        );
+    }
     walked?;
     if let Some(e) = first {
         return Err(e);
@@ -1254,7 +1341,8 @@ fn dry_top_level_flux<F: DestinationRoot>(
     stack: &[Frame<F::Dir>],
     path: &Path,
 ) -> bool {
-    if !cx.dry_run || stack.len() != 1 {
+    // A root of several sources has a prefix: its `.flux` is below `DEST/<name>`, not DEST's control directory.
+    if !cx.dry_run || stack.len() != 1 || cx.key_prefix.is_some() {
         return false;
     }
     let mut parts = path.components();
@@ -9838,7 +9926,9 @@ mod tests {
         let mut out = TreeOutcome::default();
         let mut got = Vec::new();
         let (done, result) =
-            copy_roots_at(&base, &dest, false, roots, &mut out, &mut |f| got.push(f));
+            copy_roots_at(&base, RootsDest::Existing(&dest), false, roots, &mut out, &mut |f| {
+                got.push(f)
+            });
         RootsRun { done, result, out, got }
     }
 

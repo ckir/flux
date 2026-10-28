@@ -274,6 +274,9 @@ pub enum RunWarning {
     DryRunLockTakeover { why: String },
     /// Cut 11b: a dry run found a broken leftover (`name`) beside the state that a real run would remove.
     DryRunBrokenLeftover { name: String },
+    /// Cut 18: a dry run over several sources read these prefix locks' records (lossy names, in prefix order); their
+    /// owners' liveness was not probed.
+    DryRunPrefixLocks { names: Vec<String> },
     /// Cut 11b: a dry run found debris (`name`) in the state directory that a real run would remove.
     DryRunDebris { name: String },
     /// Cut 11b: a dry resume found the prior's claim store freshly created (empty), so it has no claims to count.
@@ -1278,6 +1281,9 @@ fn dry_prior_notes(scan: &crate::prior::Scan, warnings: &mut Vec<RunWarning>) ->
 type ResumePreview<'a> =
     dyn FnMut(&crate::prior::PriorOp, &mut Vec<RunWarning>) -> Result<DryPrior, RunError> + 'a;
 
+/// Cut 18: what a place with more to create than the workspace previews where the real run creates it.
+type CreatePreview<'a> = dyn FnMut(&mut DryRun, &mut Vec<RunWarning>) -> Result<(), RunError> + 'a;
+
 /// Cut 11b: how a dry run's lock preview and prior classification ended: a predicted refusal (with the report's
 /// flags), or the flags the plan carries.
 enum DryStart {
@@ -1287,7 +1293,11 @@ enum DryStart {
 
 /// Cut 11b, spec 3.2 and 3.3: the lock preview first (a predicted refusal ends the preview before any scan or
 /// note), then the scan classified as the real run's step 4 classifies it. The caller fills `unprobed_noreplace`
-/// and `planned`.
+/// and `planned`. `create_preview` is what a place with more to create than the workspace (the prefix locks of
+/// several sources) previews where the real run would create: a fresh start and `--restart`, never a resume and never
+/// a refusal. An `Err` is a predicted refusal.
+// One input per piece of the preview, as `dry_tree`'s.
+#[allow(clippy::too_many_arguments)]
 fn dry_start<D: DirHandle, P: Place<D>>(
     site: &LockSite<'_, D>,
     capability: LockCapability,
@@ -1295,6 +1305,7 @@ fn dry_start<D: DirHandle, P: Place<D>>(
     cfg: &RunConfig,
     restart_preview: &mut dyn FnMut(&[crate::prior::PriorOp], &mut Vec<RunWarning>) -> DryPrior,
     resume_preview: &mut ResumePreview<'_>,
+    create_preview: &mut CreatePreview<'_>,
     warnings: &mut Vec<RunWarning>,
 ) -> DryStart {
     let mut dry = DryRun {
@@ -1330,8 +1341,14 @@ fn dry_start<D: DirHandle, P: Place<D>>(
     };
     dry.prior_seen = dry_prior_notes(&scan, warnings);
     if cfg.restart {
+        if let Err(e) = create_preview(&mut dry, warnings) {
+            return DryStart::Stop(e, dry);
+        }
         dry.prior = Some(restart_preview(&scan.resumable, warnings));
     } else if scan.resumable.is_empty() {
+        if let Err(e) = create_preview(&mut dry, warnings) {
+            return DryStart::Stop(e, dry);
+        }
         dry.prior = cfg.resume.then_some(DryPrior::StartedNew);
     } else if cfg.resume && scan.resumable.len() == 1 {
         // Spec D6: `prior_seen` stays false for the previewed resumable.
@@ -1357,6 +1374,24 @@ fn dry_start<D: DirHandle, P: Place<D>>(
         return DryStart::Stop(stop, dry);
     }
     DryStart::Plan(dry)
+}
+
+/// Cut 12 (ruling 10): a dry run's hardlink index slot, deferred, in a private directory under `temp_root`; `None`
+/// under `--hardlinks=copy`. Also the path of the index file, for the warning when it cannot be used. Shared by the
+/// tree and the several-source dry runs.
+pub(crate) fn dry_hardlink_slot<F: DestinationRoot>(
+    fs: &F,
+    temp_root: &Path,
+    cfg: &RunConfig,
+    opts: &CopyOptions,
+) -> (Option<HardlinkSlot<F::Dir>>, PathBuf) {
+    let hardlinks_dir = format!("flux-dry-{}-hardlinks", cfg.operation_id);
+    let hardlinks_path = temp_root.join(&hardlinks_dir).join(HARDLINK_INDEX);
+    let slot = (opts.hardlinks != flux_fs::Hardlinks::Copy).then(|| {
+        let parent = fs.destination_root(temp_root).map_err(|e| e.code);
+        HardlinkSlot::deferred(parent, std::ffi::OsString::from(&hardlinks_dir))
+    });
+    (slot, hardlinks_path)
 }
 
 /// Cut 11a: the dry branch of `tree_with`. Reads DEST's prior operations for the notes, then plans the walk over a
@@ -1406,6 +1441,7 @@ fn dry_tree<F: DestinationRoot>(
         cfg,
         &mut restart_preview,
         &mut resume_preview,
+        &mut |_, _| Ok(()),
         &mut run.warnings,
     ) {
         DryStart::Plan(dry) => dry,
@@ -1436,12 +1472,7 @@ fn dry_tree<F: DestinationRoot>(
     let partials = std::cell::Cell::new(0u64);
     // Cut 12 (ruling 10): the dry run's index lives in a private directory under the temporary root, made at the first
     // use of the index (a tree without a candidate makes nothing); it never links.
-    let hardlinks_dir = format!("flux-dry-{}-hardlinks", cfg.operation_id);
-    let hardlinks_path = temp_root.join(&hardlinks_dir).join(HARDLINK_INDEX);
-    let hardlink_slot = (opts.hardlinks != flux_fs::Hardlinks::Copy).then(|| {
-        let parent = fs.destination_root(&temp_root).map_err(|e| e.code);
-        HardlinkSlot::deferred(parent, std::ffi::OsString::from(&hardlinks_dir))
-    });
+    let (hardlink_slot, hardlinks_path) = dry_hardlink_slot(fs, &temp_root, cfg, opts);
     let cx = Shared {
         fs,
         src_root: &src_root,
@@ -1562,6 +1593,7 @@ fn dry_file<F: DestinationRoot>(
         cfg,
         &mut restart_preview,
         &mut resume_preview,
+        &mut |_, _| Ok(()),
         &mut run.warnings,
     ) {
         DryStart::Plan(dry) => dry,
