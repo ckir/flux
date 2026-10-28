@@ -51,7 +51,7 @@ pub(crate) struct MultiPlace<'p, F: DestinationRoot> {
     pub(crate) lock_dir: &'p OnceCell<F::Dir>,
     pub(crate) capability: LockCapability,
     pub(crate) prefix_id: PrefixIdOwned,
-    /// A `RefCell` so that `Place::remove`, which takes `&self`, can release the locks (the trait does not change).
+    /// A `RefCell` so that `Place::remove`, which takes `&self`, can release the locks (the trait does not change). Released for this run's own id only.
     pub(crate) prefix: RefCell<Option<PrefixLocks<'p, F::Dir>>>,
 }
 
@@ -138,7 +138,20 @@ impl<'p, F: DestinationRoot> MultiPlace<'p, F> {
                     name
                 ),
             ),
-            PrefixRefusal::Lock(e) => from_lock(e, RunStep::Lock, &self.tree.dest_shown, false),
+            PrefixRefusal::Lock { name, mut error } => {
+                if let LockError::Refused(r) = &mut error {
+                    match r.code {
+                        LockCode::TargetLockUncertain => {
+                            r.detail = "this prefix lock has an unreadable record; if no Flux run is active on this destination, remove that file and run again with the same flags".to_string();
+                        }
+                        LockCode::ArtifactOwnershipUncertain => {
+                            r.detail = crate::lock::UNTRUSTED_DETAIL.to_string();
+                        }
+                        _ => {}
+                    }
+                }
+                from_lock(error, RunStep::Lock, &self.lock_path(&name), false)
+            }
         }
     }
 
@@ -298,6 +311,10 @@ impl<F: DestinationRoot> Place<F::Dir> for MultiPlace<'_, F> {
     }
 
     fn remove(&self, id: &str) -> Result<(), (PathBuf, FsError)> {
+        // A prior's workspace (a supersede) is retired without touching this run's locks.
+        if id != self.prefix_id.operation_id {
+            return self.tree.remove(id);
+        }
         // The prefix locks go before the workspace is retired (spec 3.4). A lock that would not release is reported
         // after the workspace has been dealt with, and does not stop it.
         let released = release_cell(&self.prefix);
@@ -440,12 +457,9 @@ pub fn trees<F: DestinationRoot>(
     // A one-root manifest would be format 4 with a `kind`, which the validator rejects: the caller routes one source
     // to `tree` or `file`.
     debug_assert!(!cfg.dry_run, "a dry run of several sources is not supported");
-    // `MultiPlace::remove` releases this run's prefix locks whatever operation id it is given, and a supersede or an
-    // adoption removes a prior's: neither is supported with several sources.
-    debug_assert!(
-        !cfg.restart && !cfg.resume,
-        "several sources support neither --restart nor --resume"
-    );
+    // Adoption (`--resume`) is the unsupported case: `MultiPlace::remove` releases the prefix locks only for this
+    // run's own id, so a supersede (`--restart`) removing a prior's workspace leaves them held.
+    debug_assert!(!cfg.resume, "several sources do not support --resume");
     debug_assert!(specs.len() >= 2, "one source is `tree` or `file`");
     let mut run = Run {
         copy: None,
@@ -770,6 +784,38 @@ mod tests {
         assert_eq!(lock_files(&fx.fs).len(), 2, "both locks are held while the run lives");
         assert!(p.release_prefix_locks().is_empty());
         assert!(lock_files(&fx.fs).is_empty());
+    }
+
+    #[test]
+    fn remove_of_a_prior_keeps_this_runs_prefix_locks() {
+        let fx = fx();
+        let mut p = place(&fx, vec![root("data", RootKind::Tree)]);
+        let mut warnings = Vec::new();
+        p.create(&state(), &mut warnings).unwrap();
+        let prior = "22222222222222222222222222222222";
+        fx.fs.create_dir(Path::new(&format!("/p/dest/.flux/operations/{prior}"))).unwrap();
+        p.remove(prior).unwrap();
+        assert!(
+            !fx.fs.exists(format!("/p/dest/.flux/operations/{prior}")),
+            "the prior's workspace is retired"
+        );
+        assert_eq!(
+            lock_files(&fx.fs),
+            vec!["/p/dest/data.flux-lock".to_string()],
+            "this run's prefix lock is still held"
+        );
+        assert!(p.prefix.borrow().is_some());
+    }
+
+    #[test]
+    fn remove_of_this_run_releases_its_prefix_locks() {
+        let fx = fx();
+        let mut p = place(&fx, vec![root("data", RootKind::Tree)]);
+        let mut warnings = Vec::new();
+        p.create(&state(), &mut warnings).unwrap();
+        p.remove(ID).unwrap();
+        assert!(lock_files(&fx.fs).is_empty(), "{:?}", lock_files(&fx.fs));
+        assert!(p.prefix.borrow().is_none());
     }
 
     #[test]
@@ -1517,6 +1563,57 @@ mod trees_tests {
         assert!(!fs.exists("/p/dest/.flux"), "no workspace was made");
     }
 
+    fn lock_prefix(name: &str) -> String {
+        format!("{}: ", Path::new("/p/dest").join(format!("{name}.flux-lock")).display())
+    }
+
+    #[test]
+    fn an_unreadable_prefix_lock_names_the_file_once_and_promises_no_break_lock() {
+        let fs = fake();
+        fs.create_dir(Path::new("/p/dest")).unwrap();
+        fs.write_file("/p/dest/a.flux-lock", b""); // an empty record, nobody holds it: Uncertain under Mode::Plain
+        let (r, _) = go(&fs, &["a", "b"]);
+        let detail = match &r.run.stop {
+            Some(RunError::Refused { refusal, changed: false, .. }) => {
+                assert_eq!(refusal.code, LockCode::TargetLockUncertain);
+                refusal.detail.clone()
+            }
+            other => panic!("expected TARGET_LOCK_UNCERTAIN, got {other:?}"),
+        };
+        assert!(detail.starts_with(&lock_prefix("a")), "{detail}");
+        assert_eq!(detail.matches("a.flux-lock").count(), 1, "{detail}");
+        assert!(detail.contains("the same flags") && !detail.contains("--break-lock"), "{detail}");
+        assert!(!fs.exists("/p/dest/.flux"), "nothing was created");
+    }
+
+    #[test]
+    fn an_orphan_prefix_lock_says_remove_by_hand_not_cleanup() {
+        let fs = fake();
+        fs.create_dir(Path::new("/p/dest")).unwrap();
+        // A one-source copy into DEST/a crashed (its record names operations/<id> under DEST/a), then DEST/a was removed.
+        let dest = fs.destination_root(Path::new("/p/dest")).unwrap();
+        let site = crate::lock::LockSite::directory(&dest, &OsString::from("a")).unwrap();
+        let rec = crate::lock::test_support::record(
+            &site,
+            "33333333333333333333333333333333",
+            "operations/33333333333333333333333333333333",
+        );
+        crate::lock::test_support::dead_lock(&dest, "a.flux-lock", &rec.encode());
+        let (r, _) = go(&fs, &["a", "b"]);
+        let detail = match &r.run.stop {
+            Some(RunError::Refused { refusal, .. }) => {
+                assert_eq!(refusal.code, LockCode::ArtifactOwnershipUncertain);
+                refusal.detail.clone()
+            }
+            other => panic!("expected ARTIFACT_OWNERSHIP_UNCERTAIN, got {other:?}"),
+        };
+        assert!(detail.starts_with(&lock_prefix("a")), "{detail}");
+        assert!(
+            detail.contains("remove it by hand") && !detail.contains("flux cleanup"),
+            "{detail}"
+        );
+    }
+
     #[test]
     fn a_held_prefix_lock_on_the_last_root_refuses_and_nothing_is_copied() {
         let fs = fake();
@@ -1539,6 +1636,7 @@ mod trees_tests {
         match &r.run.stop {
             Some(RunError::Refused { refusal, changed: false, .. }) => {
                 assert_eq!(refusal.code, LockCode::TargetLockBusy);
+                assert!(refusal.detail.starts_with(&lock_prefix("c")), "{}", refusal.detail);
             }
             other => panic!("expected TARGET_LOCK_BUSY with nothing changed, got {other:?}"),
         }
@@ -1986,5 +2084,339 @@ mod trees_tests {
         assert!(got.is_empty(), "{got:?}");
         assert_eq!(fs.read_file("/p/dest/f").as_deref(), Some(&b"F"[..]));
         assert_eq!(out.excluded, 2, "a's two tmp files; the file root f adds none");
+    }
+
+    /// Run `names` on `fs` and die at the `nth` call to `op`, as a crashed process would: unwinding drops the run's
+    /// `FakeLock`s (the OS locks go, every file stays) and no `settle` runs, so the prefix lock files, the destination
+    /// lock and the TRANSFERRING manifest are left behind.
+    fn crash(fs: &FaultFs, names: &[&str], op: &str, nth: u32) {
+        fs.on_nth(op, nth, |_| panic!("the test's crash point"));
+        let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| go(fs, names)));
+        assert!(died.is_err(), "the run was meant to die at {op} #{nth}");
+    }
+
+    fn restart_cfg(n: u8) -> RunConfig {
+        RunConfig { operation_id: format!("{:032x}", n), restart: true, ..cfg() }
+    }
+
+    /// A fake whose `["a", "b"]` run died at the publish of `a/x`.
+    fn crashed_ab() -> FaultFs {
+        let n = reference(fake, &["a", "b"], "rename_no_replace", "/p/dest/a/x");
+        let fs = fake();
+        crash(&fs, &["a", "b"], "rename_no_replace", n);
+        fs
+    }
+
+    #[test]
+    fn a_several_source_restart_supersedes_a_crashed_run_abandoning_it_first() {
+        let fs = crashed_ab();
+        assert!(fs.exists(format!("/p/dest/a/x.flux-partial.{ID}")));
+        assert_eq!(manifest(&fs).state, OpState::Transferring);
+        assert_eq!(prefix_lock_files(&fs).len(), 2, "{:?}", prefix_lock_files(&fs));
+        assert!(fs.exists(LOCK));
+
+        // The reference restart, on a fake crashed the same way, says which `rename_no_replace` retires the prior.
+        let fs2 = crashed_ab();
+        let (r2, _) = go_with(&fs2, ["a", "b"].map(spec).to_vec(), &opts(), &restart_cfg(0x22));
+        ok(&r2);
+        let k = nth_of(&fs2, "rename_no_replace", &format!("operations/{ID}.removing"));
+
+        let seen = watch_manifest(&fs, "rename_no_replace", k);
+        let mark = fs.calls().len();
+        let (r, _) = go_with(&fs, ["a", "b"].map(spec).to_vec(), &opts(), &restart_cfg(0x22));
+        ok(&r);
+
+        let prior = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the prior's manifest was read at the retiring rename");
+        assert_eq!(prior.state, OpState::Abandoned);
+        assert_eq!(prior.superseded_by.as_deref(), Some(format!("{:032x}", 0x22).as_str()));
+        assert!(!fs.exists(format!("/p/dest/a/x.flux-partial.{ID}")));
+        assert!(!fs.exists(format!("/p/dest/.flux/operations/{ID}")));
+        assert_eq!(fs.read_file("/p/dest/a/x").as_deref(), Some(&b"ax"[..]));
+        assert_eq!(fs.read_file("/p/dest/b/k").as_deref(), Some(&b"bk"[..]));
+
+        // ORDER: the first `create_new` outside `DEST/.flux` is the first partial of the copy; no prefix lock of a
+        // name this run uses may be released before it (anti-goal A1). This probe is the only guard of A1 at this
+        // level.
+        let log = calls(&fs);
+        let after = &log[mark..];
+        let first_copy_write = after
+            .iter()
+            .position(|c| {
+                c.starts_with("create_new(") && !c.starts_with("create_new(/p/dest/.flux")
+            })
+            .expect("the restart creates a partial file");
+        for name in ["a", "b"] {
+            let release = format!("remove_file(/p/dest/{name}.flux-lock)");
+            let at =
+                after.iter().position(|c| *c == release).unwrap_or_else(|| panic!("no {release}"));
+            assert!(
+                first_copy_write < at,
+                "{name}: the first partial was created at {first_copy_write}, released at {at}: {after:?}"
+            );
+        }
+
+        assert!(lock_files(&fs).is_empty(), "{:?}", lock_files(&fs));
+        for name in ["a", "b"] {
+            assert!(!fs.exists(format!("/p/dest/{name}.flux-lock.broken.{:032x}", 0x22)));
+        }
+    }
+
+    #[test]
+    fn a_restart_right_after_a_crash_does_not_wait_for_a_lease() {
+        let fs = crashed_ab();
+        let bytes = fs.read_file(LOCK).expect("the crashed run left its destination lock");
+        let crate::lock::record::Decoded::Record(rec) = crate::lock::record::decode(&bytes) else {
+            panic!("the destination lock is not a record");
+        };
+        // A "now" heartbeat: nothing has aged. `classify`'s `Dead` arm reads no heartbeat (classify.rs:54-57), so the
+        // restart must take the lock at once. The mutant that proves it is a STAND-IN (refuse when the record's last
+        // heartbeat equals its creation time), because `obtain` takes no clock; the real lease gate would be
+        // `obtain_cleanup_lock`'s (`crates/flux-core/src/lock/obtain.rs`). The premise that the heartbeat is "now"
+        // holds because the crashed run wrote it with the real clock.
+        assert_eq!(rec.last_heartbeat_wall_time, rec.creation_wall_time);
+        let (r, _) = go_with(&fs, ["a", "b"].map(spec).to_vec(), &opts(), &restart_cfg(0x23));
+        ok(&r);
+    }
+
+    #[test]
+    fn a_restart_with_other_sources_leaves_the_unused_prefix_lock_and_succeeds() {
+        let fs = crashed_ab();
+        let (r, _) = go_with(&fs, ["a", "c"].map(spec).to_vec(), &opts(), &restart_cfg(0x24));
+        ok(&r);
+        // L6 residue, named on purpose: the prior's `b` lock belongs to no root of this run, so nothing releases it.
+        assert!(fs.exists("/p/dest/b.flux-lock"));
+        assert!(!fs.exists("/p/dest/a.flux-lock"));
+        assert!(!fs.exists("/p/dest/c.flux-lock"));
+        assert!(!fs.exists(LOCK));
+        assert_eq!(fs.read_file("/p/dest/c/z").as_deref(), Some(&b"cz"[..]));
+    }
+
+    /// The manifest of the operation `id`, decoded.
+    fn manifest_of(fs: &FaultFs, id: &str) -> OperationState {
+        let bytes = fs
+            .read_file(format!("/p/dest/.flux/operations/{id}/manifest"))
+            .expect("the workspace is kept");
+        decode_state(&bytes).unwrap()
+    }
+
+    /// Like `nth_of`, but the first match is looked for at call-log position `from` or later. The count still starts at
+    /// the first call named `op`, because `on_nth` counts from the fake's creation.
+    fn nth_of_from(fs: &FaultFs, from: usize, op: &str, needle: &str) -> u32 {
+        let head = format!("{op}(");
+        let mut n = 0;
+        for (at, c) in calls(fs).into_iter().enumerate() {
+            if c.starts_with(&head) {
+                n += 1;
+                if at >= from && c.contains(needle) {
+                    return n;
+                }
+            }
+        }
+        panic!("no {op} mentioning {needle} from {from} in {:?}", calls(fs));
+    }
+
+    /// `watch_manifest` for the operation `id`.
+    fn watch_manifest_of(fs: &FaultFs, id: &str, op: &str, nth: u32) -> Seen {
+        let seen: Seen = Arc::default();
+        let keep = Arc::clone(&seen);
+        let id = id.to_string();
+        fs.on_nth(op, nth, move |fs| {
+            let bytes = fs
+                .read_file(format!("/p/dest/.flux/operations/{id}/manifest"))
+                .expect("the manifest exists");
+            *keep.lock().unwrap() = Some(decode_state(&bytes).unwrap());
+        });
+        seen
+    }
+
+    /// The fixture of the takeover tests: a DEST with an empty (unreadable, nobody holds it) destination lock.
+    fn empty_dest_lock() -> FaultFs {
+        let fs = fake();
+        fs.create_dir(Path::new("/p/dest")).unwrap();
+        fs.write_file(LOCK, b"");
+        fs
+    }
+
+    #[test]
+    fn break_lock_takes_over_an_empty_destination_lock_for_several_sources() {
+        let id = format!("{:032x}", 0x25);
+        let cfg_break = || RunConfig { break_lock: true, ..restart_cfg(0x25) };
+        // The manifest is read during the run: a completed run retires its own workspace.
+        let fs2 = empty_dest_lock();
+        let (r2, _) = go_with(&fs2, ["a", "b"].map(spec).to_vec(), &opts(), &cfg_break());
+        ok(&r2);
+        let k = nth_of(&fs2, "rename_no_replace", &format!("operations/{id}.removing"));
+
+        let fs = empty_dest_lock();
+        let seen = watch_manifest_of(&fs, &id, "rename_no_replace", k);
+        let (r, _) = go_with(&fs, ["a", "b"].map(spec).to_vec(), &opts(), &cfg_break());
+        ok(&r);
+        let own = seen.lock().unwrap().clone().expect("the run's manifest was read");
+        assert!(own.takeover.is_some(), "the takeover is recorded: {own:?}");
+        assert!(!fs.exists(LOCK));
+    }
+
+    #[test]
+    fn both_locks_unreadable_refuses_at_the_prefix_lock_and_writes_nothing() {
+        let id = format!("{:032x}", 0x25);
+        let fs = empty_dest_lock();
+        fs.write_file("/p/dest/a.flux-lock", b"");
+        let cfg_break = RunConfig { break_lock: true, ..restart_cfg(0x25) };
+        let (r, _) = go_with(&fs, ["a", "b"].map(spec).to_vec(), &opts(), &cfg_break);
+        match &r.run.stop {
+            Some(RunError::Refused { refusal, changed: false, .. }) => {
+                assert_eq!(refusal.code, LockCode::TargetLockUncertain);
+                let detail = &refusal.detail;
+                assert!(detail.starts_with(&lock_prefix("a")), "{detail}");
+                assert!(detail.contains("the same flags"), "{detail}");
+                assert!(!detail.contains("--break-lock"), "{detail}");
+            }
+            other => panic!("expected TARGET_LOCK_UNCERTAIN with nothing changed, got {other:?}"),
+        }
+        assert_eq!(
+            fs.read_file(LOCK).as_deref(),
+            Some(&b""[..]),
+            "the destination lock is as it was"
+        );
+        assert!(!fs.exists(format!("/p/dest/.flux/operations/{id}")), "nothing was written");
+    }
+
+    #[test]
+    fn a_live_prefix_lock_refuses_a_restart_and_leaves_the_prior_untouched() {
+        let fs = crashed_ab();
+        // Another operation recovers the dead lock of `a` and holds it.
+        let dest = fs.destination_root(Path::new("/p/dest")).unwrap();
+        let other = PrefixIdOwned {
+            operation_id: "55555555555555555555555555555555".to_string(),
+            owner_instance_id: "other".to_string(),
+            boot_session_id: "test-boot".to_string(),
+            now: 5,
+        };
+        let (_held, _) =
+            PrefixLocks::acquire(&dest, LockCapability::LocalStrong, &os(&["a"]), &other.as_ref())
+                .unwrap();
+        let manifest_path = format!("/p/dest/.flux/operations/{ID}/manifest");
+        let partial = format!("/p/dest/a/x.flux-partial.{ID}");
+        let workspace = format!("/p/dest/.flux/operations/{ID}");
+        let snapshot = |fs: &FaultFs| {
+            (fs.read_file(&manifest_path), fs.exists(&partial), fs.exists(&workspace))
+        };
+        let before = snapshot(&fs);
+        assert!(before.0.is_some() && before.1 && before.2);
+
+        let (r, _) = go_with(&fs, ["a", "b"].map(spec).to_vec(), &opts(), &restart_cfg(0x26));
+
+        match &r.run.stop {
+            Some(RunError::Refused { refusal, .. }) => {
+                assert_eq!(refusal.code, LockCode::TargetLockBusy);
+                assert!(refusal.detail.starts_with(&lock_prefix("a")), "{}", refusal.detail);
+            }
+            other => panic!("expected TARGET_LOCK_BUSY, got {other:?}"),
+        }
+        assert!(snapshot(&fs) == before, "the prior is untouched");
+    }
+
+    #[test]
+    fn a_several_source_restart_supersedes_a_crashed_one_source_tree_run() {
+        let tree = |fs: &FaultFs, c: &RunConfig| {
+            crate::run::tree(fs, Path::new("/src/a"), Path::new("/p/dest"), &opts(), c, &mut |_| {})
+        };
+        // The prior is a one-source tree run that died at the publish of `x`: a resumable TRANSFERRING workspace.
+        let fs2 = fake();
+        let r2 = tree(&fs2, &cfg());
+        assert!(r2.stop.is_none(), "{:?}", r2.stop);
+        let n = nth_of(&fs2, "rename_no_replace", "/p/dest/x");
+
+        let fs = fake();
+        fs.on_nth("rename_no_replace", n, |_| panic!("the test's crash point"));
+        let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tree(&fs, &cfg())));
+        assert!(died.is_err(), "the run was meant to die at the publish of x");
+        let prior = manifest(&fs);
+        assert_eq!(prior.state, OpState::Transferring);
+        assert!(matches!(prior.kind, crate::state::Kind::Tree), "{:?}", prior.kind);
+        assert_ne!(prior.format_version, crate::state::MULTI_ROOT_FORMAT);
+        assert!(fs.exists(format!("/p/dest/x.flux-partial.{ID}")));
+
+        let (r, _) = go_with(&fs, ["a", "b"].map(spec).to_vec(), &opts(), &restart_cfg(0x27));
+        ok(&r);
+        assert!(!fs.exists(format!("/p/dest/.flux/operations/{ID}")), "the prior is retired");
+        assert!(!fs.exists(format!("/p/dest/x.flux-partial.{ID}")), "its partial is gone");
+        assert!(lock_files(&fs).is_empty(), "{:?}", lock_files(&fs));
+        assert_eq!(fs.read_file("/p/dest/a/x").as_deref(), Some(&b"ax"[..]));
+    }
+
+    #[test]
+    fn one_restart_supersedes_a_crashed_run_and_a_restart_that_crashed_before_abandoning_it() {
+        let id2 = format!("{:032x}", 0x28);
+        let one_source = |fs: &FaultFs| {
+            let c = RunConfig { restart: true, operation_id: id2.clone(), ..cfg() };
+            crate::run::tree(
+                fs,
+                Path::new("/src/a"),
+                Path::new("/p/dest"),
+                &opts(),
+                &c,
+                &mut |_| {},
+            )
+        };
+        // The reference: the same first crash, then the same restart un-crashed.
+        let fs2 = crashed_ab();
+        let mark2 = fs2.calls().len();
+        let r2 = one_source(&fs2);
+        assert!(r2.stop.is_none(), "{:?}", r2.stop);
+        let k = nth_of_from(&fs2, mark2, "create_new", &format!("operations/{ID}/manifest"));
+
+        // The twice-crashed fake: the several-source run died, then the one-source restart died before abandoning it.
+        let crashed_twice = || {
+            let fs = crashed_ab();
+            fs.on_nth("create_new", k, |_| panic!("the restart's crash point"));
+            let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| one_source(&fs)));
+            assert!(died.is_err(), "the restart was meant to die before abandoning its prior");
+            fs
+        };
+        let fs = crashed_twice();
+        assert_eq!(manifest_of(&fs, ID).state, OpState::Transferring);
+        // Measured: the restart died before it wrote anything past its own first manifest, which is still CREATED.
+        assert_eq!(
+            manifest_of(&fs, &id2).state,
+            OpState::Created,
+            "the restart's own workspace exists"
+        );
+
+        // The reference restart on a fake crashed the same way says which `rename_no_replace` retires each prior.
+        let fs3 = crashed_twice();
+        let (r3, _) = go_with(&fs3, ["a", "b"].map(spec).to_vec(), &opts(), &restart_cfg(0x29));
+        ok(&r3);
+        let k_first = nth_of(&fs3, "rename_no_replace", &format!("operations/{ID}.removing"));
+        let k_second = nth_of(&fs3, "rename_no_replace", &format!("operations/{id2}.removing"));
+        // Both priors must have been marked ABANDONED, by this run, before their workspaces were retired: the content
+        // of every prior's manifest is read just before its own retiring rename.
+        let seen_first = watch_manifest_of(&fs, ID, "rename_no_replace", k_first);
+        let seen_second = watch_manifest_of(&fs, &id2, "rename_no_replace", k_second);
+
+        let (r, _) = go_with(&fs, ["a", "b"].map(spec).to_vec(), &opts(), &restart_cfg(0x29));
+        ok(&r);
+        for (which, seen) in
+            [("the crashed run", &seen_first), ("the crashed restart", &seen_second)]
+        {
+            let prior =
+                seen.lock().unwrap().clone().unwrap_or_else(|| {
+                    panic!("{which}: its manifest was read at its retiring rename")
+                });
+            assert_eq!(prior.state, OpState::Abandoned, "{which}");
+            assert_eq!(
+                prior.superseded_by.as_deref(),
+                Some(format!("{:032x}", 0x29).as_str()),
+                "{which}"
+            );
+        }
+        assert!(!fs.exists(format!("/p/dest/.flux/operations/{ID}")));
+        assert!(!fs.exists(format!("/p/dest/.flux/operations/{id2}")));
+        assert_eq!(fs.read_file("/p/dest/a/x").as_deref(), Some(&b"ax"[..]));
+        assert_eq!(fs.read_file("/p/dest/b/k").as_deref(), Some(&b"bk"[..]));
     }
 }

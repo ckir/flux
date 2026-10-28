@@ -103,7 +103,7 @@ One section per audited change, newest at the bottom.
 
 These are limits and rulings of the cut, not test gaps. Each is stated as the spec's section 6, 3.4 and 3.6 state it (`docs/superpowers/specs/2026-10-22-several-sources-design.md`).
 
-- **L1. An aborted several-source run is not resumed.** After an aborted or crashed several-source run, re-running the same command is refused by the prior-operation scan (spec 21.1). With several sources `--restart` is refused in this cut, so the way forward is `flux cleanup --force DEST`, or `flux copy --restart` with one source. The resume cut removes this.
+- **L1. An aborted several-source run is not resumed.** After an aborted or crashed several-source run, re-running the same command is refused by the prior-operation scan (spec 21.1). `--restart` (and `--break-lock`, destination lock only) supersedes it since cut 17 (2026-10-28), at once, with several sources; `--resume` and `--dry-run` with several sources are still usage errors.
 - **L2. The pre-transfer phase stops at the first bad source,** not all of them.
 - **L3. A several-source run is not atomic across roots.** Roots finished before an abort stay on disk.
 - **L4. A root with a very long name is refused.** A root whose name is so long that `<name>.flux-lock` exceeds the directory's limit is refused. Spec 96.1's directory-lock fallback is not used by several-source runs.

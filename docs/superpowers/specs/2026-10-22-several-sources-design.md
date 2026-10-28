@@ -29,6 +29,7 @@ Goals
 Non-goals (each is a later cut or stays in TODO.md)
 - N1. `--resume`, `--restart`, `--break-lock`, `--resume-verify`, `--dry-run` with several sources: usage error (owner
   ruling 2026-10-22).
+  Update 2026-10-28: `--restart` and `--break-lock` with several sources landed in cut 17, `docs/superpowers/specs/2026-10-27-several-restart-design.md`; `--resume` and `--dry-run` remain usage errors.
 - N2. `--exclude` (own cut; the cut 11a spec N5 lists it separately).
 - N3. Hardlink grouping across roots (phase 4 is not built). Only the ORDER that grouping needs is honoured (§3.6).
 - N4. Parallel workers, queues, a planner (phase 3).
@@ -333,6 +334,7 @@ ruling in §3.7, the second is moot under B).
 - L1. After an aborted or crashed several-source run, re-running the same command is refused by the prior-operation
   scan (spec §21.1). With several sources `--restart` is refused in this cut, so the way forward is
   `flux cleanup --force DEST`, or `flux copy --restart` with one source. The resume cut removes this.
+  Update 2026-10-28: `--restart` supersedes an aborted several-source run since cut 17 (`docs/superpowers/specs/2026-10-27-several-restart-design.md`); the resume cut still has to remove the rest of this limitation.
 - L2. The pre-transfer phase stops at the first bad source, not all of them.
 - L3. A several-source run is not atomic across roots.
 - L4. A root whose name is so long that `<name>.flux-lock` exceeds the directory's limit is refused; §96.1's

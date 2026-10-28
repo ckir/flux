@@ -181,7 +181,7 @@ pub fn resumable_refusal(ops: &[PriorOp]) -> LockError {
     let wipe = "(its partials and its recorded progress are deleted)";
     let detail = match ops {
         [op] if op.state.format_version >= MULTI_ROOT_FORMAT => format!(
-            "operation {} is {} ({}), created by a several-source run, so --resume cannot continue it and --restart with several sources is not supported yet; run flux cleanup --force DEST to remove it, then run again",
+            "operation {} is {} ({}), created by a several-source run, so --resume cannot continue it; run again with --restart to supersede it {wipe}",
             op.state.operation_id,
             op.state.state.as_str(),
             op.shown.display()
@@ -215,7 +215,7 @@ pub fn resumable_refusal(ops: &[PriorOp]) -> LockError {
                 named.join(", ")
             );
             if ops.iter().any(|op| op.state.format_version >= MULTI_ROOT_FORMAT) {
-                detail.push_str("; a several-source prior needs flux cleanup --force DEST");
+                detail.push_str("; a several-source prior is superseded like the others");
             }
             detail
         }
@@ -631,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn a_version_5_prior_says_to_run_cleanup_force_not_resume_or_restart() {
+    fn a_version_5_prior_names_restart_not_resume_or_cleanup() {
         let op = |n: u8, v: u64, s: OpState| {
             let mut state = state(n, Kind::Tree, s);
             state.format_version = v;
@@ -639,17 +639,20 @@ mod tests {
         };
         let detail = |ops: &[PriorOp]| refusal::<()>(Err(resumable_refusal(ops))).detail;
         let d = detail(&[op(1, MULTI_ROOT_FORMAT, OpState::Failed)]);
-        for part in [id(1).as_str(), "FAILED", "manifest", "flux cleanup --force", "several-source"]
+        for part in
+            [id(1).as_str(), "FAILED", "manifest", "--restart to supersede", "several-source"]
         {
             assert!(d.contains(part), "{part}: {d}");
         }
         assert!(!d.contains("--resume to continue"), "{d}");
-        // Several priors, one of them several-source: the same way out is named; with none, the text is as before.
+        assert!(!d.contains("cleanup"), "{d}");
+        // Several priors, one of them several-source: --restart is the way out; with none, the text is as before.
         let many = detail(&[
             op(1, FORMAT_VERSION, OpState::Failed),
             op(2, MULTI_ROOT_FORMAT, OpState::Transferring),
         ]);
-        assert!(many.contains("flux cleanup --force"), "{many}");
+        assert!(!many.contains("cleanup"), "{many}");
+        assert!(many.contains("--restart"), "{many}");
         let plain = detail(&[
             op(1, FORMAT_VERSION, OpState::Failed),
             op(2, FORMAT_VERSION, OpState::Failed),
