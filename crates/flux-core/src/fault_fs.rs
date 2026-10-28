@@ -1337,7 +1337,9 @@ impl FaultFs {
     /// `create_lock` and `open_lock` fold too (a second spelling of a lock name is `AlreadyExists`; opening finds the
     /// stored spelling).
     ///
-    /// NOT normalized (they take the spelling asked for): `read_file`, `remove_dir`, `create_claim_store`, the path-level `open_read`, and the test helpers `write_file`, `read_file` and `exists`.
+    /// `DirHandle::read_file` is normalized too (a lock file read under another spelling finds the stored one).
+    ///
+    /// NOT normalized (they take the spelling asked for): `remove_dir`, `create_claim_store`, the path-level `open_read`, and the test helpers `write_file`, `read_file` and `exists`.
     /// The folding is ASCII-only. `stored()` is UNSPECIFIED, not deterministic across runs, when two existing entries
     /// differ only by case and neither equals the requested spelling (the maps it scans have no order).
     pub fn set_case_insensitive(&self, on: bool) {
@@ -2537,7 +2539,7 @@ impl DirHandle for FakeDirHandle {
 
     fn read_file(&self, name: &OsStr, limit: usize) -> Result<Vec<u8>> {
         check_component(name)?;
-        let child_path = self.my_path().join(name);
+        let child_path = self.fs().norm(&self.my_path().join(name));
         self.fs().record(format!("read_file({})", child_path.display()), "read_file")?;
         let g = self.inner.lock().unwrap();
         if g.pending.contains(&child_path) {

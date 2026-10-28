@@ -30,10 +30,11 @@ use crate::tree::{
 };
 use crate::walk::MountPolicy;
 use flux_fs::{
-    Code, CopyOptions, DestinationRoot, DirHandle, Durability, FileIdentity, FileType, FsError,
-    LockCapability, OperationId,
+    Code, CopyOptions, DestinationRoot, DirEntry, DirHandle, Durability, FileIdentity, FileType,
+    FsError, LockCapability, OperationId,
 };
 use std::cell::{OnceCell, RefCell};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -45,6 +46,67 @@ pub(crate) struct RootPlan {
     pub kind: RootKind,
     pub src: PathBuf,
     pub identity: FileIdentity,
+}
+
+/// The most entries the fold-probe asks about: on a filesystem with `Weak` identities every candidate would otherwise
+/// cost two `metadata` calls.
+const FOLD_CANDIDATES: usize = 8;
+
+/// An entry the fold-probe can use: a valid UTF-8 name holding an ASCII letter.
+fn fold_candidate(entry: &DirEntry) -> Option<&str> {
+    let name = entry.name.to_str()?;
+    name.bytes().any(|b| b.is_ascii_alphabetic()).then_some(name)
+}
+
+/// `name` with the case of its first ASCII letter swapped.
+fn swap_first_letter(name: &str) -> String {
+    let mut done = false;
+    name.chars()
+        .map(|c| {
+            if !done && c.is_ascii_alphabetic() {
+                done = true;
+                if c.is_ascii_uppercase() { c.to_ascii_lowercase() } else { c.to_ascii_uppercase() }
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// Spec 4.2 step 2 (vi): whether `dir`, whose listing is `entries`, folds ASCII case. Read-only. It asks about at most
+/// `FOLD_CANDIDATES` entries, the smallest usable names bytewise (a listing's order is arbitrary, so it must not decide
+/// which): the variant swaps the case of the first ASCII letter. A variant that is itself an entry means two names
+/// differing by case coexist (`Some(false)`); both names resolving to one `Strong` identity is `Some(true)`; a variant
+/// that is not found is `Some(false)`; anything else (an error, a `Weak` or `Unavailable` identity) tries the next
+/// candidate, and with none left the answer is `None`: undecided, never a refusal.
+fn folds_ascii_case<D: DirHandle>(dir: &D, entries: &[DirEntry]) -> Option<bool> {
+    // A bounded max-heap keeps the smallest names without sorting the listing.
+    let mut heap: BinaryHeap<&str> = BinaryHeap::with_capacity(FOLD_CANDIDATES + 1);
+    for name in entries.iter().filter_map(fold_candidate) {
+        heap.push(name);
+        if heap.len() > FOLD_CANDIDATES {
+            heap.pop();
+        }
+    }
+    let present: HashSet<&OsStr> = entries.iter().map(|e| e.name.as_os_str()).collect();
+    for name in heap.into_sorted_vec() {
+        let variant = swap_first_letter(name);
+        if present.contains(OsStr::new(&variant)) {
+            return Some(false);
+        }
+        let Ok(entry) = dir.metadata(OsStr::new(name)) else { continue };
+        let FileIdentity::Strong(id) = entry.identity else { continue };
+        match dir.metadata(OsStr::new(&variant)) {
+            Ok(found) => {
+                if matches!(found.identity, FileIdentity::Strong(other) if other == id) {
+                    return Some(true);
+                }
+            }
+            Err(e) if e.source.kind() == ErrorKind::NotFound => return Some(false),
+            Err(_) => {}
+        }
+    }
+    None
 }
 
 /// A tree's `TreePlace`, with the prefix locks of its roots.
@@ -170,13 +232,24 @@ impl<'p, F: DestinationRoot> MultiPlace<'p, F> {
         dry: &mut DryRun,
         warnings: &mut Vec<RunWarning>,
     ) -> Result<(), RunError> {
-        let Some(dest) = self.tree.dest.as_ref() else { return Ok(()) };
+        let twins = self.case_twins();
+        let Some(dest) = self.tree.dest.as_ref() else {
+            // DEST is absent: no lock file or target to read, only the fold-probe, on DEST's parent.
+            if let Some(i) = twins.iter().position(Option::is_some)
+                && self.dry_fold(None) == Some(true)
+            {
+                return Err(self.twin_collision(i, twins[i]));
+            }
+            return Ok(());
+        };
         // One listing for every leftover scan; the scan is best-effort, as `dry_lock`'s.
         let listing = dest.read_dir().ok();
+        // The fold-probe's answer, asked for at the first name with an ASCII-case twin before it.
+        let mut folds: Option<Option<bool>> = None;
         let now = wall_time_ns();
         let mut seen: Vec<(FileIdentity, &OsString)> = Vec::new();
         let mut recorded: Vec<String> = Vec::new();
-        for root in &self.roots {
+        for (i, root) in self.roots.iter().enumerate() {
             let name = &root.name;
             let site = LockSite::directory(dest, name).map_err(|error| {
                 self.prefix_error(PrefixRefusal::Lock { name: name.clone(), error })
@@ -201,6 +274,13 @@ impl<'p, F: DestinationRoot> MultiPlace<'p, F> {
                 }
                 Err(_) => false,
             };
+            // A name whose twin is before it is the same lock file on a directory that folds ASCII case, as the real
+            // `take` meets the first lock's file before it classifies anything.
+            if twins[i].is_some()
+                && *folds.get_or_insert_with(|| self.dry_fold(listing.as_deref())) == Some(true)
+            {
+                return Err(self.twin_collision(i, twins[i]));
+            }
             // `acquire` looks for `.flux-dir.lock` only after it created this name's lock file; an existing file goes
             // straight to its classification.
             if !lock_found {
@@ -252,6 +332,55 @@ impl<'p, F: DestinationRoot> MultiPlace<'p, F> {
             }
         }
         self.check_targets_in(dest)
+    }
+
+    /// For each root, the index of the first root before it whose name is equal to it after ASCII lower-casing (the
+    /// names are unique, so they differ in bytes): the trigger of the fold-probe.
+    fn case_twins(&self) -> Vec<Option<usize>> {
+        let mut first: HashMap<Vec<u8>, usize> = HashMap::new();
+        self.roots
+            .iter()
+            .enumerate()
+            .map(|(i, root)| {
+                let key = root.name.as_encoded_bytes().to_ascii_lowercase();
+                let twin = first.get(&key).copied();
+                first.entry(key).or_insert(i);
+                twin
+            })
+            .collect()
+    }
+
+    /// The refusal for root `i` and its earlier twin `twin` (the real run's, `prefix_error`).
+    fn twin_collision(&self, i: usize, twin: Option<usize>) -> RunError {
+        let other = &self.roots[twin.expect("a twin was found")].name;
+        self.prefix_error(PrefixRefusal::Collision {
+            name: self.roots[i].name.clone(),
+            other: other.clone(),
+        })
+    }
+
+    /// Spec 4.2 step 2 (vi): whether the directory the lock files live in folds ASCII case. From DEST's own listing; with
+    /// DEST absent, from its parent's, read once; with DEST present but nothing in its listing to probe with (empty,
+    /// unusable or failed), from its parent only if both are `Strong` on one volume: an existing DEST can be a mount
+    /// point or carry its own case flag, and a decided answer from the wrong directory is a favourable guess.
+    fn dry_fold(&self, listing: Option<&[DirEntry]>) -> Option<bool> {
+        let holder = self.tree.holder;
+        let Some(dest) = self.tree.dest.as_ref() else {
+            return folds_ascii_case(holder, &holder.read_dir().ok()?);
+        };
+        if let Some(entries) = listing
+            && entries.iter().any(|e| fold_candidate(e).is_some())
+        {
+            return folds_ascii_case(dest, entries);
+        }
+        // A filesystem root is its own holder: no parent.
+        self.tree.name.as_ref()?;
+        match (dest.identity().ok()?, holder.identity().ok()?) {
+            (FileIdentity::Strong(d), FileIdentity::Strong(p)) if d.volume == p.volume => {
+                folds_ascii_case(holder, &holder.read_dir().ok()?)
+            }
+            _ => None,
+        }
     }
 
     /// Group 2: what is at `DEST/<name>` now. An object of the other kind than the root is a collision; a file root
@@ -3320,5 +3449,342 @@ mod trees_tests {
             })
         );
         assert_eq!(statuses(&r), vec![RootStatus::Completed; 2]);
+    }
+
+    // ----- Several sources, --dry-run: the fold-probe (cut 18 task 4) -----
+
+    const CASE_NAMES: [&str; 2] = ["Data", "data"];
+
+    /// `dry_fake` with the sources `Data`, `Mid` and `data` (made while the fake is case-sensitive: they differ only by
+    /// case), then folding set to `fold`.
+    fn case_fake(fold: bool) -> FaultFs {
+        let fs = dry_fake();
+        for n in ["Data", "Mid", "data"] {
+            fs.create_dir(Path::new("/src").join(n).as_path()).unwrap();
+            fs.write_file(format!("/src/{n}/k"), n.as_bytes());
+        }
+        fs.set_case_insensitive(fold);
+        fs
+    }
+
+    /// A DEST holding `entries` (files), over `case_fake(fold)`.
+    fn case_dest(fold: bool, entries: &[&str]) -> FaultFs {
+        let fs = case_fake(false);
+        fs.create_dir(Path::new("/p/dest")).unwrap();
+        for e in entries {
+            fs.write_file(format!("/p/dest/{e}"), b"");
+        }
+        fs.set_case_insensitive(fold);
+        fs
+    }
+
+    /// DEST holds the lock file of a crashed run for each of `locked`, in the spelling given, over a folding fake.
+    fn residue_of(locked: &[&str]) -> FaultFs {
+        let fs = case_fake(true);
+        fs.create_dir(Path::new("/p/dest")).unwrap();
+        let dest = fs.destination_root(Path::new("/p/dest")).unwrap();
+        let crashed = PrefixIdOwned {
+            operation_id: "55555555555555555555555555555555".to_string(),
+            owner_instance_id: "dead".to_string(),
+            boot_session_id: "old-boot".to_string(),
+            now: 5,
+        };
+        let (held, _) = PrefixLocks::acquire(
+            &dest,
+            LockCapability::LocalStrong,
+            &os(locked),
+            &crashed.as_ref(),
+        )
+        .unwrap();
+        drop(held);
+        fs
+    }
+
+    /// The dry run on `build()`, with the calls it made.
+    fn dry_with_calls(build: impl Fn() -> FaultFs, names: &[&str]) -> (MultiRun, Vec<String>) {
+        let fs = build();
+        let base = calls(&fs).len();
+        let (dry, _) = dry_names(&fs, names);
+        (dry, calls(&fs)[base..].to_vec())
+    }
+
+    fn proceeds(r: &MultiRun) {
+        assert!(r.run.stop.is_none(), "{:?}", r.run.stop);
+        assert!(r.run.dry.is_some());
+    }
+
+    fn collides(r: &MultiRun) {
+        let (code, detail) = refusal_of(r);
+        assert_eq!(code, LockCode::DestinationNamespaceCollision, "{detail}");
+        assert!(detail.contains("are one name on this filesystem"), "{detail}");
+    }
+
+    #[test]
+    fn a_residue_lock_file_is_an_alias_for_two_case_equal_names() {
+        // T14: the lock file of one spelling is the file of the other.
+        let (_, code) = dry_refuses_as_real(|| residue_of(&["Data"]), &CASE_NAMES);
+        assert_eq!(code, LockCode::DestinationNamespaceCollision);
+        // The mirror.
+        let (_, code) = dry_refuses_as_real(|| residue_of(&["data"]), &CASE_NAMES);
+        assert_eq!(code, LockCode::DestinationNamespaceCollision);
+        // Three roots, the twins apart in prefix order (bytewise: Data, Mid, data).
+        let (dry, code) = dry_refuses_as_real(|| residue_of(&["Data"]), &["Data", "Mid", "data"]);
+        assert_eq!(code, LockCode::DestinationNamespaceCollision);
+        collides(&dry);
+
+        // The listing of DEST fails: the alias is still reported (it needs no listing).
+        let reference = residue_of(&["Data"]);
+        let base = calls(&reference).len();
+        dry_names(&reference, &CASE_NAMES);
+        let n = nth_of_after(&reference, base, "read_dir", "(/p/dest)");
+        let fs = residue_of(&["Data"]);
+        fs.fail_nth("read_dir", n, Code::IoError, ErrorKind::PermissionDenied);
+        let (dry, _) = dry_names(&fs, &CASE_NAMES);
+        collides(&dry);
+
+        // Equal Unavailable, and separately equal Weak, identities decide nothing.
+        for identity in
+            [FileIdentity::Unavailable, FileIdentity::Weak(ObjectId { volume: 3, index: 4 })]
+        {
+            let fs = residue_of(&["Data"]);
+            fs.set_identity("/p/dest/Data.flux-lock", identity);
+            let (dry, _) = dry_names(&fs, &CASE_NAMES);
+            proceeds(&dry);
+        }
+
+        // Two hardlinked existing targets, no lock file: not an alias (a previous copy under `Hardlinks::Auto`).
+        let fs = case_dest(false, &[]);
+        for n in ["Data", "data"] {
+            fs.create_dir(Path::new("/p/dest").join(n).as_path()).unwrap();
+            fs.set_identity(format!("/p/dest/{n}"), strong_id(77));
+        }
+        let (dry, _) = dry_names(&fs, &CASE_NAMES);
+        proceeds(&dry);
+    }
+
+    /// `nth_of` over the calls after the first `base`.
+    fn nth_of_after(fs: &FaultFs, base: usize, op: &str, needle: &str) -> u32 {
+        let head = format!("{op}(");
+        let mut n = 0;
+        for c in &calls(fs)[base..] {
+            if c.starts_with(&head) {
+                n += 1;
+                if c.contains(needle) {
+                    return n;
+                }
+            }
+        }
+        panic!("no {op} mentioning {needle}");
+    }
+
+    /// How many times the parent `/p` was listed. The destination lock's own leftover scan lists it once in every dry
+    /// run, so a probe that read the parent makes two.
+    fn parent_listings(log: &[String]) -> usize {
+        log.iter().filter(|c| *c == "read_dir(/p)").count()
+    }
+
+    fn mentions(log: &[String], op: &str, path: &str) -> bool {
+        log.iter().any(|c| c == &format!("{op}({path})"))
+    }
+
+    fn with_parent_entry(fold: bool, dest: Option<&[&str]>) -> impl Fn() -> FaultFs {
+        let dest: Option<Vec<String>> = dest.map(|d| d.iter().map(|s| s.to_string()).collect());
+        move || {
+            let fs = case_fake(false);
+            fs.write_file("/p/q", b"");
+            if let Some(entries) = &dest {
+                fs.create_dir(Path::new("/p/dest")).unwrap();
+                for e in entries {
+                    fs.write_file(format!("/p/dest/{e}"), b"");
+                }
+            }
+            fs.set_case_insensitive(fold);
+            fs
+        }
+    }
+
+    fn real_proceeds(build: impl Fn() -> FaultFs, names: &[&str]) {
+        let fs = build();
+        let (real, _) = go(&fs, names);
+        ok(&real);
+    }
+
+    #[test]
+    fn the_fold_probe_decides_from_the_listing_of_a_directory() {
+        // (1) DEST absent: the parent's entry decides.
+        let build = with_parent_entry(true, None);
+        let (_, code) = dry_refuses_as_real(&build, &CASE_NAMES);
+        assert_eq!(code, LockCode::DestinationNamespaceCollision);
+        let (_, log) = dry_with_calls(&build, &CASE_NAMES);
+        assert_eq!(parent_listings(&log), 2, "{log:?}");
+        // (2) folding off: the plan goes on, as the real run does.
+        let build = with_parent_entry(false, None);
+        real_proceeds(&build, &CASE_NAMES);
+        let (dry, _) = dry_with_calls(&build, &CASE_NAMES);
+        proceeds(&dry);
+
+        // (2b) eight entries, folding off: decided at the first candidate in bytewise order.
+        let build = with_parent_entry(false, Some(&["a", "b", "c", "d", "e", "f", "g", "h"]));
+        real_proceeds(&build, &CASE_NAMES);
+        let (dry, log) = dry_with_calls(&build, &CASE_NAMES);
+        proceeds(&dry);
+        assert_eq!(parent_listings(&log), 1, "{log:?}");
+        for n in ["b", "c", "d", "e", "f", "g", "h", "B", "C", "D", "E", "F", "G", "H"] {
+            assert!(!mentions(&log, "metadata", &format!("/p/dest/{n}")), "{n}: {log:?}");
+        }
+
+        // (3) DEST holds an entry, folding on: collision, and the parent is not read.
+        let build = with_parent_entry(true, Some(&["q"]));
+        let (_, code) = dry_refuses_as_real(&build, &CASE_NAMES);
+        assert_eq!(code, LockCode::DestinationNamespaceCollision);
+        let (_, log) = dry_with_calls(&build, &CASE_NAMES);
+        assert_eq!(parent_listings(&log), 1, "{log:?}");
+
+        // (4) DEST holds nothing with a letter, the parent is on its volume: the parent decides.
+        let build = with_parent_entry(true, Some(&["1", "2"]));
+        let (_, code) = dry_refuses_as_real(&build, &CASE_NAMES);
+        assert_eq!(code, LockCode::DestinationNamespaceCollision);
+        let (_, log) = dry_with_calls(&build, &CASE_NAMES);
+        assert_eq!(parent_listings(&log), 2, "{log:?}");
+        // (4b) the parent is on another volume: undecided (the real run refuses; the blind spot).
+        let other_volume = || {
+            let fs = with_parent_entry(true, Some(&["1", "2"]))();
+            fs.set_identity("/p", FileIdentity::Strong(ObjectId { volume: 99, index: 5 }));
+            fs
+        };
+        let (dry, _) = dry_with_calls(other_volume, &CASE_NAMES);
+        proceeds(&dry);
+        // (4c) DEST's listing fails: the parent decides on one volume, and nothing decides on two.
+        let build = with_parent_entry(true, Some(&["q"]));
+        let reference = build();
+        let base = calls(&reference).len();
+        dry_names(&reference, &CASE_NAMES);
+        let n = nth_of_after(&reference, base, "read_dir", "(/p/dest)");
+        let fs = build();
+        fs.fail_nth("read_dir", n, Code::IoError, ErrorKind::PermissionDenied);
+        let base = calls(&fs).len();
+        let (dry, _) = dry_names(&fs, &CASE_NAMES);
+        collides(&dry);
+        assert_eq!(parent_listings(&calls(&fs)[base..]), 2);
+        let fs = build();
+        fs.set_identity("/p", FileIdentity::Strong(ObjectId { volume: 99, index: 5 }));
+        fs.fail_nth("read_dir", n, Code::IoError, ErrorKind::PermissionDenied);
+        let base = calls(&fs).len();
+        let (dry, _) = dry_names(&fs, &CASE_NAMES);
+        proceeds(&dry);
+        assert_eq!(parent_listings(&calls(&fs)[base..]), 1);
+
+        // (5) no ASCII letter anywhere: undecided. DEST is `/1/2`, so the parent holds nothing but `2`.
+        let fs = case_fake(false);
+        for d in ["/1", "/1/2"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        fs.set_case_insensitive(true);
+        let specs = CASE_NAMES.map(spec).to_vec();
+        let r = trees(&fs, specs, Path::new("/1/2"), &opts(), &dry_cfg(), &mut |_| {});
+        proceeds(&r);
+
+        // (6) `Ab` and `ab` coexist: case-sensitive, no refusal.
+        let build = || case_dest(false, &["Ab", "ab"]);
+        real_proceeds(build, &CASE_NAMES);
+        let (dry, _) = dry_with_calls(build, &CASE_NAMES);
+        proceeds(&dry);
+
+        // (7) no two names equal after ASCII lower-casing: no probe.
+        for names in [&["a", "b"][..], &["\u{c9}", "\u{e9}"][..]] {
+            let build = || {
+                let fs = with_parent_entry(true, Some(&["q"]))();
+                for n in names {
+                    fs.create_dir(Path::new("/src").join(n).as_path()).ok();
+                    fs.write_file(format!("/src/{n}/k"), b"k");
+                }
+                fs
+            };
+            let (dry, log) = dry_with_calls(build, names);
+            proceeds(&dry);
+            assert_eq!(parent_listings(&log), 1, "{log:?}");
+            assert!(!mentions(&log, "metadata", "/p/dest/Q"), "{log:?}");
+            assert!(!mentions(&log, "metadata", "/p/dest/q"), "{log:?}");
+        }
+
+        // (8) a name that is not UTF-8 is not a candidate.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let odd = OsString::from_vec(vec![0xff, b'a']);
+            let build = || {
+                let fs = case_dest(true, &[]);
+                fs.write_file(Path::new("/p/dest").join(&odd), b"");
+                fs
+            };
+            let (dry, log) = dry_with_calls(build, &CASE_NAMES);
+            collides(&dry);
+            assert!(
+                !log.iter().any(|c| c.starts_with("metadata(") && c.contains('\u{fffd}')),
+                "{log:?}"
+            );
+        }
+
+        // (9) an undecidable candidate is passed over, whichever way it is undecidable.
+        for undecided in
+            [FileIdentity::Unavailable, FileIdentity::Weak(ObjectId { volume: 1, index: 424_242 })]
+        {
+            let build = || {
+                let fs = case_dest(true, &["a", "b"]);
+                fs.set_identity("/p/dest/a", undecided);
+                fs
+            };
+            let (dry, _) = dry_with_calls(build, &CASE_NAMES);
+            collides(&dry);
+            // Nothing else to ask: undecided, no refusal.
+            let alone = || {
+                let fs = case_dest(true, &["a"]);
+                fs.set_identity("/p/dest/a", undecided);
+                fs
+            };
+            let (dry, _) = dry_with_calls(alone, &CASE_NAMES);
+            proceeds(&dry);
+        }
+        // The cap: eight undecidable entries stop the walk before the thirty-two decidable ones.
+        let build = || {
+            let fs = case_dest(true, &[]);
+            for i in 0..8 {
+                fs.write_file(format!("/p/dest/u{i}"), b"");
+                fs.set_identity(format!("/p/dest/u{i}"), FileIdentity::Unavailable);
+            }
+            for i in 0..32 {
+                fs.write_file(format!("/p/dest/z{i:02}"), b"");
+            }
+            fs
+        };
+        let (dry, log) = dry_with_calls(build, &CASE_NAMES);
+        proceeds(&dry);
+        let asked = |c: &String, p: &str| c.starts_with("metadata(") && c.contains(p);
+        let probed = log.iter().filter(|c| asked(c, "/p/dest/u") || asked(c, "/p/dest/U")).count();
+        assert!((1..=16).contains(&probed), "{probed}: {log:?}");
+        assert!(!log.iter().any(|c| asked(c, "/p/dest/z") || asked(c, "/p/dest/Z")), "{log:?}");
+
+        // (10) a residue lock file and the probe both apply: one collision.
+        let (dry, code) = dry_refuses_as_real(
+            || {
+                let fs = residue_of(&["Data"]);
+                fs.write_file("/p/dest/q", b"");
+                fs
+            },
+            &CASE_NAMES,
+        );
+        assert_eq!(code, LockCode::DestinationNamespaceCollision);
+        collides(&dry);
+
+        // (11) an earlier root whose lock cannot be read is reported before the collision.
+        let (_, code) = dry_refuses_as_real(
+            || {
+                let fs = case_dest(true, &["q"]);
+                fs.write_file("/p/dest/Data.flux-lock", b"");
+                fs
+            },
+            &CASE_NAMES,
+        );
+        assert_eq!(code, LockCode::TargetLockUncertain);
     }
 }
