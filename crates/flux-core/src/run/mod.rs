@@ -274,6 +274,9 @@ pub enum RunWarning {
     DryRunLockTakeover { why: String },
     /// Cut 11b: a dry run found a broken leftover (`name`) beside the state that a real run would remove.
     DryRunBrokenLeftover { name: String },
+    /// Cut 18: a dry run over several sources read these prefix locks' records (lossy names, in prefix order); their
+    /// owners' liveness was not probed.
+    DryRunPrefixLocks { names: Vec<String> },
     /// Cut 11b: a dry run found debris (`name`) in the state directory that a real run would remove.
     DryRunDebris { name: String },
     /// Cut 11b: a dry resume found the prior's claim store freshly created (empty), so it has no claims to count.

@@ -796,6 +796,10 @@ pub fn run_warning_line(w: &RunWarning) -> String {
         RunWarning::DryRunBrokenLeftover { name } => {
             format!("note: an interrupted lock recovery left {name}; a real run classifies it")
         }
+        RunWarning::DryRunPrefixLocks { names } => format!(
+            "note: the prefix lock records of {} are readable; their owners' liveness was not probed; a real run refuses with TARGET_LOCK_BUSY for each whose OS lock is held",
+            names.join(", ")
+        ),
         RunWarning::DryRunDebris { name } => {
             format!("note: a real run would remove the workspace debris {name}")
         }
@@ -2171,6 +2175,17 @@ mod tests {
         for (w, want) in &cases {
             assert_eq!(run_warning_line(w), *want);
         }
+    }
+
+    #[test]
+    fn dry_run_prefix_locks_renders_its_names_joined() {
+        let w = RunWarning::DryRunPrefixLocks { names: vec!["a".into(), "b".into()] };
+        assert_eq!(
+            run_warning_line(&w),
+            "note: the prefix lock records of a, b are readable; their owners' liveness was not probed; a real run refuses with TARGET_LOCK_BUSY for each whose OS lock is held"
+        );
+        let one = RunWarning::DryRunPrefixLocks { names: vec!["only".into()] };
+        assert!(run_warning_line(&one).starts_with("note: the prefix lock records of only are"));
     }
 
     #[test]

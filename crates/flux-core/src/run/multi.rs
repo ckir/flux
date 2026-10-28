@@ -8,7 +8,7 @@
 //! source. Its `create` makes DEST, takes the prefix locks inside it, checks the names the sources take, and only then
 //! makes the workspace, so a refusal at any of those finds no workspace and releases every lock it took.
 
-use super::dry_prior::dry_restart;
+use super::dry_prior::{LockPreview, broken_leftovers, dry_lock_record, dry_restart};
 use super::place::{AdoptedStore, LocatedTree, Place, TreePlace, locate_dest, refused_state};
 use super::prefix::{PrefixId, PrefixIdOwned, PrefixLocks, PrefixRefusal};
 use super::roots::{SourceKind, SourceSpec, plan_roots};
@@ -18,7 +18,7 @@ use super::{
     checkpoint_policy, drive, dry_hardlink_slot, dry_start,
 };
 use crate::copy::{CopyError, CopyStep, no_heartbeat, unguarded};
-use crate::dry_run::{DryPrior, NullClaimStore};
+use crate::dry_run::{DryPrior, DryRun, NullClaimStore};
 use crate::lock::{LockCode, LockError, LockResult, LockSite, Refusal, check_capability};
 use crate::prior::{PriorOp, Scan, check_control_plane};
 use crate::state::{
@@ -158,6 +158,100 @@ impl<'p, F: DestinationRoot> MultiPlace<'p, F> {
                 from_lock(error, RunStep::Lock, &self.lock_path(&name), false)
             }
         }
+    }
+
+    /// The dry run's preview of what `create` does between making DEST and making the workspace (spec 4.2 step 2): every
+    /// prefix lock's file read in prefix order, then the targets checked, so a refusal has the order of the real run's.
+    /// A no-op while DEST is absent. The notes (the aggregate of the readable prefix locks, the `.broken.` leftovers) and
+    /// `owner_liveness` are set only once every lock has passed, and are kept when the target check then refuses, as the
+    /// real run's leftovers are pushed before its `check_targets`.
+    pub(crate) fn dry_create_preview(
+        &self,
+        dry: &mut DryRun,
+        warnings: &mut Vec<RunWarning>,
+    ) -> Result<(), RunError> {
+        let Some(dest) = self.tree.dest.as_ref() else { return Ok(()) };
+        // One listing for every leftover scan; the scan is best-effort, as `dry_lock`'s.
+        let listing = dest.read_dir().ok();
+        let now = wall_time_ns();
+        let mut seen: Vec<(FileIdentity, &OsString)> = Vec::new();
+        let mut recorded: Vec<String> = Vec::new();
+        for root in &self.roots {
+            let name = &root.name;
+            let site = LockSite::directory(dest, name).map_err(|error| {
+                self.prefix_error(PrefixRefusal::Lock { name: name.clone(), error })
+            })?;
+            let lock_found = match dest.metadata(site.lock_name()) {
+                Ok(found) => {
+                    // The lock files of two names are one file where the filesystem folds the names together; the
+                    // targets are not compared (two hardlinked targets are a legitimate copy).
+                    if let FileIdentity::Strong(id) = found.identity {
+                        if let Some((_, other)) = seen
+                            .iter()
+                            .find(|(s, _)| matches!(s, FileIdentity::Strong(o) if *o == id))
+                        {
+                            return Err(self.prefix_error(PrefixRefusal::Collision {
+                                name: name.clone(),
+                                other: (*other).clone(),
+                            }));
+                        }
+                        seen.push((found.identity, name));
+                    }
+                    true
+                }
+                Err(_) => false,
+            };
+            // `acquire` looks for `.flux-dir.lock` only after it created this name's lock file; an existing file goes
+            // straight to its classification.
+            if !lock_found {
+                let present = site.dir_lock_present().map_err(|error| {
+                    self.prefix_error(PrefixRefusal::Lock { name: name.clone(), error })
+                })?;
+                if present {
+                    let busy = LockError::Refused(Box::new(Refusal {
+                        code: LockCode::TargetLockBusy,
+                        holder: None,
+                        // The text of `lock/acquire.rs`'s `S96_1_dircheck`.
+                        detail:
+                            "a directory lock (.flux-dir.lock) is present beside the target's lock"
+                                .to_string(),
+                    }));
+                    return Err(
+                        self.prefix_error(PrefixRefusal::Lock { name: name.clone(), error: busy })
+                    );
+                }
+            }
+            // A scratch for the record note: one aggregate replaces the per-lock notes.
+            let mut scratch = Vec::new();
+            match dry_lock_record(&site, false, self.capability, now, &mut scratch).0 {
+                LockPreview::Refused(error) => {
+                    return Err(
+                        self.prefix_error(PrefixRefusal::Lock { name: name.clone(), error })
+                    );
+                }
+                LockPreview::Error(e) => {
+                    return Err(self.prefix_error(PrefixRefusal::Lock {
+                        name: name.clone(),
+                        error: LockError::Io(e),
+                    }));
+                }
+                LockPreview::Recorded(_) => recorded.push(name.to_string_lossy().into_owned()),
+                // `break_lock` is false, so a takeover is not offered.
+                LockPreview::Absent | LockPreview::Takeover(_) => {}
+            }
+        }
+        if !recorded.is_empty() {
+            warnings.push(RunWarning::DryRunPrefixLocks { names: recorded });
+            dry.owner_liveness = true;
+        }
+        if let Some(entries) = &listing {
+            for root in &self.roots {
+                let mut lock_name = root.name.clone();
+                lock_name.push(".flux-lock");
+                broken_leftovers(entries, &lock_name, warnings);
+            }
+        }
+        self.check_targets_in(dest)
     }
 
     /// Group 2: what is at `DEST/<name>` now. An object of the other kind than the root is a collision; a file root
@@ -726,7 +820,7 @@ fn dry_trees<F: DestinationRoot>(
         cfg,
         &mut restart_preview,
         &mut resume_preview,
-        &mut |_, _| Ok(()),
+        &mut |dry, warnings| place.dry_create_preview(dry, warnings),
         &mut run.warnings,
     ) {
         DryStart::Plan(dry) => dry,
@@ -2884,5 +2978,347 @@ mod trees_tests {
         let Some(Err(abort)) = &r.run.copy else { panic!("expected an abort: {:?}", r.run.copy) };
         assert!(abort.refused_unchanged(), "{abort:?}");
         assert_eq!(abort.outcome.directories_created, 0);
+    }
+
+    // ----- Several sources, --dry-run: the prefix locks, the directory lock, the targets and --restart (cut 18 task 3) -----
+
+    /// The code and detail of a run that stopped with a refusal.
+    fn refusal_of(r: &MultiRun) -> (LockCode, String) {
+        match &r.run.stop {
+            Some(RunError::Refused { refusal, .. }) => (refusal.code, refusal.detail.clone()),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// The real run on `build()` and the dry run on another `build()` refuse with the same code and text. Returns the
+    /// dry run.
+    fn dry_refuses_as_real(build: impl Fn() -> FaultFs, names: &[&str]) -> (MultiRun, LockCode) {
+        let real_fs = build();
+        let (real, _) = go(&real_fs, names);
+        let want = refusal_of(&real);
+        let fs = build();
+        let base = calls(&fs).len();
+        let (dry, got) = dry_names(&fs, names);
+        assert_eq!(refusal_of(&dry), want, "{names:?}");
+        assert!(got.is_empty(), "nothing is streamed on a refusal: {got:?}");
+        assert!(dry.run.copy.is_none() && dry.roots.is_empty());
+        crate::run::tests::forbidden_in(&calls(&fs)[base..]);
+        (dry, want.0)
+    }
+
+    fn strong_id(index: u128) -> FileIdentity {
+        FileIdentity::Strong(ObjectId { volume: 1, index: 9_500_000 + index })
+    }
+
+    fn with_dest(build: impl Fn(&FaultFs) + Copy) -> impl Fn() -> FaultFs {
+        move || {
+            let fs = dry_fake();
+            fs.create_dir(Path::new("/p/dest")).unwrap();
+            build(&fs);
+            fs
+        }
+    }
+
+    #[test]
+    fn dry_refusals_match_the_real_run() {
+        // A file root over a directory.
+        let (_, code) = dry_refuses_as_real(
+            with_dest(|fs| fs.create_dir(Path::new("/p/dest/f")).unwrap()),
+            &["a", "f"],
+        );
+        assert_eq!(code, LockCode::DestinationNamespaceCollision);
+        // A folder root over a file.
+        let (_, code) = dry_refuses_as_real(
+            with_dest(|fs| fs.write_file("/p/dest/a", b"in the way")),
+            &["a", "b"],
+        );
+        assert_eq!(code, LockCode::DestinationNamespaceCollision);
+        // An empty lock record.
+        let (_, code) = dry_refuses_as_real(
+            with_dest(|fs| fs.write_file("/p/dest/a.flux-lock", b"")),
+            &["a", "b"],
+        );
+        assert_eq!(code, LockCode::TargetLockUncertain);
+        // An orphan: the record names a workspace that is not there.
+        let orphan = with_dest(|fs| {
+            let dest = fs.destination_root(Path::new("/p/dest")).unwrap();
+            let site = crate::lock::LockSite::directory(&dest, &OsString::from("a")).unwrap();
+            let id = "33333333333333333333333333333333";
+            let rec = crate::lock::test_support::record(&site, id, &format!("operations/{id}"));
+            crate::lock::test_support::dead_lock(&dest, "a.flux-lock", &rec.encode());
+        });
+        let (_, code) = dry_refuses_as_real(orphan, &["a", "b"]);
+        assert_eq!(code, LockCode::ArtifactOwnershipUncertain);
+        // A foreign file: more bytes than a record holds.
+        let (_, code) = dry_refuses_as_real(
+            with_dest(|fs| fs.write_file("/p/dest/a.flux-lock", &vec![b'x'; 5000])),
+            &["a", "b"],
+        );
+        assert_eq!(code, LockCode::ControlPlaneNamespaceConflict);
+        // The source directory itself at DEST/a; and the source file itself at DEST/f.
+        let same_dir = with_dest(|fs| {
+            fs.create_dir(Path::new("/p/dest/a")).unwrap();
+            fs.set_identity("/src/a", strong_id(1));
+            fs.set_identity("/p/dest/a", strong_id(1));
+        });
+        let (_, code) = dry_refuses_as_real(same_dir, &["a", "b"]);
+        assert_eq!(code, LockCode::SafetyRejected);
+        let same_file = with_dest(|fs| {
+            fs.write_file("/p/dest/f", b"F");
+            fs.set_identity("/src/f", strong_id(2));
+            fs.set_identity("/p/dest/f", strong_id(2));
+        });
+        let (_, code) = dry_refuses_as_real(same_file, &["a", "f"]);
+        assert_eq!(code, LockCode::SafetyRejected);
+
+        // Order: the lock of a root before its own target; every lock before every target.
+        let both = with_dest(|fs| {
+            fs.write_file("/p/dest/a.flux-lock", b"");
+            fs.write_file("/p/dest/a", b"in the way");
+        });
+        let (_, code) = dry_refuses_as_real(both, &["a", "b"]);
+        assert_eq!(code, LockCode::TargetLockUncertain);
+        let across = with_dest(|fs| {
+            fs.write_file("/p/dest/a", b"in the way");
+            fs.write_file("/p/dest/b.flux-lock", b"");
+        });
+        let (r, code) = dry_refuses_as_real(across, &["a", "b"]);
+        assert_eq!(code, LockCode::TargetLockUncertain);
+        assert!(refusal_of(&r).1.contains("b.flux-lock"), "{:?}", refusal_of(&r));
+
+        // The directory lock is looked at for the first name whose lock file is absent, and only there.
+        let dir_lock = with_dest(|fs| fs.write_file("/p/dest/.flux-dir.lock", b""));
+        let (r, code) = dry_refuses_as_real(dir_lock, &["a", "b"]);
+        assert_eq!(code, LockCode::TargetLockBusy);
+        assert!(refusal_of(&r).1.contains("a.flux-lock"), "{:?}", refusal_of(&r));
+        let after_unreadable = with_dest(|fs| {
+            fs.write_file("/p/dest/.flux-dir.lock", b"");
+            fs.write_file("/p/dest/a.flux-lock", b"");
+        });
+        let (_, code) = dry_refuses_as_real(after_unreadable, &["a", "b"]);
+        assert_eq!(code, LockCode::TargetLockUncertain);
+    }
+
+    #[test]
+    fn dry_run_over_hardlinked_file_roots_is_not_an_alias_refusal() {
+        let files = || {
+            ["h1", "h2"]
+                .map(|n| SourceSpec {
+                    src: Path::new("/src").join(n),
+                    name: OsString::from(n),
+                    kind: SourceKind::File,
+                })
+                .to_vec()
+        };
+        let fs = dry_fake();
+        fs.write_file("/src/h1", b"shared");
+        let (d1, d2) = (
+            fs.destination_root(Path::new("/src")).unwrap(),
+            fs.destination_root(Path::new("/src")).unwrap(),
+        );
+        d2.create_hardlink(OsStr::new("h2"), &d1, OsStr::new("h1")).unwrap();
+        let (real, _) = go_with(&fs, files(), &opts(), &cfg());
+        ok(&real);
+        let (d1, d2) = (
+            fs.destination_root(Path::new("/p/dest")).unwrap(),
+            fs.destination_root(Path::new("/p/dest")).unwrap(),
+        );
+        let id = |d: &<FaultFs as DestinationRoot>::Dir, n: &str| {
+            d.metadata(OsStr::new(n)).unwrap().identity
+        };
+        assert_eq!(id(&d1, "h1"), id(&d2, "h2"), "the real run hardlinked the targets");
+
+        let skip = CopyOptions { existing: ExistingPolicy::SkipExisting, ..opts() };
+        let (r, _) = go_with(&fs, files(), &skip, &dry_cfg());
+
+        assert!(r.run.stop.is_none(), "{:?}", r.run.stop);
+        assert_eq!(ok(&r).files_skipped, 2, "{:?}", counters(ok(&r)));
+        assert_eq!(ok(&r).files_copied, 0);
+    }
+
+    /// DEST holding the prefix locks of a crashed run for `names`, with no resumable operation.
+    fn dead_prefix_locks(fs: &FaultFs, names: &[&str]) {
+        let dest = fs.destination_root(Path::new("/p/dest")).unwrap();
+        let crashed = PrefixIdOwned {
+            operation_id: "55555555555555555555555555555555".to_string(),
+            owner_instance_id: "dead".to_string(),
+            boot_session_id: "old-boot".to_string(),
+            now: 5,
+        };
+        let (held, _) =
+            PrefixLocks::acquire(&dest, LockCapability::LocalStrong, &os(names), &crashed.as_ref())
+                .unwrap();
+        drop(held);
+    }
+
+    fn prefix_note_names(r: &MultiRun) -> Vec<Vec<String>> {
+        r.run
+            .warnings
+            .iter()
+            .filter_map(|w| match w {
+                RunWarning::DryRunPrefixLocks { names } => Some(names.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn liveness(r: &MultiRun) -> bool {
+        r.run.dry.as_ref().expect("the dry flags").owner_liveness
+    }
+
+    fn lock_record_notes(r: &MultiRun) -> usize {
+        r.run.warnings.iter().filter(|w| matches!(w, RunWarning::DryRunLockRecord { .. })).count()
+    }
+
+    #[test]
+    fn prefix_lock_notes_are_one_aggregate_and_survive_a_target_refusal() {
+        // Two readable trusted prefix locks and no resumable prior: one aggregate note, no refusal.
+        let fs = dest_only();
+        dead_prefix_locks(&fs, &["a", "b"]);
+        assert_eq!(prefix_lock_files(&fs).len(), 2);
+        let (r, _) = dry_names(&fs, &["a", "b"]);
+        assert!(r.run.stop.is_none(), "{:?}", r.run.stop);
+        assert_eq!(prefix_note_names(&r), [["a", "b"]]);
+        assert_eq!(lock_record_notes(&r), 0);
+        assert!(liveness(&r));
+
+        // Negative control: no lock files.
+        let fs = dest_only();
+        let (r, _) = dry_names(&fs, &["a", "b"]);
+        assert!(r.run.stop.is_none(), "{:?}", r.run.stop);
+        assert!(prefix_note_names(&r).is_empty());
+        assert!(!liveness(&r));
+
+        // Mixed: root 1 readable, root 2 unreadable: root 2's refusal, none of root 1's notes.
+        let fs = dest_only();
+        dead_prefix_locks(&fs, &["a"]);
+        fs.write_file("/p/dest/b.flux-lock", b"");
+        let (r, _) = dry_names(&fs, &["a", "b"]);
+        let (code, detail) = refusal_of(&r);
+        assert_eq!(code, LockCode::TargetLockUncertain);
+        assert!(detail.contains("b.flux-lock"), "{detail}");
+        assert!(
+            prefix_note_names(&r).is_empty() && lock_record_notes(&r) == 0,
+            "{:?}",
+            r.run.warnings
+        );
+        assert!(!liveness(&r));
+
+        // Combined: root 1 readable plus a leftover, root 2's target the wrong kind: the target's refusal and the notes.
+        let fs = dest_only();
+        dead_prefix_locks(&fs, &["a"]);
+        let broken = format!("a.flux-lock.broken.{ID}");
+        fs.write_file(Path::new("/p/dest").join(&broken), b"");
+        fs.create_dir(Path::new("/p/dest/f")).unwrap();
+        let (r, _) = dry_names(&fs, &["a", "f"]);
+        assert_eq!(refusal_of(&r).0, LockCode::DestinationNamespaceCollision);
+        assert_eq!(prefix_note_names(&r), [["a"]]);
+        assert!(liveness(&r));
+        let at = |want: &dyn Fn(&RunWarning) -> bool| r.run.warnings.iter().position(want);
+        let record = at(&|w| matches!(w, RunWarning::DryRunPrefixLocks { .. })).unwrap();
+        let leftover =
+            at(&|w| matches!(w, RunWarning::DryRunBrokenLeftover { name } if *name == broken));
+        assert!(record < leftover.expect("the leftover is noted"), "{:?}", r.run.warnings);
+    }
+
+    fn dry_restart_cfg() -> RunConfig {
+        RunConfig { operation_id: format!("{:032x}", 0x22), restart: true, ..dry_cfg() }
+    }
+
+    fn crashed_ab_dry() -> FaultFs {
+        let fs = crashed_ab();
+        fs.create_dir(Path::new("/tmp")).unwrap();
+        fs
+    }
+
+    fn discards(got: &[TreeFailure]) -> usize {
+        got.iter()
+            .filter(|f| {
+                matches!(&f.cause, crate::tree::TreeFailureCause::Planned(e) if e.action == PlannedAction::Discard)
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_dry_restart_previews_the_supersede_of_a_crashed_run() {
+        let fs = crashed_ab_dry();
+        let base = calls(&fs).len();
+        let specs = ["a", "b"].map(spec).to_vec();
+
+        let (r, got) = go_with(&fs, specs, &opts(), &dry_restart_cfg());
+
+        assert!(r.run.stop.is_none(), "{:?}", r.run.stop);
+        assert_eq!(prefix_note_names(&r), [["a", "b"]]);
+        assert!(liveness(&r));
+        match &r.run.dry.as_ref().unwrap().prior {
+            Some(DryPrior::Restart { superseded, partials_found, states }) => {
+                assert_eq!(superseded.len(), 1, "{superseded:?}");
+                assert_eq!(superseded[0].0, ID);
+                assert_eq!(partials_found, &[PathBuf::from(format!("a/x.flux-partial.{ID}"))]);
+                assert_eq!(*states, 1);
+            }
+            other => panic!("expected a restart preview, got {other:?}"),
+        }
+        assert!(discards(&got) >= 1, "{got:?}");
+        crate::run::tests::forbidden_in(&calls(&fs)[base..]);
+
+        // The ordering row: a wrong-kind target refuses before the supersede is previewed (A2).
+        let fs = crashed_ab_dry();
+        fs.create_dir(Path::new("/p/dest/f")).unwrap();
+        let specs = ["a", "b", "f"].map(spec).to_vec();
+        let (r, got) = go_with(&fs, specs, &opts(), &dry_restart_cfg());
+        assert_eq!(refusal_of(&r).0, LockCode::DestinationNamespaceCollision);
+        assert_eq!(discards(&got), 0, "{got:?}");
+    }
+
+    #[test]
+    fn a_dry_restart_break_lock_takes_over_an_empty_destination_lock() {
+        let cfg_break = || RunConfig { break_lock: true, ..dry_restart_cfg() };
+        let build = || {
+            let fs = empty_dest_lock();
+            fs.create_dir(Path::new("/tmp")).unwrap();
+            fs
+        };
+        let fs = build();
+        let (r, _) = go_with(&fs, ["a", "b"].map(spec).to_vec(), &opts(), &cfg_break());
+        assert!(r.run.stop.is_none(), "{:?}", r.run.stop);
+        assert!(r.run.dry.as_ref().unwrap().lock_takeover);
+
+        // An unreadable prefix lock too: the prefix refusal.
+        let fs = build();
+        fs.write_file("/p/dest/a.flux-lock", b"");
+        let (r, _) = go_with(&fs, ["a", "b"].map(spec).to_vec(), &opts(), &cfg_break());
+        let (code, detail) = refusal_of(&r);
+        assert_eq!(code, LockCode::TargetLockUncertain);
+        assert!(detail.contains("a.flux-lock"), "{detail}");
+    }
+
+    #[test]
+    fn a_plain_dry_run_over_a_crashed_run_refuses_naming_restart() {
+        let fs = crashed_ab_dry();
+        fs.create_dir(Path::new("/p/dest/f")).unwrap();
+        let specs = ["a", "b", "f"].map(spec).to_vec();
+
+        let plain = RunConfig { restart: false, ..dry_restart_cfg() };
+        let (r, got) = go_with(&fs, specs, &opts(), &plain);
+
+        let (code, detail) = refusal_of(&r);
+        assert_eq!(code, LockCode::ResumableOperationExists);
+        assert!(detail.contains("--restart"), "{detail}");
+        assert!(got.is_empty(), "{got:?}");
+
+        // --restart over no DEST at all: nothing to supersede, and the fresh plan.
+        let fs = dry_fake();
+        let (r, _) = go_with(&fs, ["a", "b"].map(spec).to_vec(), &opts(), &dry_restart_cfg());
+        assert!(r.run.stop.is_none(), "{:?}", r.run.stop);
+        assert_eq!(
+            r.run.dry.as_ref().unwrap().prior,
+            Some(DryPrior::Restart {
+                superseded: Vec::new(),
+                partials_found: Vec::new(),
+                states: 0
+            })
+        );
+        assert_eq!(statuses(&r), vec![RootStatus::Completed; 2]);
     }
 }
