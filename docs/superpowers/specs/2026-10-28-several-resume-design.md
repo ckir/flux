@@ -1,6 +1,6 @@
 # `flux copy --resume` with several sources (cut 19)
 
-Status: draft (2026-10-28), branch `feat/several-resume` off main `c7a4798f73f0e309fdca3fad04275f0cb8139fb6`. Not yet reviewed by a panel.
+Status: reviewed (2026-10-28): panel round 1 folded 4 findings, round 2 GREEN. Branch `feat/several-resume` off main `c7a4798f73f0e309fdca3fad04275f0cb8139fb6`.
 
 ## 1. Intent
 
@@ -54,7 +54,7 @@ Order rationale: the locks are the only step of the three that can be undone by 
 A resumed run's `finish` calls `place.remove(&locked.state.operation_id)` (`run/mod.rs:1189`) with the ADOPTED id, which is not this run's id, so `MultiPlace::remove` (`multi.rs:545`) takes its "retire a prior's workspace" branch and releases nothing. That is correct: `drive` calls `settle` before `finish` on every path (`run/mod.rs:701`; the opening-failure path at `460`), and the several-source `settle` is `release_prefix_locks` (`multi.rs:876`), which drains `self.prefix`. The locks are therefore released, in the spec's order (locks before the workspace is retired), before `remove` runs. **Correction (panel round 1, MG-1; the author's earlier draft added an `adopted` id arm to `remove` and said agy had missed a defect: the claim was wrong, agy's statement that the locks are released at the end was right).** The `debug_assert!(!cfg.resume, ..)` at `multi.rs:693` is deleted and its comment, which concerns a supersede, is rewritten. The consequence for tests: an end-to-end resume cannot show that `remove` is right (`settle` hides it), so T2 is the end-to-end assertion that no `*.flux-lock` file remains, and T4 shows the adoption refusals release the locks (the only release `settle` does not cover is the one inside `adopt`, which runs before the walk).
 
 ### 4.5 The real run
-`trees()` (`multi.rs:683`) no longer asserts `!cfg.resume`. `session.rs` step 4 already picks `scan.resumable.remove(0)` under `cfg.resume` and calls `validate(&prior, &place.roots(), ...)` then `place.adopt`; `MultiPlace::roots()` already returns one `Root` per source. The report shows the one-source resume notes (`resume_lines`, `report.rs:830`) and the per-root lines; `files_resumed` is a total. **To verify in the plan:** which counters a resumed several-source report prints per root (the `root <name>:` line shows copied and failed; skipped-as-resumed is in the total).
+`trees()` (`multi.rs:683`) no longer asserts `!cfg.resume`. `session.rs` step 4 already picks `scan.resumable.remove(0)` under `cfg.resume` and calls `validate(&prior, &place.roots(), ...)` then `place.adopt`; `MultiPlace::roots()` already returns one `Root` per source. The report shows the one-source resume notes (`resume_lines`, `report.rs:830`) and the per-root lines; `files_resumed` is a total. The `root <name>: <n> copied, <m> failed` line (`report.rs`, `root_lines`) and the `--json` `roots` entries (`name`, `status`, `files_copied`, `files_failed`) show THIS invocation's counts, so a root finished before the kill prints `0 copied, 0 failed`; the files skipped as already complete are in the totals and the `resumed <k> already-complete files` summary only (panel round 2, measured at `report.rs`). **(call)** no per-root resumed counter is added in this cut; a note in the help and README says so. Exit codes are those of the one-source resume.
 
 ### 4.6 The dry preview
 `dry_trees` (`multi.rs:918`) replaces its refusing `resume_preview` with the one-source shape (`run/mod.rs:1427`): `dry_adopt` on a private copy of the store, parked for the walk; the walk then runs with `claims` = the copy, `resume: true`, `dry_prior: Some(id)`, `dry_partials` set. `dry_adopt` and `adopt_on_copy` (`run/dry_prior.rs:267`, `287`) take a `&TreePlace` and call `place.roots()`, which for the tree inside a `MultiPlace` is the ONE-root answer; they gain a `roots: &[Root]` parameter (the one-source caller passes `place.roots()`).
@@ -70,6 +70,7 @@ CLI (`several_sources.rs`, the Linux-only kill harness cut 17 copied): (T12) kil
 - B1. A prefix lock file of a dead run whose record is unreadable refuses the resume as `TARGET_LOCK_UNCERTAIN` (the text of cut 17 and 18), and the operator removes it or uses `--restart`. This is the existing prefix-lock rule, not a resume decision.
 - B2. A source list that changed since the kill is refused (N1).
 - B3. The cut 18 dry-run blind spots (N2 to N4 of that spec) apply to the dry resume.
+- B4. Each resume that finds dead prefix locks moves them to `<name>.flux-lock.broken.<this run's id>` (unique per run, section 3) and reports them as `BrokenLeftover`; successive kills accumulate them in DEST until `flux cleanup` removes them (`cleanup/discover.rs:322`, discovery of every `<lock>.broken.<id>`).
 
 ## 7. Process
 AGY-FIRST done for F1 to F4 (seam `.clavity/seams/several-resume-fork.md`, `[VERDICT: ALIGNED]`; the author's own claim that agy missed an unreleased-lock defect was wrong: `settle` releases the locks before `finish`, section 4.4). The design then goes to the adversarial panel (AGY-AFTER), then a plan against the code as it is, then subagent-driven execution, capstone and test audit.
@@ -79,4 +80,5 @@ Closed in this document: the flag gate, validate generalisation, adoption order,
 
 ## Stand-downs
 - DISCARDED-BELOW-FLOOR (panel round 1): re-using `MultiPlace::lock_directory`'s cached `OnceCell` handle during `adopt` is unreachable as a problem because `create` and `adopt` are mutually exclusive in one run: `session.rs:181` takes the `adopt` branch, else the `create` branch.
+- Panel round 2: GREEN, seven seats, no findings (Boundary Smuggler, Resource Vampire, Dependency Cynic, Activation Auditor consciously dropped: names are validated before this change; no new resources; no new dependency; no auto-routed component). Two operator-visible facts agy named in its answers were folded as 4.5 and B4.
 - Panel round 1 findings AB-1, CA-1, PP-1, MG-1: each FOLDED into sections 4.2, 4.6 and 4.4 above (MG-1 also retracted the author's earlier 4.4).
