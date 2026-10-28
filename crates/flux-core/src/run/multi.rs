@@ -3562,6 +3562,32 @@ mod trees_tests {
         proceeds(&dry);
     }
 
+    /// T14, the alias rule alone: with DEST on another volume than its parent and its listing failing, the fold-probe
+    /// has nothing to decide with, so only the shared identity of the two lock files can refuse.
+    #[test]
+    fn the_lock_file_alias_refuses_where_the_fold_probe_cannot_decide() {
+        let blind = |fs: &FaultFs| {
+            fs.set_identity("/p", FileIdentity::Strong(ObjectId { volume: 1, index: 1 }));
+            fs.set_identity("/p/dest", FileIdentity::Strong(ObjectId { volume: 2, index: 1 }));
+        };
+        // Control: the same blind probe and no lock file proceeds, so nothing but the alias can refuse below.
+        let fs = case_dest(true, &[]);
+        blind(&fs);
+        let (dry, _) = dry_names(&fs, &CASE_NAMES);
+        proceeds(&dry);
+
+        let reference = residue_of(&["Data"]);
+        blind(&reference);
+        let base = calls(&reference).len();
+        dry_names(&reference, &CASE_NAMES);
+        let n = nth_of_after(&reference, base, "read_dir", "(/p/dest)");
+        let fs = residue_of(&["Data"]);
+        blind(&fs);
+        fs.fail_nth("read_dir", n, Code::IoError, ErrorKind::PermissionDenied);
+        let (dry, _) = dry_names(&fs, &CASE_NAMES);
+        collides(&dry);
+    }
+
     /// `nth_of` over the calls after the first `base`.
     fn nth_of_after(fs: &FaultFs, base: usize, op: &str, needle: &str) -> u32 {
         let head = format!("{op}(");
