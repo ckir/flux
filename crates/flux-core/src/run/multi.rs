@@ -8,9 +8,12 @@
 //! source. Its `create` makes DEST, takes the prefix locks inside it, checks the names the sources take, and only then
 //! makes the workspace, so a refusal at any of those finds no workspace and releases every lock it took.
 
-use super::dry_prior::{LockPreview, broken_leftovers, dry_lock_record, dry_restart};
-use super::place::{AdoptedStore, LocatedTree, Place, TreePlace, locate_dest, refused_state};
+use super::dry_prior::{
+    DryAdopt, LockPreview, broken_leftovers, dry_adopt, dry_lock_record, dry_restart,
+};
+use super::place::{AdoptedStore, LocatedTree, Place, TreePlace, locate_dest};
 use super::prefix::{PrefixId, PrefixIdOwned, PrefixLocks, PrefixRefusal};
+use super::resume::validate;
 use super::roots::{SourceKind, SourceSpec, plan_roots};
 use super::session::{Fault, Locked, failed, from_lock, lock_io};
 use super::{
@@ -30,8 +33,8 @@ use crate::tree::{
 };
 use crate::walk::MountPolicy;
 use flux_fs::{
-    Code, CopyOptions, DestinationRoot, DirEntry, DirHandle, Durability, FileIdentity, FileType,
-    FsError, LockCapability, OperationId,
+    ClaimStore, Code, CopyOptions, DestinationRoot, DirEntry, DirHandle, Durability, FileIdentity,
+    FileType, FsError, LockCapability, OperationId,
 };
 use std::cell::{OnceCell, RefCell};
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -952,12 +955,32 @@ fn dry_trees<F: DestinationRoot>(
             dry_restart(fs, &dest_shown, &operations_shown, priors, warnings, &mut *on_report)
         }
     };
-    // Several sources do not resume: the refusal `MultiPlace::adopt` gives, were a prior resumable.
-    let mut resume_preview = |_: &PriorOp, _: &mut Vec<RunWarning>| {
-        Err(refused_state(
-            LockCode::IncompatibleState,
-            "resuming several sources is not supported in this version".to_string(),
-        ))
+    // Spec 4.6: a dry `--resume` walks against a repaired copy of the prior's store; the copy and the directory holding
+    // it are parked here for the walk, as `dry_tree` parks them.
+    let temp_root = cfg.dry_temp_root.clone().unwrap_or_else(std::env::temp_dir);
+    let mut adopted: super::dry_prior::Parked<F> = None;
+    let place_ref = &place;
+    // The real order (spec 4.6): compatibility, the prefix locks, the targets, then the store copy.
+    let mut resume_preview = |prior: &PriorOp, dry: &mut DryRun, warnings: &mut Vec<RunWarning>| {
+        // Only the early compatibility gate: `dry_adopt` validates again into the caller's `warnings`, so a weak
+        // identity's `ResumeMappingByPath` is pushed once.
+        validate(prior, &Place::roots(place_ref), opts, &mut Vec::new())?;
+        place_ref.dry_create_preview(dry, warnings)?;
+        match dry_adopt(
+            fs,
+            &place_ref.tree,
+            &Place::roots(place_ref),
+            prior,
+            opts,
+            &temp_root,
+            warnings,
+        ) {
+            DryAdopt::Store { temp, claims, prior } => {
+                adopted = Some((temp, claims));
+                Ok(prior)
+            }
+            DryAdopt::Refused(e) => Err(e),
+        }
     };
     let mut dry = match dry_start(
         site,
@@ -976,9 +999,23 @@ fn dry_trees<F: DestinationRoot>(
             return ended_early(run);
         }
     };
-    let temp_root = cfg.dry_temp_root.clone().unwrap_or_else(std::env::temp_dir);
-    let (hardlink_slot, hardlinks_path) = dry_hardlink_slot(fs, &temp_root, cfg, opts);
+    // Declared temp first, store second: the store drops first, then the directory holding its file.
+    let (_temp, store) = match adopted.take() {
+        Some((temp, claims)) => (Some(temp), Some(RefCell::new(claims))),
+        None => (None, None),
+    };
     let null = RefCell::new(NullClaimStore);
+    let claims: &RefCell<dyn ClaimStore> = match &store {
+        Some(store) => store,
+        None => &null,
+    };
+    let prior_id = match &dry.prior {
+        Some(DryPrior::Resume { operation_id, .. }) if store.is_some() => {
+            Some(operation_id.clone())
+        }
+        _ => None,
+    };
+    let (hardlink_slot, hardlinks_path) = dry_hardlink_slot(fs, &temp_root, cfg, opts);
     let partials = std::cell::Cell::new(0u64);
     let src_root = place.tree.src_root.clone();
     let cx = Shared {
@@ -989,13 +1026,13 @@ fn dry_trees<F: DestinationRoot>(
         opts,
         guard: &unguarded,
         beat: &no_heartbeat,
-        claims: Some(&null),
-        resume: false,
+        claims: Some(claims),
+        resume: store.is_some(),
         batch: batch_policy(cfg),
         ckpt: None,
         dry_run: true,
-        dry_prior: None,
-        dry_partials: Some(&partials),
+        dry_prior: prior_id.as_deref(),
+        dry_partials: prior_id.is_some().then_some(&partials),
         key_prefix: None,
         hardlinks: hardlink_slot.as_ref(),
         anchor_root: None,
@@ -1025,6 +1062,7 @@ fn dry_trees<F: DestinationRoot>(
         }
     }
     dry.unprobed_noreplace = true;
+    dry.partials_present = partials.get();
     run.dry = Some(dry);
     run.copy = Some(result);
     let roots = root_reports(&place.roots, done, true);
@@ -3650,6 +3688,172 @@ mod trees_tests {
                 matches!(&f.cause, crate::tree::TreeFailureCause::Planned(e) if e.action == PlannedAction::Discard)
             })
             .count()
+    }
+
+    // ----- Several sources, --dry-run --resume (cut 19 task 4) -----
+
+    fn dry_resume_cfg() -> RunConfig {
+        RunConfig { operation_id: format!("{:032x}", 0x22), resume: true, ..dry_cfg() }
+    }
+
+    /// `crashed_late` with `/tmp` made for the dry run's private store copy.
+    fn crashed_late_dry() -> FaultFs {
+        let fs = crashed_late();
+        fs.create_dir(Path::new("/tmp")).unwrap();
+        fs
+    }
+
+    /// `forbidden_in` for a dry `--resume`, which reads the prior's `state.db` (the one admitted `open_read`) and
+    /// works on the copy's store: the one-source tests' `forbidden_for_resume` is private to them, so this is its
+    /// filter. The publication and upgrade claim calls never happen in a dry run.
+    fn forbidden_for_resume(after: &[String]) {
+        const BANNED: [&str; 5] = [
+            "claim_upgrade",
+            "claim_prepare(",
+            "claim_prepare_many",
+            "claim_commit_prepared",
+            "claim_discard_prepared",
+        ];
+        let mut kept = Vec::new();
+        for c in after {
+            assert!(!BANNED.iter().any(|b| c.starts_with(b)), "{c} in a dry resume: {after:?}");
+            let store_read = c.starts_with("open_read(/p/dest/")
+                && c.contains(".flux/operations/")
+                && c.ends_with("/state.db)");
+            if !c.starts_with("claim_") && !store_read {
+                kept.push(c.clone());
+            }
+        }
+        crate::run::tests::forbidden_in(&kept);
+    }
+
+    fn resumed_plans(got: &[TreeFailure]) -> usize {
+        got.iter()
+            .filter(|f| {
+                matches!(&f.cause, crate::tree::TreeFailureCause::Planned(e) if e.action == PlannedAction::Resume)
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_dry_resume_agrees_with_the_real_resume_and_changes_nothing() {
+        let fs = crashed_late_dry();
+        let base = calls(&fs).len();
+
+        let (r, got) = go_with(&fs, two(), &opts(), &dry_resume_cfg());
+
+        assert!(r.run.stop.is_none(), "{:?}", r.run.stop);
+        match &r.run.dry.as_ref().unwrap().prior {
+            Some(DryPrior::Resume { operation_id, claims, .. }) => {
+                assert_eq!(operation_id, ID);
+                assert!(claims.unwrap() >= 1, "{claims:?}");
+            }
+            other => panic!("expected a resume preview, got {other:?}"),
+        }
+        forbidden_for_resume(&calls(&fs)[base..]);
+
+        let real_fs = crashed_late_dry();
+        let (real, _) = go_with(&real_fs, two(), &opts(), &resume_cfg(0x22));
+        let want = ok(&real).files_resumed;
+        assert!(want >= 1, "{:?}", ok(&real));
+        assert_eq!(ok(&r).files_resumed, want);
+        assert_eq!(resumed_plans(&got) as u64, want, "{got:?}");
+        assert_eq!(ok(&r).files_copied, ok(&real).files_copied);
+    }
+
+    #[test]
+    fn a_dry_resume_refuses_in_the_real_order() {
+        // (a) A changed list: the compatibility table answers before any prefix lock is read.
+        let fs = crashed_ab_dry();
+        let (r, _) = go_with(&fs, ["a", "b", "c"].map(spec).to_vec(), &opts(), &dry_resume_cfg());
+        assert_eq!(refusal_of(&r).0, LockCode::IncompatibleState, "{:?}", r.run.stop);
+        assert!(prefix_note_names(&r).is_empty(), "{:?}", r.run.warnings);
+
+        // (b) A wrong-kind target and readable prefix locks: the prefix note, then the target's refusal, before the
+        // store is copied.
+        let build = || {
+            let n = reference(fake, &["a", "f"], "rename_no_replace", "/p/dest/a/x");
+            let fs = fake();
+            crash(&fs, &["a", "f"], "rename_no_replace", n);
+            fs.create_dir(Path::new("/tmp")).unwrap();
+            fs.create_dir(Path::new("/p/dest/f")).unwrap();
+            fs
+        };
+        let fs = build();
+        let base = calls(&fs).len();
+        let (r, _) = go_with(&fs, ["a", "f"].map(spec).to_vec(), &opts(), &dry_resume_cfg());
+        assert_eq!(refusal_of(&r).0, LockCode::DestinationNamespaceCollision, "{:?}", r.run.stop);
+        assert_eq!(prefix_note_names(&r), [["a", "f"]]);
+        assert!(
+            !calls(&fs)[base..].iter().any(|c| c.contains("flux-dry-")),
+            "the store was copied before the target check: {:?}",
+            &calls(&fs)[base..]
+        );
+
+        // (c) A torn store: the copy is refused after the aggregate prefix note.
+        let fs = crashed_ab_dry();
+        fs.write_file(format!("/p/dest/.flux/operations/{ID}/state.db"), b"torn");
+        let (r, _) = go_with(&fs, two(), &opts(), &dry_resume_cfg());
+        assert_eq!(refusal_of(&r).0, LockCode::StateCorrupt, "{:?}", r.run.stop);
+        assert!(
+            r.run.warnings.iter().any(|w| matches!(w, RunWarning::DryRunStoreTorn)),
+            "{:?}",
+            r.run.warnings
+        );
+        assert_eq!(prefix_note_names(&r), [["a", "b"]]);
+    }
+
+    #[test]
+    fn a_dry_resume_with_no_prior_plans_fresh() {
+        let fs = dest_only();
+        dead_prefix_locks(&fs, &["a", "b"]);
+
+        let (r, _) = go_with(&fs, two(), &opts(), &dry_resume_cfg());
+
+        assert!(r.run.stop.is_none(), "{:?}", r.run.stop);
+        assert_eq!(r.run.dry.as_ref().unwrap().prior, Some(DryPrior::StartedNew));
+        assert_eq!(prefix_note_names(&r), [["a", "b"]]);
+        assert!(liveness(&r));
+    }
+
+    #[test]
+    fn a_dry_resume_removes_its_temporary_store_copy() {
+        let fs = crashed_late_dry();
+
+        let (r, _) = go_with(&fs, two(), &opts(), &dry_resume_cfg());
+
+        assert!(matches!(r.run.dry.as_ref().unwrap().prior, Some(DryPrior::Resume { .. })));
+        assert!(!fs.exists(format!("/tmp/flux-dry-{ID}")));
+        let tmp = fs.destination_root(Path::new("/tmp")).unwrap();
+        assert!(tmp.read_dir().unwrap().is_empty(), "{:?}", calls(&fs));
+    }
+
+    #[test]
+    fn a_dry_resume_of_weak_roots_warns_once_per_root() {
+        let build = || {
+            let n = reference(fake_timed, &["a", "b"], "rename_no_replace", "/p/dest/b/k");
+            let weak = |fs: &FaultFs| {
+                fs.set_identity("/src/a", FileIdentity::Weak(ObjectId { volume: 5, index: 11 }));
+                fs.set_identity("/src/b", FileIdentity::Weak(ObjectId { volume: 5, index: 12 }));
+            };
+            let fs = fake_timed();
+            weak(&fs);
+            crash(&fs, &["a", "b"], "rename_no_replace", n);
+            fs.create_dir(Path::new("/tmp")).unwrap();
+            fs
+        };
+        let fs = build();
+
+        let (r, _) = go_with(&fs, two(), &opts(), &dry_resume_cfg());
+
+        assert!(r.run.stop.is_none(), "{:?}", r.run.stop);
+        let by_path = r
+            .run
+            .warnings
+            .iter()
+            .filter(|w| matches!(w, RunWarning::ResumeMappingByPath(_)))
+            .count();
+        assert_eq!(by_path, 2, "{:?}", r.run.warnings);
     }
 
     #[test]
