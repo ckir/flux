@@ -31,6 +31,7 @@ Non-goals (each stays in `TODO.md`)
 - N2. `--break-lock` for the prefix locks (**owner**, P1): an unreadable prefix lock is refused with an honest message. P2 (take over and record each prefix takeover) is its own later cut because `state.takeover` is one optional slot (`crates/flux-core/src/state.rs:369`, `deny_unknown_fields`) and widening it risks a format 6 against several-sources goal G5.
 - N3. Any change to the lease rule or to `flux cleanup`.
 - N4. `--restart` with `--dry-run` for several sources (it stays the `--dry-run` usage error).
+  Update 2026-10-28: cut 18 built `--dry-run` for several sources, with and without `--restart`, `docs/superpowers/specs/2026-10-28-several-dry-run-design.md`; N1 and N4 are closed for `--dry-run`, `--resume` remains.
 
 Anti-goals (a failure even if the tests pass)
 - A1. A restart that releases this run's own prefix locks while it supersedes a prior (the defect at `multi.rs:300-309`, see 3.2): the copy would then run with no namespace guard.

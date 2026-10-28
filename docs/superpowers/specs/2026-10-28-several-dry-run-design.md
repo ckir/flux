@@ -1,6 +1,6 @@
 # `flux copy --dry-run` with several sources (cut 18)
 
-Status: draft for owner approval. Not built. Branch `feat/several-dry-run` off main `d59cd83e6790b8ec18e0da7774094f964b96581f`.
+Status: built (cut 18, tasks 1 to 6 on `feat/several-dry-run`). Branch `feat/several-dry-run` off main `d59cd83e6790b8ec18e0da7774094f964b96581f`.
 
 ## 1. Intent
 

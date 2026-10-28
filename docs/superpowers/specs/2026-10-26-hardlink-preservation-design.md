@@ -138,6 +138,8 @@ is an ordinary copy, not a degradation, and the destination's link count equals 
 linked, not the source's `nlink`. A single-file copy has one name, so it has no group. With several sources (one operation), `--resume` and `--dry-run`
 remain usage errors (`crates/flux-cli/src/main.rs:37`), so a group that spans roots only arises for fresh copies.
 
+Update 2026-10-28: `--dry-run` with several sources landed in cut 18; only `--resume` remains a usage error there.
+
 ### Modes and failures (the table)
 
 | Situation | `copy` | `auto` | `preserve` |
