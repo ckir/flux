@@ -154,6 +154,7 @@ The `--json` object, the stdout records, the exit codes, the summary text, `flux
 - B5. The `Discovered` counter races the final `files_total` by design: it is sampled while the walk runs.
 - B6. A resumed single file shows the counters shape, not a percent (3.4).
 - B7. Byte motion is the bytes THIS run writes. The re-read that `--resume-verify` does on a partial, and the re-read of `--verify=destination` or `full` after a file is written (`copy.rs:1000`), move no byte counter, so a very large file shows a still `Transferred` during those phases while the 250 ms refresh keeps the elapsed time and speed honest (speed decays). A later cut may add a verifying phase counter.
+- B8. A burst of failure records redraws the bar once per record (`suspend` forces a draw, `state.rs:189` at tag 0.18.6), which can flicker on a terminal. Cosmetic; a rate-limited batch is a later refinement.
 
 ## 7. Rulings made while writing this (each with the cost if wrong)
 
@@ -168,3 +169,10 @@ The `--json` object, the stdout records, the exit codes, the summary text, `flux
 - Placeholders: none left as TBD. Items for the PLAN (line-level, written against code after this spec is merged to the branch): the exact `RunConfig` literal list, the exact signatures through `Shared` and the copy function, the `FailureTally`-matching predicate for `errors`, the terminal-width behaviour of the bar template, and indicatif behaviours stated here as facts but to be re-read at the plan stage with `path:line` at the installed tag (the draw-error discards, `suspend` on a hidden target, `InMemoryTerm`).
 - Cases: empty source (no entries: shows zeros, then clears); a source that is one empty file; several sources with a refusing root (the display is finished on the error path by `Drop`); `--resume` with every file done (counters show `Resumed` only); `--restart`; `--dry-run` (no display, G2); `--json` on a terminal (no display); a stderr that closes mid-run (A2); a one-column terminal (indicatif truncates; no panic is claimed beyond its own, to be checked at the plan stage).
 - Requirement map: G1 -> 3.2, 3.3, T5; G2 -> 3.5, T6, T7; G3 -> 3.5, 3.6; G4 -> 3.1 (Relaxed, no locks), T4; G5 -> 3.1; G6 -> 3.3, 3.4, T3; G7 -> T1, T2.
+
+## Stand-downs (adversarial panel, 2026-10-28)
+
+- Round 1, solo floor (driver): seven defects found and FOLDED in `af3668ab8856087095f5bd85b2a5af50efa03414` (G1 and G4 rewording, sampler failure handling, zero-length and single-file counters, the `Live` glue type with T8, boundary B7).
+- Round 1, agy escalation: VOIDED, not counted. Its reply attributed to this artifact a `--quiet` gating condition, `Display::suspend`, `finish_and_clear`, `expected_bytes.filter` and joined worker threads, none of which the artifact contains, and four of its repository cites pointed at unrelated lines (`main.rs:182` is a clap doc comment, `run/mod.rs:434` a parameter list, `multi.rs:242` the dry fold); it also named a dependency indicatif 0.18.6 does not have (`number_prefix`; the crate depends on `unit-prefix`). Measured by the driver.
+- Round 2, agy escalation, with a verbatim-quote rule and the seats Blindspot Auditor and Boundary Smuggler added: no live challenge. A sample of its quotes and cites was measured and matches (one slip: its `state.rs:69` quotation was wrong, the claim it supports, that draw errors are discarded, holds at that tag). Its weakest-point remark, bar flicker under a burst of failure records, is FOLDED as boundary B8. Its "Mutant: none" verdicts on T1-T8 are the peer's reasoning, not a measurement; the non-vacuity proofs run at implementation time are the evidence.
+- DISCARDED-BELOW-FLOOR: none. UNVERIFIED-ACCEPTED: none.
