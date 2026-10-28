@@ -13,6 +13,7 @@
 ## Global Constraints
 
 - Repo gate: `just check` (fmt-check, clippy `--all-targets -- -D warnings`, typos, licence headers, tests via nextest). Expected pass line: exit 0. Do not invent stricter flags.
+- Every task ends with `just check` exit 0 BEFORE its commit (the repo's clippy gate is `-D warnings` and flags `too_many_arguments` above seven parameters and dead code; a task must not leave the gate red for a later one). If clippy flags the `create_preview` parameter type as `type_complexity`, give it a type alias next to `ResumePreview` (`run/mod.rs`).
 - Nextest filters: `test(/(^|::)NAME$/)` (a library unit test's name carries its module path: `run::multi::trees_tests::NAME`); add `--no-fail-fast` whenever the claim is "nothing else went red".
 - Commit trailer on every commit: `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>` (an implementer uses its own model name). Never write a short git sha in prose or commit bodies (typos gate): full 40-hex or none.
 - Never run `git checkout`, `switch`, `stash` or `reset`.
@@ -61,6 +62,7 @@
 - [ ] **Step 2: Run** `cargo nextest run -p flux-core -E 'test(/(^|::)broken_leftovers_notes_exactly_the_entries_of_one_lock$/)'`. Expected: FAIL to compile (`broken_leftovers` undefined).
 - [ ] **Step 3: Implement** the two functions and make `dry_lock` delegate. Behaviour of `dry_lock` is unchanged (SHAPE-DIVERGENCE STOP: if making it compile would change a value's shape, type or encoding, STOP and report `[original] -> [yours] because <reason>`).
 - [ ] **Step 4: Run** `cargo nextest run -p flux-core --no-fail-fast`. Expected: all green (the existing dry tests are the oracle that `dry_lock` is unchanged), including the new test.
+- [ ] **Step 5a: `just check`** Expected: exit 0.
 - [ ] **Step 5: Commit** `refactor: split dry_lock into the record read and the leftover scan (cut 18 task 1)`.
 
 ---
@@ -97,6 +99,7 @@
   - `multi.rs`: split `check_targets`; `trees` removes the `debug_assert` and, right before `let mut done`, `if cfg.dry_run { return dry_trees(fs, run, out, place, &site, anchor_identity, cfg, &opts, inputs, on_report); }` where `anchor_identity` is `dest.identity()` or `holder.identity()` as `trees` already computes `anchor` (`multi.rs:545-552`). `dry_trees` mirrors `dry_tree`: build the `Shared` (dry settings, `NullClaimStore`, the helper's slot shared by all roots), call `dry_start(site, capability, &place, cfg, &mut restart_preview, &mut resume_refused, &mut create_preview_noop, &mut run.warnings)` (restart preview: reuse `dry_restart` through the same closure shape as `dry_tree` at 1380-1386; the resume closure is unreachable for several sources and returns the same refusal `MultiPlace::adopt` gives), then `copy_roots_at(&cx, dest_ref, false, inputs, &mut out, on_report)`, then the hardlink slot close, the I7 count (`absent && !matches!(&result, Err(a) if a.refused_unchanged())` adds one to `directories_created`), `dry.unprobed_noreplace = true`, `run.dry = Some(dry)`, `run.copy = Some(result)`, and the `RootReport`s built exactly as `trees` builds them (`multi.rs:641-661`).
 - [ ] **Step 4: Run** `cargo nextest run -p flux-core --no-fail-fast`. Expected: the new tests and the whole crate green (the live and one-source dry paths are the regression oracle for the `copy_roots_at`, `dry_start` and `dry_top_level_flux` edits).
 - [ ] **Step 5: Mutants** (the driver proves non-vacuity): (a) drop the `key_prefix` gate -> T8 red; (b) `Planned` root counts no directory -> T1/T2 red; (c) skip the I7 count -> T15/T2 red; drop `unprobed_noreplace` or the pre-flight `out.warnings` -> T2 red; (d) `folder_root` treats every `open_dir` error as not-found -> T11b red. Report which test went red for each.
+- [ ] **Step 6a: `just check`** Expected: exit 0.
 - [ ] **Step 6: Commit** `feat: flux copy --dry-run with several sources, the fresh plan (cut 18 task 2)`.
 
 ---
@@ -125,6 +128,7 @@ Behaviour of `dry_create_preview` (spec 4.2 step 2; read it, it is the oracle): 
 - [ ] **Step 3: Implement** as specified above; add the `RunWarning` variant (`run/mod.rs` next to `DryRunBrokenLeftover` at 276) and the `run_warning_line` arm. Replace the no-op closure in `dry_trees` by one that calls `place.dry_create_preview(dry, warnings)`.
 - [ ] **Step 4: Run** `cargo nextest run --workspace --no-fail-fast`. Expected: green.
 - [ ] **Step 5: Mutants:** run `check_targets_in` per root inside the loop -> the cross-root order row of T4 red; compare targets pairwise in the alias step -> the hardlink control red; flush the notes before `check_targets_in` instead of keeping them on its refusal (drop them) -> T5 combined red; call the preview before the `RESUMABLE_OPERATION_EXISTS` refusal -> T13 red; move the `.flux-dir.lock` check before the loop -> the T4 dir-lock-after-unreadable row red; set `owner_liveness` per root inside the loop -> T5 mixed red. Report which test went red for each.
+- [ ] **Step 6a: `just check`** Expected: exit 0.
 - [ ] **Step 6: Commit** `feat: prefix lock, directory lock and target previews for a dry several-source run (cut 18 task 3)`.
 
 ---
@@ -147,6 +151,7 @@ Behaviour of `dry_create_preview` (spec 4.2 step 2; read it, it is the oracle): 
 - [ ] **Step 3: Implement** the probe and the `read_file` `norm` fix (test-support only).
 - [ ] **Step 4: Run** `cargo nextest run --workspace --no-fail-fast`. Expected: green.
 - [ ] **Step 5: Mutants:** probe with the byte-equal name instead of the swapped one -> T16 (1) red; treat variant NotFound as `Some(true)` -> (2) red; `continue` past a NotFound variant -> (2b) red; probe always (not lazily) -> (7) red; plain `==` on identities -> (9) and T14 `Unavailable`/`Weak` rows red; skip the cap -> (9) red; stop at the first undecidable candidate -> (9) first/second sub-row red; accept equal `Weak` ids in the probe (not only in the lock-file alias) -> the (9) `Weak` sub-row red. Report which row went red.
+- [ ] **Step 6a: `just check`** Expected: exit 0.
 - [ ] **Step 6: Commit** `feat: fold-probe for a dry several-source run (cut 18 task 4)`.
 
 ---
@@ -166,6 +171,7 @@ Behaviour of `dry_create_preview` (spec 4.2 step 2; read it, it is the oracle): 
 - [ ] **Step 2: Run** `cargo nextest run -p flux-cli --no-fail-fast`. Expected: the new tests FAIL.
 - [ ] **Step 3: Implement** the gate, the two `r.dry_run = args.dry_run;` lines (as `main.rs:470-471`), `root_lines(roots, dry)`, the help and doc text ("--resume needs one source").
 - [ ] **Step 4: Run** `cargo nextest run --workspace --no-fail-fast` and `rg "with several sources is not supported yet" crates` (only `--resume` remains). Expected: green.
+- [ ] **Step 5a: `just check`** Expected: exit 0.
 - [ ] **Step 5: Commit** `feat: flux copy --dry-run accepts several sources (cut 18 task 5)`.
 
 ---
@@ -181,6 +187,7 @@ Behaviour of `dry_create_preview` (spec 4.2 step 2; read it, it is the oracle): 
 - [ ] **Step 2: Run** `cargo nextest run -p flux-core --test dry_run_several_std_fs`. Expected: FAIL before Tasks 2 to 4, PASS now (it is written last, so it passes at first run; the driver proves non-vacuity by a mutant: make `dry_trees` call `create_dir` for the root -> the snapshot assertion red).
 - [ ] **Step 3: Docs** as listed; `--help` wording is already done in Task 5.
 - [ ] **Step 4: Run** `just check`. Expected: exit 0.
+- [ ] **Step 5a: `just check`** Expected: exit 0.
 - [ ] **Step 5: Commit** `docs: several-source dry run, limits and the real-filesystem pairing (cut 18 task 6)`.
 
 ---
