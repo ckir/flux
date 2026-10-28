@@ -23,8 +23,8 @@ use crate::prior::PriorOp;
 use crate::state::{FLUX_DIR, OPERATIONS_DIR, OpState, STATE_DB};
 use crate::tree::{TreeFailure, TreeFailureCause};
 use flux_fs::{
-    ClaimStore, Code, CopyOptions, DestinationRoot, DirHandle, FileHandle, FileIdentity, FsError,
-    LockCapability,
+    ClaimStore, Code, CopyOptions, DestinationRoot, DirEntry, DirHandle, FileHandle, FileIdentity,
+    FsError, LockCapability,
 };
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
@@ -49,20 +49,20 @@ pub(crate) enum LockPreview {
 }
 
 /// Spec 3.2: classify the lock file from its bytes alone. It never opens the lock, so a lock held by another
-/// run reads the same as a dead one's.
-pub(crate) fn dry_lock<D: DirHandle>(
+/// run reads the same as a dead one's. The `bool` is false where the read itself failed, so no leftover scan follows.
+pub(crate) fn dry_lock_record<D: DirHandle>(
     site: &LockSite<'_, D>,
     break_lock: bool,
     capability: LockCapability,
     now_ns: u64,
     warnings: &mut Vec<RunWarning>,
-) -> LockPreview {
+) -> (LockPreview, bool) {
     let preview = match site.dir().read_file(site.lock_name(), RECORD_LEN) {
         Err(e) if e.source.kind() == ErrorKind::NotFound => LockPreview::Absent,
         Err(e) if matches!(e.code, Code::SafetyRejected | Code::DestinationError) => {
             LockPreview::Refused(foreign_refusal())
         }
-        Err(e) => return LockPreview::Error(e),
+        Err(e) => return (LockPreview::Error(e), false),
         Ok(bytes) => match decode(&bytes) {
             Decoded::Foreign => LockPreview::Refused(foreign_refusal()),
             Decoded::Uncertain(why) => {
@@ -71,7 +71,7 @@ pub(crate) fn dry_lock<D: DirHandle>(
                 } else {
                     // The live takeover's first check (S240_5_s1): strong identity and OS-native locks.
                     match site.dir().identity() {
-                        Err(e) => return LockPreview::Error(e),
+                        Err(e) => return (LockPreview::Error(e), false),
                         Ok(id)
                             if matches!(id, FileIdentity::Strong(_))
                                 && capability.allows_exclusive() =>
@@ -85,7 +85,7 @@ pub(crate) fn dry_lock<D: DirHandle>(
                 }
             }
             Decoded::Record(r) => match site.workspace(&r) {
-                Err(LockError::Io(e)) => return LockPreview::Error(e),
+                Err(LockError::Io(e)) => return (LockPreview::Error(e), false),
                 Err(refused) => LockPreview::Refused(refused),
                 Ok(Workspace::Untrusted) => LockPreview::Refused(untrusted_refusal(r)),
                 Ok(Workspace::Missing) => LockPreview::Refused(orphan_refusal(r, site.kind())),
@@ -105,18 +105,39 @@ pub(crate) fn dry_lock<D: DirHandle>(
             },
         },
     };
-    // The `.broken.` leftovers a real run would reclaim. Best-effort: a listing error is ignored, since an
-    // unreadable directory would already have failed the record read above.
-    let mut prefix = site.lock_name().as_encoded_bytes().to_vec();
+    (preview, true)
+}
+
+/// The `.broken.` leftovers of one lock that a real run would reclaim, noted from an already-read listing so
+/// several locks can share one directory read.
+pub(crate) fn broken_leftovers(
+    entries: &[DirEntry],
+    lock_name: &OsStr,
+    warnings: &mut Vec<RunWarning>,
+) {
+    let mut prefix = lock_name.as_encoded_bytes().to_vec();
     prefix.extend_from_slice(b".broken.");
-    if let Ok(entries) = site.dir().read_dir() {
-        for entry in entries {
-            if entry.name.as_encoded_bytes().starts_with(&prefix) {
-                warnings.push(RunWarning::DryRunBrokenLeftover {
-                    name: entry.name.to_string_lossy().into_owned(),
-                });
-            }
+    for entry in entries {
+        if entry.name.as_encoded_bytes().starts_with(&prefix) {
+            warnings.push(RunWarning::DryRunBrokenLeftover {
+                name: entry.name.to_string_lossy().into_owned(),
+            });
         }
+    }
+}
+
+/// `dry_lock_record`, then the leftover scan. The scan is best-effort: a listing error is ignored, since an
+/// unreadable directory would already have failed the record read.
+pub(crate) fn dry_lock<D: DirHandle>(
+    site: &LockSite<'_, D>,
+    break_lock: bool,
+    capability: LockCapability,
+    now_ns: u64,
+    warnings: &mut Vec<RunWarning>,
+) -> LockPreview {
+    let (preview, scan) = dry_lock_record(site, break_lock, capability, now_ns, warnings);
+    if scan && let Ok(entries) = site.dir().read_dir() {
+        broken_leftovers(&entries, site.lock_name(), warnings);
     }
     preview
 }

@@ -8352,6 +8352,27 @@ fn dry_lock_rows_of_the_record_table() {
 }
 
 #[test]
+fn broken_leftovers_notes_exactly_the_entries_of_one_lock() {
+    use super::dry_prior::broken_leftovers;
+    let entry = |n: &str| flux_fs::DirEntry {
+        name: std::ffi::OsString::from(n),
+        file_type: flux_fs::FileType::File,
+    };
+    let entries = [
+        entry("a.flux-lock.broken.1"),
+        entry("a.flux-lock"),
+        entry("b.flux-lock.broken.2"),
+        entry("a.flux-lock.broken"),
+    ];
+    let mut w = Vec::new();
+    broken_leftovers(&entries, OsStr::new("a.flux-lock"), &mut w);
+    assert!(
+        matches!(w.as_slice(), [RunWarning::DryRunBrokenLeftover { name }] if name == "a.flux-lock.broken.1"),
+        "{w:?}"
+    );
+}
+
+#[test]
 fn dry_lock_never_opens_or_locks() {
     use super::dry_prior::dry_lock;
     let dest = OsStr::new("dest");
