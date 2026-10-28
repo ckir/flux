@@ -77,6 +77,7 @@ Engine (`FaultFs`, `crates/flux-core/src/run/multi.rs` tests):
 - T9. Hardlink groups spanning two roots: one shared slot, the dry counts match the real run's `files_hardlinked`.
 - T10. `--exclude` and `--no-recursive` per root: per-root `excluded` counts sum to the total.
 - T11. DEST absent: no prefix-lock reads, no `check_targets`, every root planned new.
+- T13. A plain dry run (no `--restart`) over a crashed several-source prior refuses with `RESUMABLE_OPERATION_EXISTS` naming `--restart`, as the real run does, and streams nothing; a dry `--restart` with DEST absent previews an empty supersede and the fresh plan.
 - T12. An abort mid-walk (a source read error in root 2): root 1 `completed`, root 2 `failed`, later roots `not_started`.
 CLI (`crates/flux-cli/tests/several_sources.rs`): the existing gate test loses its `--dry-run` arm and keeps `--resume` and `--dry-run --resume` (exit 2 naming `--resume`); a dry run exits 0 with the dry summary and the per-root lines; `--json` carries `dry_run: true`, `roots` and `unprobed`; `--json` on a missing and on a symlink source carries `dry_run: true` (the pre-engine arms); a dry `--restart` over a killed run (the `Stalled` fixture of cut 17) prints the discards and the real tree is byte-identical afterwards; `--dry-run --restart` on a fresh DEST exits 0.
 Real filesystem (`crates/flux-core/tests/dry_run_std_fs.rs` style): snapshot before/after unchanged for a several-source dry run, and the dry counters equal a real run's on a copy of the tree.
