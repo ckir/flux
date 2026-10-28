@@ -2582,6 +2582,37 @@ mod trees_tests {
     }
 
     #[test]
+    fn a_resume_whose_aside_cannot_be_deleted_warns_once_naming_it() {
+        // The recovery of the first dead prefix lock moves it aside and then deletes the aside (spec 4.3); that
+        // delete is the resume's first `remove_file`. It fails, and the aside is reported as a leftover.
+        // A reference resume on an identical fixture says which `remove_file` that is (the fake is deterministic); the
+        // destination lock's own aside, deleted earlier, is reported by the session and is not what this pins.
+        let reference_fs = crashed_late();
+        let mark = calls(&reference_fs).len();
+        ok(&go_with(&reference_fs, two(), &opts(), &resume_cfg(0x22)).0);
+        let n = nth_after(&reference_fs, mark, "remove_file", "/p/dest/a.flux-lock.broken.");
+        let fs = crashed_late();
+        fs.fail_nth("remove_file", n, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+        let (r, _) = go_with(&fs, two(), &opts(), &resume_cfg(0x22));
+        ok(&r);
+        let leftovers: Vec<&PathBuf> = r
+            .run
+            .warnings
+            .iter()
+            .filter_map(|w| match w {
+                RunWarning::BrokenLeftover(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        let aside = format!("a.flux-lock.broken.{:032x}", 0x22);
+        assert!(
+            matches!(&leftovers[..], [p] if p.to_string_lossy().ends_with(&aside)),
+            "{:?}",
+            r.run.warnings
+        );
+    }
+
+    #[test]
     fn a_resume_after_a_kill_inside_the_first_root_finishes_the_run() {
         // `crashed_ab`'s crash (the publish of `a/x`), on the timed fake.
         let n = reference(fake_timed, &["a", "b"], "rename_no_replace", "/p/dest/a/x");
