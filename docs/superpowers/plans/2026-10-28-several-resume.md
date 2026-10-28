@@ -47,10 +47,10 @@ Behaviour (spec 4.2). After the existing count check, loop `stored.roots.iter().
   - `a_changed_kind_is_refused_naming_the_root_and_restart`: second root `Tree` stored, `File` now: text equals `root b: the operation copies a folder, this run's source is a file; run again with --restart to supersede it`.
   - `a_renamed_root_is_refused_with_the_destination_text`: same sources and kinds, second root's prefix `b` stored, `c` now: text starts `root b: the destination differs`.
   - `every_weak_root_matched_by_path_warns_once`: both roots `Weak` identity, same paths: `warnings` holds two `ResumeMappingByPath`, in root order.
-  - `a_one_root_refusal_has_no_root_tag`: the existing single-root mismatch text does not contain `root `.
+  - `a_one_root_refusal_has_no_root_tag`: the existing single-root mismatch text starts `the source root differs` and does not start with `root ` (it contains the words `source root`, so a substring check cannot be used).
 - [ ] **Step 2: Run them to verify they fail.** `cargo nextest run -p flux-core --no-fail-fast -E 'test(run::resume)'` Expected: the five fail, every existing test passes.
 - [ ] **Step 3: Implement** as described above in `validate` and give `source_mismatch` an `Option<&str>` tag parameter (both of its call sites are in this function).
-- [ ] **Step 4: Run** the same command. Expected: all pass. Mutant check: make the loop compare only the first pair; `a_swapped_pair...` must go red; restore.
+- [ ] **Step 4: Run** the same command. Expected: all pass. Mutant check: make the loop compare only the first pair; the kind, renamed-root and weak-root tests (second-root cases) must go red, restore. (`a_swapped_pair...` differs already in the first pair, so it stays green: measured by the Task 1 implementer.)
 - [ ] **Step 5: `just check`, then commit** `git add crates/flux-core/src/run/resume.rs && git commit -m "feat: resume compatibility compares every root"` with the trailer.
 
 ---
