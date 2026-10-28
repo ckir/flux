@@ -20,7 +20,7 @@ use crate::lock::{
     uncertain_refusal, untrusted_refusal,
 };
 use crate::prior::PriorOp;
-use crate::state::{FLUX_DIR, OPERATIONS_DIR, OpState, STATE_DB};
+use crate::state::{FLUX_DIR, OPERATIONS_DIR, OpState, Root, STATE_DB};
 use crate::tree::{TreeFailure, TreeFailureCause};
 use flux_fs::{
     ClaimStore, Code, CopyOptions, DestinationRoot, DirEntry, DirHandle, FileHandle, FileIdentity,
@@ -267,12 +267,13 @@ pub(crate) type Parked<F> = Option<(
 pub(crate) fn dry_adopt<F: DestinationRoot>(
     fs: &F,
     place: &TreePlace<'_, F>,
+    roots: &[Root],
     prior: &PriorOp,
     opts: &CopyOptions,
     temp_root: &Path,
     warnings: &mut Vec<RunWarning>,
 ) -> DryAdopt<F::Dir> {
-    match adopt_on_copy(fs, place, prior, opts, temp_root, warnings) {
+    match adopt_on_copy(fs, place, roots, prior, opts, temp_root, warnings) {
         Ok((temp, claims, prior)) => DryAdopt::Store { temp, claims, prior },
         Err(e) => DryAdopt::Refused(e),
     }
@@ -287,13 +288,14 @@ type Adopted<F> = (
 fn adopt_on_copy<F: DestinationRoot>(
     fs: &F,
     place: &TreePlace<'_, F>,
+    roots: &[Root],
     prior: &PriorOp,
     opts: &CopyOptions,
     temp_root: &Path,
     warnings: &mut Vec<RunWarning>,
 ) -> Result<Adopted<F>, RunError> {
     // 1. The compatibility table, as the real adoption applies it.
-    validate(prior, &place.roots(), opts, warnings)?;
+    validate(prior, roots, opts, warnings)?;
     let id = prior.state.operation_id.as_str();
     let created = prior.state.state == OpState::Created;
     let db = place.operations_shown().join(id).join(STATE_DB);

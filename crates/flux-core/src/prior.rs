@@ -180,12 +180,6 @@ pub fn scan_file<D: DirHandle>(
 pub fn resumable_refusal(ops: &[PriorOp]) -> LockError {
     let wipe = "(its partials and its recorded progress are deleted)";
     let detail = match ops {
-        [op] if op.state.format_version >= MULTI_ROOT_FORMAT => format!(
-            "operation {} is {} ({}), created by a several-source run, so --resume cannot continue it; run again with --restart to supersede it {wipe}",
-            op.state.operation_id,
-            op.state.state.as_str(),
-            op.shown.display()
-        ),
         [op] if op.state.format_version >= FORMAT_VERSION => format!(
             "operation {} is {} ({}); run again with --resume to continue it or --restart to supersede it {wipe}",
             op.state.operation_id,
@@ -631,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn a_version_5_prior_names_restart_not_resume_or_cleanup() {
+    fn a_version_5_prior_names_resume_and_restart_not_cleanup() {
         let op = |n: u8, v: u64, s: OpState| {
             let mut state = state(n, Kind::Tree, s);
             state.format_version = v;
@@ -639,12 +633,15 @@ mod tests {
         };
         let detail = |ops: &[PriorOp]| refusal::<()>(Err(resumable_refusal(ops))).detail;
         let d = detail(&[op(1, MULTI_ROOT_FORMAT, OpState::Failed)]);
-        for part in
-            [id(1).as_str(), "FAILED", "manifest", "--restart to supersede", "several-source"]
-        {
+        for part in [
+            id(1).as_str(),
+            "FAILED",
+            "manifest",
+            "--resume to continue it or --restart to supersede it",
+        ] {
             assert!(d.contains(part), "{part}: {d}");
         }
-        assert!(!d.contains("--resume to continue"), "{d}");
+        assert!(!d.contains("several-source"), "{d}");
         assert!(!d.contains("cleanup"), "{d}");
         // Several priors, one of them several-source: --restart is the way out; with none, the text is as before.
         let many = detail(&[

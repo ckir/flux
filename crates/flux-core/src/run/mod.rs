@@ -1278,8 +1278,10 @@ fn dry_prior_notes(scan: &crate::prior::Scan, warnings: &mut Vec<RunWarning>) ->
 }
 
 /// Cut 11b: the dry `--resume` preview of the one resumable prior: its `DryPrior`, or the refusal a real run meets.
-type ResumePreview<'a> =
-    dyn FnMut(&crate::prior::PriorOp, &mut Vec<RunWarning>) -> Result<DryPrior, RunError> + 'a;
+/// Cut 19: it takes the dry flags too, so a place with more to create than the workspace previews that in the real
+/// order (a refusal of the prior's compatibility first, then what the place creates, then the store copy).
+type ResumePreview<'a> = dyn FnMut(&crate::prior::PriorOp, &mut DryRun, &mut Vec<RunWarning>) -> Result<DryPrior, RunError>
+    + 'a;
 
 /// Cut 18: what a place with more to create than the workspace previews where the real run creates it.
 type CreatePreview<'a> = dyn FnMut(&mut DryRun, &mut Vec<RunWarning>) -> Result<(), RunError> + 'a;
@@ -1294,8 +1296,9 @@ enum DryStart {
 /// Cut 11b, spec 3.2 and 3.3: the lock preview first (a predicted refusal ends the preview before any scan or
 /// note), then the scan classified as the real run's step 4 classifies it. The caller fills `unprobed_noreplace`
 /// and `planned`. `create_preview` is what a place with more to create than the workspace (the prefix locks of
-/// several sources) previews where the real run would create: a fresh start and `--restart`, never a resume and never
-/// a refusal. An `Err` is a predicted refusal.
+/// several sources) previews where the real run would create: a fresh start and `--restart` call it themselves, a resume
+/// is handed the dry flags and calls it in `resume_preview` where its order requires. An `Err` is a predicted
+/// refusal.
 // One input per piece of the preview, as `dry_tree`'s.
 #[allow(clippy::too_many_arguments)]
 fn dry_start<D: DirHandle, P: Place<D>>(
@@ -1352,7 +1355,7 @@ fn dry_start<D: DirHandle, P: Place<D>>(
         dry.prior = cfg.resume.then_some(DryPrior::StartedNew);
     } else if cfg.resume && scan.resumable.len() == 1 {
         // Spec D6: `prior_seen` stays false for the previewed resumable.
-        match resume_preview(&scan.resumable[0], warnings) {
+        match resume_preview(&scan.resumable[0], &mut dry, warnings) {
             Ok(p) => dry.prior = Some(p),
             Err(e) => return DryStart::Stop(e, dry),
         }
@@ -1424,16 +1427,18 @@ fn dry_tree<F: DestinationRoot>(
     let temp_root = cfg.dry_temp_root.clone().unwrap_or_else(std::env::temp_dir);
     let mut adopted: dry_prior::Parked<F> = None;
     let place_ref: &TreePlace<'_, F> = &*place;
-    let mut resume_preview =
-        |prior: &crate::prior::PriorOp, warnings: &mut Vec<RunWarning>| match dry_adopt(
-            place_fs, place_ref, prior, opts, &temp_root, warnings,
-        ) {
+    let mut resume_preview = |prior: &crate::prior::PriorOp,
+                              _: &mut DryRun,
+                              warnings: &mut Vec<RunWarning>| {
+        match dry_adopt(place_fs, place_ref, &place_ref.roots(), prior, opts, &temp_root, warnings)
+        {
             DryAdopt::Store { temp, claims, prior } => {
                 adopted = Some((temp, claims));
                 Ok(prior)
             }
             DryAdopt::Refused(e) => Err(e),
-        };
+        }
+    };
     let mut dry = match dry_start(
         site,
         capability,
@@ -1576,16 +1581,17 @@ fn dry_file<F: DestinationRoot>(
         }
     };
     let mut prior_id: Option<String> = None;
-    let mut resume_preview = |prior: &crate::prior::PriorOp, warnings: &mut Vec<RunWarning>| {
-        resume::validate(prior, &place.roots(), opts, warnings)?;
-        prior_id = Some(prior.state.operation_id.clone());
-        Ok(DryPrior::Resume {
-            operation_id: prior.state.operation_id.clone(),
-            claims: None,
-            recovered: 0,
-            strays: 0,
-        })
-    };
+    let mut resume_preview =
+        |prior: &crate::prior::PriorOp, _: &mut DryRun, warnings: &mut Vec<RunWarning>| {
+            resume::validate(prior, &place.roots(), opts, warnings)?;
+            prior_id = Some(prior.state.operation_id.clone());
+            Ok(DryPrior::Resume {
+                operation_id: prior.state.operation_id.clone(),
+                claims: None,
+                recovered: 0,
+                strays: 0,
+            })
+        };
     let mut dry = match dry_start(
         site,
         capability,

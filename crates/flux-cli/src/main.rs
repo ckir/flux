@@ -36,8 +36,8 @@ enum Commands {
     /// With one SOURCE, a file is copied to DEST and a folder's contents onto DEST. With
     /// several (`flux copy SOURCE... DEST`; the last path is DEST) each source, a file or
     /// a folder, is copied to `DEST/<its name>` in one operation; DEST is created if missing.
-    /// --restart, --break-lock and --dry-run work with one or several sources; --resume
-    /// needs exactly one source. In a several-source run a file source that already exists at
+    /// --restart, --break-lock, --dry-run and --resume work with one or several sources.
+    /// In a several-source run a file source that already exists at
     /// `DEST/<name>` is skipped without the identity check a single file gets, and when
     /// DEST's filesystem gives no strong file identity an existing file is reported as a
     /// collision.
@@ -148,6 +148,7 @@ struct CopyArgs {
     /// In a tree copy a file of 64 MiB or more continues after the longest leading run of chunks whose digests match on
     /// both the source and the destination; every other half-copied file is recopied, and a half-copied single file of 64 MiB or more is validated by re-reading and hashing it against the source (`--resume-verify=chunks` runs as `full` for a single file). Under
     /// --durability=normal a checkpoint is advisory and is validated against the data before it is trusted.
+    /// With several sources the per-root lines count this run's work only; files skipped as already complete are in the totals and the `resumed` line.
     #[arg(long, conflicts_with = "restart")]
     resume: bool,
     /// How a half-copied large file is validated before --resume continues it: `chunks` (the default) proves each
@@ -645,22 +646,10 @@ fn tree_output(
     json(args, &rep);
 }
 
-/// Why `--resume` cannot go with several sources: exit 2 and no JSON, as every usage error.
-/// `--restart` is allowed: it supersedes an aborted several-source run. `--dry-run` is allowed too.
-fn several_flag_gate(args: &CopyArgs) -> Option<String> {
-    args.resume.then(|| {
-        "error: --resume with several sources is not supported yet; run again with --restart to supersede an aborted several-source run".to_owned()
-    })
-}
-
 /// `flux copy SOURCE... DEST` with two or more sources (spec 3.1 to 3.8).
 fn copy_several(args: &CopyArgs) -> u8 {
     if let Err(msg) = selection_of(&args.exclude, args.no_recursive) {
         err(&format!("error: {msg}"));
-        return exit_code::USAGE;
-    }
-    if let Some(msg) = several_flag_gate(args) {
-        err(&msg);
         return exit_code::USAGE;
     }
     let (sources, destination) = args.paths.split_at(args.paths.len() - 1);
