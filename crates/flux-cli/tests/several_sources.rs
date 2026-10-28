@@ -566,7 +566,9 @@ const STALL_AT: u32 = 4;
 /// `out/alpha/sub/b` and `out/beta/a.flux-partial.<id>` on disk, and a resume reports `(2 entries claimed)` and
 /// `resumed 2 already-complete files`. Measured by running the stall loop described at `STALL_AT` for n = 4 to 14
 /// and resuming each killed run: n = 4 to 9 resume with 0 claimed entries, n = 10 to 14 with 2, and n = 13 is the
-/// first whose destination holds a `beta` partial.
+/// first whose destination holds a `beta` partial. The CLI-level proof of skipping is Linux-only; the engine tests
+/// (`a_several_source_resume_continues_a_crashed_run` in `crates/flux-core/src/run/multi.rs`) pin skipping on every OS.
+#[cfg(target_os = "linux")]
 const STALL_AT_AFTER_FIRST_ROOT: u32 = 13;
 
 /// Whether some file named `a.flux-partial.*` sits directly in `dir`.
@@ -680,6 +682,7 @@ fn a_dry_restart_on_a_fresh_dest_exits_0() {
     assert!(!out_dir.exists());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_resume_over_a_killed_run_finishes_it() {
     use std::os::unix::fs::MetadataExt;
@@ -691,6 +694,13 @@ fn a_resume_over_a_killed_run_finishes_it() {
         .kill();
     assert!(has_partial_a(&out.join("beta")), "{:?}", snapshot(&out).keys().collect::<Vec<_>>());
     // Alpha finished before the kill: its files are published and must not be written again.
+    for f in ["alpha/a", "alpha/sub/b"] {
+        assert!(
+            out.join(f).is_file(),
+            "STALL_AT_AFTER_FIRST_ROOT has drifted: {f} is not published at the stall; {:?}",
+            snapshot(&out).keys().collect::<Vec<_>>()
+        );
+    }
     let stamp = |p: &Path| {
         let m = std::fs::metadata(p).unwrap();
         (m.ino(), m.mtime(), m.mtime_nsec())
@@ -754,6 +764,7 @@ fn a_resume_with_a_replaced_source_is_refused_naming_restart() {
     assert!(err.contains("root "), "{err}");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_resume_with_a_reordered_list_resumes_normally() {
     let d = TempDir::new().unwrap();
