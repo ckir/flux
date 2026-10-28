@@ -8,10 +8,10 @@ A long `flux copy` runs silently today: per-record failure lines as they happen 
 
 ### Goals
 
-- G1. On a terminal, files and bytes advance on screen at least every 250 ms during a copy, including inside ONE large file.
+- G1. On a terminal, the display refreshes every 250 ms during a copy and its byte counter advances per chunk, including inside ONE large file (it cannot advance while the disk itself is stalled inside one write).
 - G2. A run whose stderr is not a terminal, every `--json` run and every `--dry-run` produces output byte-identical to today (stdout, stderr and exit code).
 - G3. The final summary, the record lines, the `--json` object and the exit codes are unchanged.
-- G4. The display only observes. No copy-correctness path changes behaviour; no lock, WAL, heartbeat or claim path waits on the display.
+- G4. The display only observes. No copy-correctness path changes behaviour; a counter bump in the engine is one `Relaxed` atomic add that never waits; no lock, WAL, heartbeat or claim path waits on the display. Printing a record line through the display may block on the terminal exactly as `err()` does today.
 - G5. Memory stays bounded: no file list is kept (spec section 52, "Progress must not require the entire file list in RAM").
 - G6. It works for one file, one folder, several sources, and a `--resume` of any of them.
 - G7. It is testable without a terminal.
@@ -84,10 +84,10 @@ Resumed       1,204        (only when resumed > 0)
 Errors        3            (only when errors > 0)
 ```
 
-- Single file with a known size (section 3.4): `indicatif`'s bar with `Transferred`, percent, `Speed`, `ETA`.
+- Single file with a known size (section 3.4): `indicatif`'s bar with `Transferred`, percent, `Speed`, `ETA`; the lines above do not apply.
 - Speed is `bytes / elapsed` over the whole run so far (N5). With `elapsed == 0` or `bytes == 0` the speed line shows `-`. `Transferred` counts bytes THIS run wrote, never bytes a resume skipped (so a resume's speed does not jump).
 - Clamps: `processed = min(copied + resumed, discovered)`; a single-file percent is clamped to 100.
-- `Display` owns an `indicatif::ProgressBar` and one sampler thread. `Display::start(progress: Arc<Progress>, target: ProgressDrawTarget) -> Display`; `Display::println(&self, line: &str)` prints one record line above the bar (`ProgressBar::suspend`, which runs the closure even when the target is hidden); `Display::finish(self)` clears the bar and joins the thread. `Drop` does the same, so an unwind or an early return cannot leave the thread or the bar behind.
+- `Display` owns an `indicatif::ProgressBar` and one sampler thread. If the thread cannot be spawned, `Display::start` returns `None` and the CLI takes the plain path; `finish` and `Drop` ignore a sampler panic (the join error is discarded), so a display fault never reaches the copy. `Display::start(progress: Arc<Progress>, target: ProgressDrawTarget) -> Display`; `Display::println(&self, line: &str)` prints one record line above the bar (`ProgressBar::suspend`, which runs the closure even when the target is hidden); `Display::finish(self)` clears the bar and joins the thread. `Drop` does the same, so an unwind or an early return cannot leave the thread or the bar behind.
 - The sampler wakes every 250 ms, reads `snapshot()`, renders, and updates the bar. Every draw error is ignored (indicatif discards them: `state.rs:69,89,149,176,185,189`, `progress_bar.rs:443` at tag 0.18.6), so a closed or full stderr never fails the copy (A2).
 
 ### 3.3 Where the engine bumps the counters (`flux-core`)
@@ -106,7 +106,7 @@ Errors        3            (only when errors > 0)
 
 ### 3.4 A single file
 
-`run::file` (the single-file path) sets `expected_bytes` from the source's length, which it already reads, and only when `cfg.resume` is false: a resumed single file writes fewer bytes than its length, so a percent against the full length would never reach 100. A resumed single file shows the counters shape.
+The single-file path does not use `finish_copy` or the walk, so `discovered`, `copied` and `resumed` stay zero and the single-file frame uses only `bytes` and `expected_bytes`. `run::file` sets `expected_bytes` from the source's length, which it already reads, only when that length is greater than zero (a zero-length file shows the counters frame) and only when `cfg.resume` is false: a resumed single file writes fewer bytes than its length, so a percent against the full length would never reach 100. A resumed single file shows the counters shape.
 
 ### 3.5 When the display runs (the CLI, `copy` and `copy_several`)
 
@@ -115,6 +115,10 @@ The display is created in exactly one condition: `!args.dry_run && !args.json &&
 - Record lines: the `on_report` closure calls `display.println(&line)` when a display exists, else `err(&line)` as today. The closure also calls `progress.add_error()` for a counted record.
 - The display is finished (bar cleared, thread joined) BEFORE `tree_output` prints the summary and the warning lines, so those print exactly as today.
 - Several sources: one `Progress` for the whole operation, held across roots, so the counters advance monotonically; `cfg.progress` is set once.
+
+### 3.5a The CLI glue is a unit, not inline code
+
+The three operations of 3.5 (decide, print a record, finish before the summary) live in one small type in the `flux-cli` library crate (`crates/flux-cli/src/lib.rs` exists), `Live`: `Live::start(enabled: bool, target: ProgressDrawTarget) -> Live` (plain when `enabled` is false or the target is hidden or the sampler cannot start), `Live::progress(&self) -> Option<Arc<Progress>>` (for `cfg.progress`), `Live::record(&self, line: &str, counted_failure: bool)` (display println else `err`), `Live::finish(self)`. `main.rs` calls it and nothing else, so the ordering and routing are unit-testable against an in-memory terminal even though every CLI test runs with a piped stderr.
 
 ### 3.6 What does not change
 
@@ -129,6 +133,7 @@ The `--json` object, the stdout records, the exit codes, the summary text, `flux
 - T5 (`flux-core`): in-file motion: a large single file's `bytes` is non-zero BEFORE `finish_copy` runs (read from inside the fault-fs hook between two chunk writes), which is G1's in-file clause.
 - T6 (`flux-cli`): with stderr piped (every CLI test), no bar escape codes and no extra lines appear (the existing `copy`, `several_sources` and `run` suites are the oracle); `--json` and `--dry-run` runs construct no display.
 - T7 (`flux-cli`, unit): the display-condition function over (dry_run, json, is_terminal) truth table.
+- T8 (`flux-cli`, unit, `Live` over an `InMemoryTerm` target): `record` puts the line above the bar and counts a failure; `finish` clears the bar before a following write (the summary position); a disabled `Live` writes exactly the lines it is given to stderr and starts no thread; `progress()` is `None` when disabled.
 - Non-vacuity: every test is proven red against a logic mutant of the guarded line (drop the bump, swap `copied` and `resumed`, remove the clamp, remove the `finish` before the summary).
 - Not testable here: a real terminal and the Windows console. Covered by the CI matrix for the compile and the headless tests; the on-screen look is an owner check.
 
@@ -148,6 +153,7 @@ The `--json` object, the stdout records, the exit codes, the summary text, `flux
 - B4. The speed is an average over the whole run (N5).
 - B5. The `Discovered` counter races the final `files_total` by design: it is sampled while the walk runs.
 - B6. A resumed single file shows the counters shape, not a percent (3.4).
+- B7. Byte motion is the bytes THIS run writes. The re-read that `--resume-verify` does on a partial, and the re-read of `--verify=destination` or `full` after a file is written (`copy.rs:1000`), move no byte counter, so a very large file shows a still `Transferred` during those phases while the 250 ms refresh keeps the elapsed time and speed honest (speed decays). A later cut may add a verifying phase counter.
 
 ## 7. Rulings made while writing this (each with the cost if wrong)
 
