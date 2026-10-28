@@ -561,6 +561,14 @@ impl Drop for Stalled {
 /// with both prefix locks on disk.
 const STALL_AT: u32 = 4;
 
+/// The stall index that stops `[alpha, beta]` into `out` while `beta` is being copied, after `alpha` finished and
+/// its two claims were synced (measured 2026-10-28 on the debug binary, Linux): the run stops with `out/alpha/a`,
+/// `out/alpha/sub/b` and `out/beta/a.flux-partial.<id>` on disk, and a resume reports `(2 entries claimed)` and
+/// `resumed 2 already-complete files`. Measured by running the stall loop described at `STALL_AT` for n = 4 to 14
+/// and resuming each killed run: n = 4 to 9 resume with 0 claimed entries, n = 10 to 14 with 2, and n = 13 is the
+/// first whose destination holds a `beta` partial.
+const STALL_AT_AFTER_FIRST_ROOT: u32 = 13;
+
 /// Whether some file named `a.flux-partial.*` sits directly in `dir`.
 fn has_partial_a(dir: &Path) -> bool {
     std::fs::read_dir(dir)
@@ -674,12 +682,21 @@ fn a_dry_restart_on_a_fresh_dest_exits_0() {
 
 #[test]
 fn a_resume_over_a_killed_run_finishes_it() {
+    use std::os::unix::fs::MetadataExt;
     let d = TempDir::new().unwrap();
     let marks = TempDir::new().unwrap();
     let (alpha, beta) = (folder(d.path(), "alpha"), folder(d.path(), "beta"));
     let out = d.path().join("out");
-    Stalled::start_several(&[&alpha, &beta], &out, STALL_AT, marks.path(), &[]).kill();
-    assert!(has_partial_a(&out.join("alpha")), "{:?}", snapshot(&out).keys().collect::<Vec<_>>());
+    Stalled::start_several(&[&alpha, &beta], &out, STALL_AT_AFTER_FIRST_ROOT, marks.path(), &[])
+        .kill();
+    assert!(has_partial_a(&out.join("beta")), "{:?}", snapshot(&out).keys().collect::<Vec<_>>());
+    // Alpha finished before the kill: its files are published and must not be written again.
+    let stamp = |p: &Path| {
+        let m = std::fs::metadata(p).unwrap();
+        (m.ino(), m.mtime(), m.mtime_nsec())
+    };
+    let done = [out.join("alpha/a"), out.join("alpha/sub/b")];
+    let before: Vec<_> = done.iter().map(|p| stamp(p)).collect();
 
     let resumed = flux()
         .current_dir(d.path())
@@ -694,17 +711,17 @@ fn a_resume_over_a_killed_run_finishes_it() {
     assert_eq!(roots.len(), 2, "{v}");
     assert!(roots.iter().all(|r| r["status"] == "completed"), "{v}");
     // The resumed count is the skipped count (as the one-source resume test asserts).
-    // Under the default durability a kill loses the unsynced claims, so the resume may find none and print no
-    // `resumed` line: then nothing was skipped.
-    let n: u64 = err.find("resumed ").map_or(0, |at| {
-        err[at + "resumed ".len()..]
-            .split(' ')
-            .next()
-            .unwrap()
-            .parse()
-            .unwrap_or_else(|_| panic!("{err}"))
-    });
+    let at = err.find("resumed ").unwrap_or_else(|| panic!("{err}"));
+    let n: u64 = err[at + "resumed ".len()..]
+        .split(' ')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap_or_else(|_| panic!("{err}"));
+    assert!(n >= 1, "{err}");
     assert_eq!(Some(n), v["files_skipped"].as_u64(), "{err} {v}");
+    let after: Vec<_> = done.iter().map(|p| stamp(p)).collect();
+    assert_eq!(before, after, "a file completed before the kill was written again");
     assert_eq!(snapshot(&out.join("alpha")), snapshot(&alpha));
     assert_eq!(snapshot(&out.join("beta")), snapshot(&beta));
     assert!(control_plane_names(&out).is_empty(), "{:?}", control_plane_names(&out));
@@ -715,27 +732,49 @@ fn a_resume_over_a_killed_run_finishes_it() {
 }
 
 #[test]
-fn a_resume_with_a_changed_source_list_is_refused_naming_restart() {
+fn a_resume_with_a_replaced_source_is_refused_naming_restart() {
     let d = TempDir::new().unwrap();
     let marks = TempDir::new().unwrap();
     let (alpha, beta) = (folder(d.path(), "alpha"), folder(d.path(), "beta"));
     let out = d.path().join("out");
     Stalled::start_several(&[&alpha, &beta], &out, STALL_AT, marks.path(), &[]).kill();
-    // A swapped argument order is no change: the roots are sorted by their destination name (the result does not
-    // depend on argument order), so the changed list replaces a source.
+    // A reordered argument list is no change (see the next test), so the changed list replaces a source.
     folder(d.path(), "gamma");
 
-    let swapped = flux()
+    let replaced = flux()
         .current_dir(d.path())
         .args(["copy", "--resume", "--json", "alpha", "gamma", "out"])
         .output()
         .unwrap();
 
-    let err = stderr(&swapped);
-    assert_eq!(swapped.status.code(), Some(3), "stderr: {err}");
+    let err = stderr(&replaced);
+    assert_eq!(replaced.status.code(), Some(3), "stderr: {err}");
     assert!(err.contains("INCOMPATIBLE_STATE"), "{err}");
     assert!(err.contains("--restart"), "{err}");
     assert!(err.contains("root "), "{err}");
+}
+
+#[test]
+fn a_resume_with_a_reordered_list_resumes_normally() {
+    let d = TempDir::new().unwrap();
+    let marks = TempDir::new().unwrap();
+    let (alpha, beta) = (folder(d.path(), "alpha"), folder(d.path(), "beta"));
+    let out = d.path().join("out");
+    Stalled::start_several(&[&alpha, &beta], &out, STALL_AT_AFTER_FIRST_ROOT, marks.path(), &[])
+        .kill();
+
+    // The roots are sorted by destination name, so the argument order is not part of the operation.
+    let resumed = flux()
+        .current_dir(d.path())
+        .args(["copy", "--resume", "--json", "beta", "alpha", "out"])
+        .output()
+        .unwrap();
+
+    let err = stderr(&resumed);
+    assert_eq!(resumed.status.code(), Some(0), "stderr: {err}");
+    assert!(err.contains("resuming operation "), "{err}");
+    assert_eq!(snapshot(&out.join("alpha")), snapshot(&alpha));
+    assert_eq!(snapshot(&out.join("beta")), snapshot(&beta));
 }
 
 #[test]
