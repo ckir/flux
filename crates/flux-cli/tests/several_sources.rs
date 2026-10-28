@@ -148,38 +148,14 @@ fn dest_that_is_a_file_exits_2() {
 }
 
 #[test]
-fn resume_and_dry_run_exit_2_naming_the_flag() {
+fn resume_exits_2_naming_the_flag() {
     let d = TempDir::new().unwrap();
     let (alpha, beta) = (folder(d.path(), "alpha"), folder(d.path(), "beta"));
     let out_dir = d.path().join("out");
-    for flag in ["--resume", "--dry-run"] {
-        let out = flux()
-            .arg("copy")
-            .arg(flag)
-            .arg("--json")
-            .arg(&alpha)
-            .arg(&beta)
-            .arg(&out_dir)
-            .output()
-            .unwrap();
-        let err = stderr(&out);
-        assert_eq!(out.status.code(), Some(2), "{flag}: {err}");
-        assert!(
-            err.contains(&format!("error: {flag} with several sources is not supported yet")),
-            "{flag}: {err}"
-        );
-        assert!(!err.contains("cleanup"), "{flag}: {err}");
-        assert_eq!(
-            err.contains("run again with --restart"),
-            flag == "--resume",
-            "only --resume names --restart: {flag}: {err}"
-        );
-        assert!(out.stdout.is_empty(), "{flag}: a usage error prints no JSON");
-        assert!(!out_dir.exists(), "{flag}: nothing may be created");
-    }
-    // --restart passes the gate, so --restart --dry-run is refused for --dry-run.
     let out = flux()
-        .args(["copy", "--restart", "--dry-run", "--json"])
+        .arg("copy")
+        .arg("--resume")
+        .arg("--json")
         .arg(&alpha)
         .arg(&beta)
         .arg(&out_dir)
@@ -187,9 +163,114 @@ fn resume_and_dry_run_exit_2_naming_the_flag() {
         .unwrap();
     let err = stderr(&out);
     assert_eq!(out.status.code(), Some(2), "{err}");
-    assert!(err.contains("--dry-run with several sources is not supported yet"), "{err}");
+    assert!(err.contains("error: --resume with several sources is not supported yet"), "{err}");
+    assert!(!err.contains("cleanup"), "{err}");
+    assert!(err.contains("run again with --restart"), "{err}");
     assert!(out.stdout.is_empty(), "a usage error prints no JSON");
     assert!(!out_dir.exists(), "nothing may be created");
+    // --dry-run passes the gate, so --dry-run --resume is refused for --resume.
+    let out = flux()
+        .args(["copy", "--dry-run", "--resume", "--json"])
+        .arg(&alpha)
+        .arg(&beta)
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("--resume with several sources is not supported yet"), "{err}");
+    assert!(out.stdout.is_empty(), "a usage error prints no JSON");
+    assert!(!out_dir.exists(), "nothing may be created");
+}
+
+#[test]
+fn a_dry_run_of_several_sources_prints_the_plan_and_changes_nothing() {
+    let d = TempDir::new().unwrap();
+    let (alpha, beta) = (folder(d.path(), "alpha"), folder(d.path(), "beta"));
+    let out_dir = d.path().join("out");
+    let before = snapshot(d.path());
+
+    let out =
+        flux().args(["copy", "--dry-run"]).arg(&alpha).arg(&beta).arg(&out_dir).output().unwrap();
+
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(err.lines().any(|l| l == "root alpha: would copy 2, 0 would fail"), "{err}");
+    assert!(err.contains("dry run: would copy"), "{err}");
+    assert!(err.contains("alpha: object_type=dir action=would_create"), "{err}");
+    assert_eq!(snapshot(d.path()), before, "a dry run changes nothing, not even out.flux-lock");
+    assert!(!out_dir.exists());
+}
+
+#[test]
+fn a_dry_run_json_carries_dry_run_roots_and_unprobed() {
+    let d = TempDir::new().unwrap();
+    let (alpha, beta) = (folder(d.path(), "alpha"), folder(d.path(), "beta"));
+    let out_dir = d.path().join("out");
+
+    let out = flux()
+        .args(["copy", "--dry-run", "--json"])
+        .arg(&alpha)
+        .arg(&beta)
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let v = json(&out);
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["unprobed"], serde_json::json!(["noreplace_publish", "target_lock"]));
+    let roots = v["roots"].as_array().unwrap();
+    assert_eq!(roots.len(), 2);
+    for r in roots {
+        let mut keys: Vec<&str> = r.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["files_copied", "files_failed", "name", "status"]);
+        assert_eq!(r["files_copied"], 2);
+    }
+    assert!(!out_dir.exists());
+}
+
+#[test]
+fn a_dry_run_json_on_a_missing_source_still_says_dry_run() {
+    let d = TempDir::new().unwrap();
+    let beta = folder(d.path(), "beta");
+    let missing = d.path().join("no-such-source");
+    let out_dir = d.path().join("out");
+
+    let out = flux()
+        .args(["copy", "--dry-run", "--json"])
+        .arg(&beta)
+        .arg(&missing)
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert_eq!(json(&out)["dry_run"], true);
+    assert!(!out_dir.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dry_run_json_on_a_symlink_source_still_says_dry_run() {
+    let d = TempDir::new().unwrap();
+    let (alpha, beta) = (folder(d.path(), "alpha"), folder(d.path(), "beta"));
+    let link = d.path().join("the-link");
+    std::os::unix::fs::symlink(&beta, &link).unwrap();
+    let out_dir = d.path().join("out");
+
+    let out = flux()
+        .args(["copy", "--dry-run", "--json"])
+        .arg(&alpha)
+        .arg(&link)
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert_eq!(json(&out)["dry_run"], true);
+    assert!(!out_dir.exists());
 }
 
 #[test]
@@ -581,4 +662,48 @@ fn a_killed_run_restarted_with_other_sources_keeps_the_stale_prefix_lock() {
     assert!(!out.join("alpha.flux-lock").exists());
     assert!(!out.join("gamma.flux-lock").exists());
     assert_eq!(std::fs::read(out.join("gamma/a")).unwrap(), b"A-gamma");
+}
+
+#[test]
+fn a_dry_restart_over_a_killed_run_prints_the_discards_and_changes_nothing() {
+    let d = TempDir::new().unwrap();
+    let marks = TempDir::new().unwrap();
+    let (alpha, beta) = (folder(d.path(), "alpha"), folder(d.path(), "beta"));
+    let out = d.path().join("out");
+    Stalled::start_several(&[&alpha, &beta], &out, STALL_AT, marks.path(), &[]).kill();
+    assert!(has_partial_a(&out.join("alpha")), "{:?}", snapshot(&out).keys().collect::<Vec<_>>());
+    let before = snapshot(d.path());
+
+    let dry = flux()
+        .current_dir(d.path())
+        .args(["copy", "--dry-run", "--restart", "alpha", "beta", "out"])
+        .output()
+        .unwrap();
+
+    let err = stderr(&dry);
+    assert_eq!(dry.status.code(), Some(0), "stderr: {err}");
+    assert!(
+        err.lines()
+            .any(|l| l.contains("alpha/a.flux-partial.") && l.contains("action=would_discard")),
+        "{err}"
+    );
+    assert_eq!(snapshot(d.path()), before, "a dry --restart recovers and rewrites nothing");
+}
+
+#[test]
+fn a_dry_restart_on_a_fresh_dest_exits_0() {
+    let d = TempDir::new().unwrap();
+    let (alpha, beta) = (folder(d.path(), "alpha"), folder(d.path(), "beta"));
+    let out_dir = d.path().join("out");
+
+    let out = flux()
+        .args(["copy", "--dry-run", "--restart"])
+        .arg(&alpha)
+        .arg(&beta)
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(!out_dir.exists());
 }

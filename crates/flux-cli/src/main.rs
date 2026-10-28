@@ -36,8 +36,8 @@ enum Commands {
     /// With one SOURCE, a file is copied to DEST and a folder's contents onto DEST. With
     /// several (`flux copy SOURCE... DEST`; the last path is DEST) each source, a file or
     /// a folder, is copied to `DEST/<its name>` in one operation; DEST is created if missing.
-    /// --restart and --break-lock work with one or several sources; --resume and --dry-run
-    /// need exactly one source. In a several-source run a file source that already exists at
+    /// --restart, --break-lock and --dry-run work with one or several sources; --resume
+    /// needs exactly one source. In a several-source run a file source that already exists at
     /// `DEST/<name>` is skipped without the identity check a single file gets, and when
     /// DEST's filesystem gives no strong file identity an existing file is reported as a
     /// collision.
@@ -183,7 +183,7 @@ struct CopyArgs {
     /// Descend into directories that are other mounts (section 42); by default each is created empty and skipped.
     #[arg(long)]
     cross_filesystems: bool,
-    /// Report what the copy would do and change nothing: no lock, no state, no destination write (section 5.2).
+    /// Report what the copy would do and change nothing: no lock, no state, no destination write (section 5.2). With several sources it cannot always tell that two names differing only in case are one name on a case-folding destination; the real run refuses that with DESTINATION_NAMESPACE_COLLISION.
     #[arg(long)]
     dry_run: bool,
     /// Check each copied file's content. `--verify` alone means `destination`. `none` (the default) checks nothing.
@@ -621,7 +621,7 @@ fn tree_output(
             for line in report::unprobed_lines(&rep.unprobed, mode) {
                 err(&line);
             }
-            lines(report::root_lines(roots));
+            lines(report::root_lines(roots, args.dry_run));
             err(&if args.dry_run {
                 report::dry_run_summary_line(&rep, outcome.directories_created)
             } else {
@@ -645,21 +645,12 @@ fn tree_output(
     json(args, &rep);
 }
 
-/// Why `--resume` and `--dry-run` cannot go with several sources: exit 2 and no JSON, as every usage error.
-/// `--restart` is allowed: it supersedes an aborted several-source run.
+/// Why `--resume` cannot go with several sources: exit 2 and no JSON, as every usage error.
+/// `--restart` is allowed: it supersedes an aborted several-source run. `--dry-run` is allowed too.
 fn several_flag_gate(args: &CopyArgs) -> Option<String> {
-    let flag = if args.resume {
-        "--resume"
-    } else if args.dry_run {
-        "--dry-run"
-    } else {
-        return None;
-    };
-    let mut msg = format!("error: {flag} with several sources is not supported yet");
-    if args.resume {
-        msg.push_str("; run again with --restart to supersede an aborted several-source run");
-    }
-    Some(msg)
+    args.resume.then(|| {
+        "error: --resume with several sources is not supported yet; run again with --restart to supersede an aborted several-source run".to_owned()
+    })
 }
 
 /// `flux copy SOURCE... DEST` with two or more sources (spec 3.1 to 3.8).
@@ -694,6 +685,7 @@ fn copy_several(args: &CopyArgs) -> u8 {
                 report::SYMLINK_WHY
             ));
             let mut r = Report::pre_engine(true);
+            r.dry_run = args.dry_run;
             r.verify_level = verify_name(args);
             json(args, &r);
             return exit_code::FAILED;
@@ -701,6 +693,7 @@ fn copy_several(args: &CopyArgs) -> u8 {
         Err(Stop::Failed(line)) => {
             err(&line);
             let mut r = Report::pre_engine(false);
+            r.dry_run = args.dry_run;
             r.verify_level = verify_name(args);
             json(args, &r);
             return exit_code::FAILED;

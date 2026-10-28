@@ -262,18 +262,18 @@ impl Report {
 }
 
 /// The stderr lines for a several-source run's roots (spec 3.7, 3.8): one per finished root, then one naming the roots
-/// that were not started.
-pub fn root_lines(roots: &[RootReport]) -> Vec<String> {
+/// that were not started. A dry run words the counts as what would happen.
+pub fn root_lines(roots: &[RootReport], dry: bool) -> Vec<String> {
     let mut v: Vec<String> = roots
         .iter()
         .filter(|r| r.status != RootStatus::NotStarted)
         .map(|r| {
-            format!(
-                "root {}: {} copied, {} failed",
-                r.name.to_string_lossy(),
-                r.files_copied,
-                r.files_failed
-            )
+            let (name, copied, failed) = (r.name.to_string_lossy(), r.files_copied, r.files_failed);
+            if dry {
+                format!("root {name}: would copy {copied}, {failed} would fail")
+            } else {
+                format!("root {name}: {copied} copied, {failed} failed")
+            }
         })
         .collect();
     let unstarted: Vec<_> = roots
@@ -2426,21 +2426,38 @@ mod tests {
 
     #[test]
     fn root_lines_name_the_not_started_roots() {
-        let lines = root_lines(&[
-            root("a", RootStatus::Completed, 2, 0),
-            root("b", RootStatus::Failed, 1, 3),
-            root("c", RootStatus::NotStarted, 0, 0),
-            root("d", RootStatus::NotStarted, 0, 0),
-        ]);
+        let lines = root_lines(
+            &[
+                root("a", RootStatus::Completed, 2, 0),
+                root("b", RootStatus::Failed, 1, 3),
+                root("c", RootStatus::NotStarted, 0, 0),
+                root("d", RootStatus::NotStarted, 0, 0),
+            ],
+            false,
+        );
         assert_eq!(
             lines,
             ["root a: 2 copied, 0 failed", "root b: 1 copied, 3 failed", "not started: c, d"]
         );
         assert_eq!(
-            root_lines(&[root("a", RootStatus::Completed, 1, 0)]),
+            root_lines(&[root("a", RootStatus::Completed, 1, 0)], false),
             ["root a: 1 copied, 0 failed"]
         );
-        assert!(root_lines(&[]).is_empty());
+        assert!(root_lines(&[], false).is_empty());
+    }
+
+    #[test]
+    fn root_lines_read_would_copy_in_a_dry_run() {
+        let roots =
+            [root("alpha", RootStatus::Completed, 2, 1), root("zed", RootStatus::NotStarted, 0, 0)];
+        assert_eq!(
+            root_lines(&roots, true),
+            ["root alpha: would copy 2, 1 would fail", "not started: zed"]
+        );
+        assert_eq!(
+            root_lines(&roots, false),
+            ["root alpha: 2 copied, 1 failed", "not started: zed"]
+        );
     }
 
     fn group(count: u64, example: &str) -> DegradedGroup {
