@@ -1219,6 +1219,9 @@ item was, not only in a commit message.
 ## Cut 16 open (selection; spec `docs/superpowers/specs/2026-10-27-selection-design.md`)
 
 - [ ] **A per-entry `EXCLUDE` record or listing** of what `--exclude` removed (today only the `excluded` count is reported).
+- [ ] **`flux cleanup` refuses an uncertain lock with a hint for flags it does not have.** `obtain_cleanup_lock` (`crates/flux-core/src/lock/obtain.rs:210-217`) says "run again with --restart --break-lock", but its own doc (`obtain.rs:162-163`) says cleanup always refuses an uncertain lock and `flux cleanup` has neither flag. Fix the text (point at `flux copy --restart --break-lock` or at removing the file by hand) and pin it with a test. Found in the cut 17 design panel.
+- [ ] **A stale line cite in a comment.** `crates/flux-core/src/run/prefix.rs:128` cites `lock/obtain.rs:126` for "Mode::Plain never claims a lock", but that line is the Busy arm; the Plain arm is at `obtain.rs:131`. Re-cite by symbol, not by line.
+- [ ] **`[profile.ci]` in `Cargo.toml:97-100` is unused.** No justfile recipe, workflow or nextest config selects it (`inherits = "dev"`, `debug = 0`, `strip = "debuginfo"`). Either wire it into the CI test jobs (measure the build-time win first; timing needs the owner's OK and an idle machine) or delete it.
 - [ ] **`--exclude-from FILE`**: read patterns from a file.
 - [ ] **Negation and character classes** in `--exclude` patterns (`!`, `[ ]` and `\` are reserved and rejected today).
 - [ ] **`--exclude-ignore-case`**: case-insensitive matching (matching is case-sensitive today).
