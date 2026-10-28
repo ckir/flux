@@ -233,6 +233,9 @@ fn folds_case(dir: &Path) -> bool {
 fn two_names_that_differ_only_by_case_are_refused_by_a_dry_run_on_a_folding_volume() {
     let d = TempDir::new().unwrap();
     if !folds_case(d.path()) {
+        if cfg!(any(target_os = "macos", windows)) {
+            panic!("expected a case-folding temporary volume on this OS");
+        }
         eprintln!(
             "skipped: the temporary volume is case-sensitive (the fake's T16 guards the probe)"
         );

@@ -766,7 +766,9 @@ pub(crate) struct RootDone {
 /// later one `NotStarted`. Any other abort-class error (a lost lock mid-walk, a root that cannot be created) stops the
 /// loop: that root, which had begun, is `Failed` and every later one `NotStarted`. ANY counted failure (the `out.failures.total()` delta over the root) marks its root `Failed` and the loop goes
 /// on; an abort marks it `Failed` too. `TreeFailure.path` is relative to
-/// DEST for a folder root's entries (`<name>/<path>`) and is the name itself for a file root.
+/// DEST for a folder root's entries (`<name>/<path>`) and is the name itself for a file root. `dest` is
+/// `RootsDest::Existing` in a live run; `RootsDest::Planned(anchor)` only in a dry run whose DEST is absent, where every
+/// root is planned against `anchor`'s identity.
 pub(crate) fn copy_roots_at<F: DestinationRoot>(
     base: &Shared<'_, F>,
     dest: RootsDest<'_, F::Dir>,

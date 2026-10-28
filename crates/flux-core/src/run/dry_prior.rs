@@ -49,7 +49,7 @@ pub(crate) enum LockPreview {
 }
 
 /// Spec 3.2: classify the lock file from its bytes alone. It never opens the lock, so a lock held by another
-/// run reads the same as a dead one's. The `bool` is false where the read itself failed, so no leftover scan follows.
+/// run reads the same as a dead one's. The `bool` is false on any `LockPreview::Error` (the record read, the directory identity or the workspace check failed), so no leftover scan follows.
 pub(crate) fn dry_lock_record<D: DirHandle>(
     site: &LockSite<'_, D>,
     break_lock: bool,

@@ -224,7 +224,7 @@ impl<'p, F: DestinationRoot> MultiPlace<'p, F> {
 
     /// The dry run's preview of what `create` does between making DEST and making the workspace (spec 4.2 step 2): every
     /// prefix lock's file read in prefix order, then the targets checked, so a refusal has the order of the real run's.
-    /// A no-op while DEST is absent. The notes (the aggregate of the readable prefix locks, the `.broken.` leftovers) and
+    /// With DEST absent only the fold-probe runs, on DEST's parent. The notes (the aggregate of the readable prefix locks, the `.broken.` leftovers) and
     /// `owner_liveness` are set only once every lock has passed, and are kept when the target check then refuses, as the
     /// real run's leftovers are pushed before its `check_targets`.
     pub(crate) fn dry_create_preview(
@@ -235,10 +235,10 @@ impl<'p, F: DestinationRoot> MultiPlace<'p, F> {
         let twins = self.case_twins();
         let Some(dest) = self.tree.dest.as_ref() else {
             // DEST is absent: no lock file or target to read, only the fold-probe, on DEST's parent.
-            if let Some(i) = twins.iter().position(Option::is_some)
+            if let Some((i, Some(t))) = twins.iter().copied().enumerate().find(|(_, t)| t.is_some())
                 && self.dry_fold(None) == Some(true)
             {
-                return Err(self.twin_collision(i, twins[i]));
+                return Err(self.twin_collision(i, t));
             }
             return Ok(());
         };
@@ -276,10 +276,10 @@ impl<'p, F: DestinationRoot> MultiPlace<'p, F> {
             };
             // A name whose twin is before it is the same lock file on a directory that folds ASCII case, as the real
             // `take` meets the first lock's file before it classifies anything.
-            if twins[i].is_some()
+            if let Some(t) = twins[i]
                 && *folds.get_or_insert_with(|| self.dry_fold(listing.as_deref())) == Some(true)
             {
-                return Err(self.twin_collision(i, twins[i]));
+                return Err(self.twin_collision(i, t));
             }
             // `acquire` looks for `.flux-dir.lock` only after it created this name's lock file; an existing file goes
             // straight to its classification.
@@ -351,8 +351,8 @@ impl<'p, F: DestinationRoot> MultiPlace<'p, F> {
     }
 
     /// The refusal for root `i` and its earlier twin `twin` (the real run's, `prefix_error`).
-    fn twin_collision(&self, i: usize, twin: Option<usize>) -> RunError {
-        let other = &self.roots[twin.expect("a twin was found")].name;
+    fn twin_collision(&self, i: usize, twin: usize) -> RunError {
+        let other = &self.roots[twin].name;
         self.prefix_error(PrefixRefusal::Collision {
             name: self.roots[i].name.clone(),
             other: other.clone(),
@@ -675,8 +675,8 @@ fn prepare_file_root<F: DestinationRoot>(
     Ok(meta.identity)
 }
 
-/// Several sources under the destination's lock (spec 3.3 to 3.8): `specs` is two or more sources, and the run is not
-/// a dry one. `tree_with`'s run, with the roots' prefix locks taken inside DEST before the workspace exists and
+/// Several sources under the destination's lock (spec 3.3 to 3.8): `specs` is two or more sources; a dry run (`cfg.dry_run`)
+/// branches to `dry_trees` after Group 1. `tree_with`'s run, with the roots' prefix locks taken inside DEST before the workspace exists and
 /// released on every path before `finish`.
 pub fn trees<F: DestinationRoot>(
     fs: &F,
