@@ -148,6 +148,7 @@ struct CopyArgs {
     /// In a tree copy a file of 64 MiB or more continues after the longest leading run of chunks whose digests match on
     /// both the source and the destination; every other half-copied file is recopied, and a half-copied single file of 64 MiB or more is validated by re-reading and hashing it against the source (`--resume-verify=chunks` runs as `full` for a single file). Under
     /// --durability=normal a checkpoint is advisory and is validated against the data before it is trusted.
+    /// With several sources the per-root lines count this run's work only; files skipped as already complete are in the totals and the `resumed` line.
     #[arg(long, conflicts_with = "restart")]
     resume: bool,
     /// How a half-copied large file is validated before --resume continues it: `chunks` (the default) proves each

@@ -1124,7 +1124,7 @@ Each is deferred to the cut that first reads it (cut 7b spec, `docs/superpowers/
       unproven data; that argument was not measured, and the spec amendment is the owner's call. Decision 15's real-filesystem crash tests are the
       `real-filesystem crash-injection harness` item, still open, under "Cut 9e debt" above (the test-audit debt entry
       near line 593).
-- [ ] **`roots` (§19, §18.3)** - the manifest now carries several roots (format 5, several-sources cut). Resume over several sources landed in cut 19 (2026-10-28), as `--restart` did in cut 17 and `--dry-run` in cut 18.
+- [x] **`roots` (§19, §18.3)** - the manifest now carries several roots (format 5, several-sources cut). Resume over several sources landed in cut 19 (2026-10-28), as `--restart` did in cut 17 and `--dry-run` in cut 18.
 - [ ] **`last_heartbeat_monotonic` (§229.2)** - cut 9: "diagnostic/current-session data only".
 - [ ] **Finishing a prior run's `cleanup_pending` (§21.1 "may", §218)** - cut 9: a COMPLETED prior with
       `cleanup_pending = true` and its artifact list is proceeded past and left.

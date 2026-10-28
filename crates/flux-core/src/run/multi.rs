@@ -710,7 +710,7 @@ pub fn trees<F: DestinationRoot>(
     // A one-root manifest would be format 4 with a `kind`, which the validator rejects: the caller routes one source
     // to `tree` or `file`.
     // A resume (`--resume`) adopts in `MultiPlace::adopt`, which takes the prefix locks under this run's id; `remove` of
-    // a prior's id retires only a workspace and leaves those locks held.
+    // a prior's id retires only the workspace; `settle` has already released this run's locks.
     debug_assert!(specs.len() >= 2, "one source is `tree` or `file`");
     let mut run = Run {
         copy: None,
@@ -2582,6 +2582,24 @@ mod trees_tests {
     }
 
     #[test]
+    fn a_resume_after_a_kill_inside_the_first_root_finishes_the_run() {
+        // `crashed_ab`'s crash (the publish of `a/x`), on the timed fake.
+        let n = reference(fake_timed, &["a", "b"], "rename_no_replace", "/p/dest/a/x");
+        let fs = fake_timed();
+        crash(&fs, &["a", "b"], "rename_no_replace", n);
+        assert_eq!(prefix_lock_files(&fs).len(), 2, "{:?}", prefix_lock_files(&fs));
+        let (r, _) = go_with(&fs, two(), &opts(), &resume_cfg(0x22));
+        ok(&r);
+        match &r.run.resumed {
+            Some(ResumeNote::Adopted { operation_id, .. }) => assert_eq!(operation_id, ID),
+            other => panic!("expected an adoption, got {other:?}"),
+        }
+        expect_tree(&fs);
+        assert!(lock_files(&fs).is_empty(), "{:?}", lock_files(&fs));
+        assert!(!fs.exists(format!("/p/dest/.flux/operations/{ID}")));
+    }
+
+    #[test]
     fn a_second_kill_and_a_second_resume_finish_the_run() {
         // The reference resume says which publish of `b/k` to die at.
         let reference_fs = crashed_late();
@@ -2621,6 +2639,7 @@ mod trees_tests {
         );
         // The destination lock's record is written only after the workspace exists, so the dead run left it empty:
         // the run is told to break it.
+        // The engine accepts `break_lock` with `resume`; through the CLI this state needs `--restart --break-lock`.
         let c = RunConfig { break_lock: true, ..resume_cfg(0x22) };
         let (r, _) = go_with(&fs, two(), &opts(), &c);
         ok(&r);

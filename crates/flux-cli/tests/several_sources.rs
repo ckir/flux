@@ -761,7 +761,7 @@ fn a_resume_with_a_replaced_source_is_refused_naming_restart() {
     assert_eq!(replaced.status.code(), Some(3), "stderr: {err}");
     assert!(err.contains("INCOMPATIBLE_STATE"), "{err}");
     assert!(err.contains("--restart"), "{err}");
-    assert!(err.contains("root "), "{err}");
+    assert!(err.contains("root beta: the source root differs"), "{err}");
 }
 
 #[cfg(target_os = "linux")]
@@ -817,6 +817,7 @@ fn a_dry_resume_with_a_changed_list_exits_3_naming_restart() {
     assert_eq!(dry.status.code(), Some(3), "stderr: {err}");
     assert!(err.contains("INCOMPATIBLE_STATE"), "{err}");
     assert!(err.contains("--restart"), "{err}");
+    assert!(err.contains("root beta: the source root differs"), "{err}");
     assert_eq!(snapshot(d.path()), before);
 }
 
