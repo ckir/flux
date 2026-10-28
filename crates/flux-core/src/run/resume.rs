@@ -11,9 +11,10 @@ use super::{RunError, RunWarning};
 use crate::lock::{LockCode, LockError};
 use crate::prior::{PriorOp, corrupt};
 use crate::state::{
-    Config, FORMAT_VERSION, Options, Root, V1, V2, from_native_hex, parse_identity,
+    Config, FORMAT_VERSION, Options, Root, RootKind, V1, V2, from_native_hex, parse_identity,
 };
 use flux_fs::{CopyOptions, FileIdentity};
+use std::path::PathBuf;
 
 fn refused(code: LockCode, detail: String) -> RunError {
     RunError::Refused {
@@ -77,7 +78,7 @@ pub(crate) fn validate(
             },
         );
     }
-    let mut by_path = None;
+    let mut by_path: Vec<PathBuf> = Vec::new();
     if roots.len() != stored.roots.len() {
         return Err(incompatible(format!(
             "the source roots differ: the operation has {} roots, this run names {}; run again with --restart to supersede it",
@@ -85,24 +86,43 @@ pub(crate) fn validate(
             roots.len()
         )));
     }
-    if let (Some(then), Some(now)) = (stored.roots.first(), roots.first()) {
-        let strong = |text: &str| match parse_identity(text) {
-            Some(id @ FileIdentity::Strong(_)) => Some(id),
-            _ => None,
-        };
+    let strong = |text: &str| match parse_identity(text) {
+        Some(id @ FileIdentity::Strong(_)) => Some(id),
+        _ => None,
+    };
+    for (then, now) in stored.roots.iter().zip(roots) {
+        // With several roots every refusal names the stored root by its destination prefix.
+        let tag = (stored.roots.len() > 1).then(|| shown(&then.destination_prefix));
+        let tag = tag.as_deref();
+        if let (Some(was), Some(asks)) = (then.kind, now.kind)
+            && was != asks
+        {
+            let word = |k: RootKind| if k == RootKind::Tree { "folder" } else { "file" };
+            return Err(incompatible(tagged(
+                tag,
+                &format!(
+                    "the operation copies a {}, this run's source is a {}; run again with --restart to supersede it",
+                    word(was),
+                    word(asks)
+                ),
+            )));
+        }
         match (strong(&then.source_identity), strong(&now.source_identity)) {
             (Some(a), Some(b)) if a == b => {}
-            (Some(_), Some(_)) => return Err(source_mismatch(Some(then), Some(now))),
+            (Some(_), Some(_)) => return Err(source_mismatch(tag, Some(then), Some(now))),
             _ if then.source_root == now.source_root => {
-                by_path = Some(from_native_hex(&now.source_root).unwrap_or_default());
+                by_path.push(from_native_hex(&now.source_root).unwrap_or_default());
             }
-            _ => return Err(source_mismatch(Some(then), Some(now))),
+            _ => return Err(source_mismatch(tag, Some(then), Some(now))),
         }
         if then.destination_prefix != now.destination_prefix {
-            return Err(incompatible(format!(
-                "the destination differs: the operation writes {} and this run names {}; run again with --restart to supersede it",
-                shown(&then.destination_prefix),
-                shown(&now.destination_prefix)
+            return Err(incompatible(tagged(
+                tag,
+                &format!(
+                    "the destination differs: the operation writes {} and this run names {}; run again with --restart to supersede it",
+                    shown(&then.destination_prefix),
+                    shown(&now.destination_prefix)
+                ),
             )));
         }
     }
@@ -148,13 +168,16 @@ pub(crate) fn validate(
         }
         config.options.durability = now.durability;
     }
-    if let Some(path) = by_path {
-        warnings.push(RunWarning::ResumeMappingByPath(path));
-    }
+    warnings.extend(by_path.into_iter().map(RunWarning::ResumeMappingByPath));
     Ok(config)
 }
 
-fn source_mismatch(then: Option<&Root>, now: Option<&Root>) -> RunError {
+/// A refusal text, prefixed `root <name>: ` when the operation has several roots.
+fn tagged(tag: Option<&str>, text: &str) -> String {
+    tag.map_or_else(|| text.to_string(), |name| format!("root {name}: {text}"))
+}
+
+fn source_mismatch(tag: Option<&str>, then: Option<&Root>, now: Option<&Root>) -> RunError {
     let describe = |r: Option<&Root>| {
         r.map_or_else(
             || ("no source root".to_string(), "none".to_string()),
@@ -163,8 +186,11 @@ fn source_mismatch(then: Option<&Root>, now: Option<&Root>) -> RunError {
     };
     let (then_path, then_id) = describe(then);
     let (now_path, now_id) = describe(now);
-    incompatible(format!(
-        "the source root differs: the operation copies {then_path} ({then_id}), this run names {now_path} ({now_id}); run again with --restart to supersede it"
+    incompatible(tagged(
+        tag,
+        &format!(
+            "the source root differs: the operation copies {then_path} ({then_id}), this run names {now_path} ({now_id}); run again with --restart to supersede it"
+        ),
     ))
 }
 
@@ -366,6 +392,89 @@ mod tests {
             "{detail}"
         );
         assert!(detail.contains("--restart"), "{detail}");
+    }
+
+    fn mroot(name: &str, identity: &str, kind: crate::state::RootKind) -> Root {
+        Root {
+            destination_prefix: native_hex(std::path::Path::new(name)),
+            kind: Some(kind),
+            ..root(&format!("/{name}"), identity)
+        }
+    }
+
+    fn multi_prior(roots: Vec<Root>) -> PriorOp {
+        let state = OperationState::created(
+            ID,
+            Kind::Tree,
+            std::path::Path::new("/d"),
+            1,
+            None,
+            Config::new(roots, Options::of(&opts())),
+        );
+        PriorOp { state, shown: shown() }
+    }
+
+    #[test]
+    fn a_swapped_pair_of_roots_is_refused_naming_the_first_root() {
+        use crate::state::RootKind::Tree;
+        let a = mroot("a", "strong:3:1", Tree);
+        let b = mroot("b", "strong:3:2", Tree);
+        let prior = multi_prior(vec![a.clone(), b.clone()]);
+        let (code, detail) = refused(run(&prior, &[b, a], &opts()).0);
+        assert_eq!(code, LockCode::IncompatibleState);
+        assert!(detail.starts_with("root a: the source root differs"), "{detail}");
+        assert!(detail.contains("--restart"), "{detail}");
+    }
+
+    #[test]
+    fn a_changed_kind_is_refused_naming_the_root_and_restart() {
+        use crate::state::RootKind::{File, Tree};
+        let a = mroot("a", "strong:3:1", Tree);
+        let prior = multi_prior(vec![a.clone(), mroot("b", "strong:3:2", Tree)]);
+        let now = [a, mroot("b", "strong:3:2", File)];
+        let (code, detail) = refused(run(&prior, &now, &opts()).0);
+        assert_eq!(code, LockCode::IncompatibleState);
+        assert_eq!(
+            detail,
+            "root b: the operation copies a folder, this run's source is a file; run again with --restart to supersede it"
+        );
+    }
+
+    #[test]
+    fn a_renamed_root_is_refused_with_the_destination_text() {
+        use crate::state::RootKind::Tree;
+        let a = mroot("a", "strong:3:1", Tree);
+        let prior = multi_prior(vec![a.clone(), mroot("b", "strong:3:2", Tree)]);
+        let now = [
+            a,
+            Root {
+                destination_prefix: native_hex(std::path::Path::new("c")),
+                ..mroot("b", "strong:3:2", Tree)
+            },
+        ];
+        let (code, detail) = refused(run(&prior, &now, &opts()).0);
+        assert_eq!(code, LockCode::IncompatibleState);
+        assert!(detail.starts_with("root b: the destination differs"), "{detail}");
+    }
+
+    #[test]
+    fn every_weak_root_matched_by_path_warns_once() {
+        use crate::state::RootKind::Tree;
+        let roots = vec![mroot("a", "weak:3:1", Tree), mroot("b", "weak:3:2", Tree)];
+        let prior = multi_prior(roots.clone());
+        let (r, w) = run(&prior, &roots, &opts());
+        assert!(r.is_ok(), "{:?}", r.err());
+        assert_eq!(w.len(), 2);
+        assert!(matches!(&w[0], RunWarning::ResumeMappingByPath(p) if p == &PathBuf::from("/a")));
+        assert!(matches!(&w[1], RunWarning::ResumeMappingByPath(p) if p == &PathBuf::from("/b")));
+    }
+
+    #[test]
+    fn a_one_root_refusal_has_no_root_tag() {
+        let other = prior3(|c| c.roots[0] = root("/s", "strong:3:10"));
+        let (_, detail) = refused(run(&other, &roots_now(), &opts()).0);
+        assert!(detail.starts_with("the source root differs"), "{detail}");
+        assert!(!detail.starts_with("root "), "{detail}");
     }
 
     #[test]
