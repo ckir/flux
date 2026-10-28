@@ -1124,14 +1124,15 @@ Each is deferred to the cut that first reads it (cut 7b spec, `docs/superpowers/
       unproven data; that argument was not measured, and the spec amendment is the owner's call. Decision 15's real-filesystem crash tests are the
       `real-filesystem crash-injection harness` item, still open, under "Cut 9e debt" above (the test-audit debt entry
       near line 593).
-- [ ] **`roots` (§19, §18.3)** - the manifest now carries several roots (format 5, several-sources cut). What remains is resume over several sources (see "Several sources known limits"); `--restart` landed in cut 17 and `--dry-run` in cut 18.
+- [ ] **`roots` (§19, §18.3)** - the manifest now carries several roots (format 5, several-sources cut). Resume over several sources landed in cut 19 (2026-10-28), as `--restart` did in cut 17 and `--dry-run` in cut 18.
 - [ ] **`last_heartbeat_monotonic` (§229.2)** - cut 9: "diagnostic/current-session data only".
 - [ ] **Finishing a prior run's `cleanup_pending` (§21.1 "may", §218)** - cut 9: a COMPLETED prior with
       `cleanup_pending = true` and its artifact list is proceeded past and left.
 - [ ] **Stale classification from heartbeat age (§102)** - cut 9.
 
 ## Several sources known limits (`flux copy a b c DEST`; spec `docs/superpowers/specs/2026-10-22-several-sources-design.md`)
-- [ ] **`--resume` with several sources (L1).** It is a usage error. `--dry-run` (also with `--restart`) works with several sources since cut 18 (2026-10-28). `--restart` and `--break-lock` work with several sources since cut 17 (2026-10-28): after an aborted several-source run, `flux copy --restart a b c DEST` supersedes it at once. `--break-lock` takes over the DESTINATION lock only.
+- [x] **`--resume` with several sources (L1).** Closed in cut 19 (2026-10-28): `flux copy --resume a b c DEST` resumes an aborted several-source run (the same source list; a changed list is refused `INCOMPATIBLE_STATE` naming `--restart`) and `--dry-run --resume` previews it. History: it was a usage error. `--dry-run` (also with `--restart`) works with several sources since cut 18 (2026-10-28). `--restart` and `--break-lock` work with several sources since cut 17 (2026-10-28): after an aborted several-source run, `flux copy --restart a b c DEST` supersedes it at once. `--break-lock` takes over the DESTINATION lock only.
+- [ ] **`FaultFs::write_file` over a `state.db` is not seen by an open fake claim store (found in cut 19 task 2; reported, unverified).**
 - [ ] **The source cap has no measured value on Windows.** The cap is computed at run time from the descriptor limit. Windows has no measured number.
 - [ ] **A walk skip for stray `*.flux-lock` files (spec V11).** A stale prefix lock copied as payload when a DEST is later used as a source.
 - [ ] **`LockSite::named` accepts a lock name its recovery rename cannot hold.** A dead lock whose name is 216 to 255 units can be acquired but never recovered. Measured on ext4: errno 36. See `crates/flux-core/src/lock/site.rs:82`, `broken_name` at `site.rs:108` and the rename at `crates/flux-core/src/lock/recover.rs:42`. The several-sources cut guards prefix locks only, with `prefix_lock_fits`.

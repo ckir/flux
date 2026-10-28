@@ -766,6 +766,62 @@ fn a_resume_with_a_replaced_source_is_refused_naming_restart() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn a_dry_resume_over_a_killed_run_prints_the_plan_and_changes_nothing() {
+    let d = TempDir::new().unwrap();
+    let marks = TempDir::new().unwrap();
+    let (alpha, beta) = (folder(d.path(), "alpha"), folder(d.path(), "beta"));
+    let out = d.path().join("out");
+    Stalled::start_several(&[&alpha, &beta], &out, STALL_AT_AFTER_FIRST_ROOT, marks.path(), &[])
+        .kill();
+    assert!(has_partial_a(&out.join("beta")), "{:?}", snapshot(&out).keys().collect::<Vec<_>>());
+    let before = snapshot(d.path());
+
+    let dry = flux()
+        .current_dir(d.path())
+        .args(["copy", "--dry-run", "--resume", "--json", "alpha", "beta", "out"])
+        .output()
+        .unwrap();
+
+    let err = stderr(&dry);
+    assert_eq!(dry.status.code(), Some(0), "stderr: {err}");
+    let v = json(&dry);
+    assert_eq!(v["dry_run"], true, "{v}");
+    let roots = v["roots"].as_array().unwrap_or_else(|| panic!("{v}"));
+    assert_eq!(roots.len(), 2, "{v}");
+    let names: Vec<&str> = roots.iter().map(|r| r["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["alpha", "beta"], "{v}");
+    let unprobed = v["unprobed"].as_array().unwrap_or_else(|| panic!("{v}"));
+    assert!(unprobed.iter().any(|k| k == "owner_liveness"), "{v}");
+    assert!(err.contains("would copy"), "{err}");
+    assert!(err.contains("dry run: would resume 2 already-complete files"), "{err}");
+    assert_eq!(snapshot(d.path()), before, "a dry --resume recovers and rewrites nothing");
+}
+
+#[test]
+fn a_dry_resume_with_a_changed_list_exits_3_naming_restart() {
+    let d = TempDir::new().unwrap();
+    let marks = TempDir::new().unwrap();
+    let (alpha, beta) = (folder(d.path(), "alpha"), folder(d.path(), "beta"));
+    let out = d.path().join("out");
+    Stalled::start_several(&[&alpha, &beta], &out, STALL_AT, marks.path(), &[]).kill();
+    folder(d.path(), "gamma");
+    let before = snapshot(d.path());
+
+    let dry = flux()
+        .current_dir(d.path())
+        .args(["copy", "--dry-run", "--resume", "--json", "alpha", "gamma", "out"])
+        .output()
+        .unwrap();
+
+    let err = stderr(&dry);
+    assert_eq!(dry.status.code(), Some(3), "stderr: {err}");
+    assert!(err.contains("INCOMPATIBLE_STATE"), "{err}");
+    assert!(err.contains("--restart"), "{err}");
+    assert_eq!(snapshot(d.path()), before);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn a_resume_with_a_reordered_list_resumes_normally() {
     let d = TempDir::new().unwrap();
     let marks = TempDir::new().unwrap();

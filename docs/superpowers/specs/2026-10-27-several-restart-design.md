@@ -32,6 +32,7 @@ Non-goals (each stays in `TODO.md`)
 - N3. Any change to the lease rule or to `flux cleanup`.
 - N4. `--restart` with `--dry-run` for several sources (it stays the `--dry-run` usage error).
   Update 2026-10-28: cut 18 built `--dry-run` for several sources, with and without `--restart`, `docs/superpowers/specs/2026-10-28-several-dry-run-design.md`; N1 and N4 are closed for `--dry-run`, `--resume` remains.
+  Update 2026-10-28 (cut 19): --resume and --dry-run --resume with several sources are built, docs/superpowers/specs/2026-10-28-several-resume-design.md.
 
 Anti-goals (a failure even if the tests pass)
 - A1. A restart that releases this run's own prefix locks while it supersedes a prior (the defect at `multi.rs:300-309`, see 3.2): the copy would then run with no namespace guard.
