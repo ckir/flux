@@ -597,14 +597,32 @@ impl<F: DestinationRoot> Place<F::Dir> for MultiPlace<'_, F> {
 
     fn adopt(
         &mut self,
-        _prior: &OperationState,
-        _durability: Durability,
-        _warnings: &mut Vec<RunWarning>,
+        prior: &OperationState,
+        durability: Durability,
+        warnings: &mut Vec<RunWarning>,
     ) -> Result<Option<AdoptedStore>, RunError> {
-        Err(refused_state(
-            LockCode::IncompatibleState,
-            "resuming several sources is not supported in this version".to_string(),
-        ))
+        // The prefix locks are taken as `create` takes them, under this run's id (spec 4.3).
+        let dir = self.lock_directory()?;
+        let names: Vec<OsString> = self.roots.iter().map(|r| r.name.clone()).collect();
+        let id: PrefixId<'_> = self.prefix_id.as_ref();
+        let (locks, leftovers) = match PrefixLocks::acquire(dir, self.capability, &names, &id) {
+            Ok(taken) => taken,
+            // `acquire` has released what it took.
+            Err(refusal) => return Err(self.prefix_error(refusal)),
+        };
+        *self.prefix.get_mut() = Some(locks);
+        for name in leftovers {
+            warnings.push(RunWarning::BrokenLeftover(self.tree.dest_shown.join(name)));
+        }
+        let adopted = match self.check_targets() {
+            Ok(()) => self.tree.adopt(prior, durability, warnings),
+            Err(e) => Err(e),
+        };
+        if adopted.is_err() {
+            let failed = self.release_prefix_locks();
+            self.warn_release(failed, warnings);
+        }
+        adopted
     }
 }
 
@@ -688,9 +706,8 @@ pub fn trees<F: DestinationRoot>(
 ) -> MultiRun {
     // A one-root manifest would be format 4 with a `kind`, which the validator rejects: the caller routes one source
     // to `tree` or `file`.
-    // Adoption (`--resume`) is the unsupported case: `MultiPlace::remove` releases the prefix locks only for this
-    // run's own id, so a supersede (`--restart`) removing a prior's workspace leaves them held.
-    debug_assert!(!cfg.resume, "several sources do not support --resume");
+    // A resume (`--resume`) adopts in `MultiPlace::adopt`, which takes the prefix locks under this run's id; `remove` of
+    // a prior's id retires only a workspace and leaves those locks held.
     debug_assert!(specs.len() >= 2, "one source is `tree` or `file`");
     let mut run = Run {
         copy: None,
@@ -1350,20 +1367,6 @@ mod tests {
         assert_eq!(p.kind(), Kind::Tree);
         assert_eq!(p.workspace_path(ID), format!("operations/{ID}"));
     }
-
-    #[test]
-    fn adopting_a_prior_is_refused_as_an_incompatible_state() {
-        let fx = fx();
-        let mut p = place(&fx, vec![root("data", RootKind::Tree)]);
-        let r = p.adopt(&state(), Durability::Normal, &mut Vec::new());
-        match r {
-            Err(RunError::Refused { refusal, changed: false, .. }) => {
-                assert_eq!(refusal.code, LockCode::IncompatibleState);
-                assert!(refusal.detail.contains("resuming several sources is not supported"));
-            }
-            other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
-        }
-    }
 }
 
 /// `run::trees` on the fake filesystem. `/src/{a,b,c}` are folders, `/src/f` is a file; `/p` exists and `/p/dest` does
@@ -1373,7 +1376,7 @@ mod trees_tests {
     use super::*;
     use crate::dry_run::{PlannedAction, PlannedObject};
     use crate::fault_fs::FaultFs;
-    use crate::run::ResumeVerify;
+    use crate::run::{ResumeNote, ResumeVerify};
     use crate::state::{OpState, decode as decode_state, from_native_hex};
     use flux_fs::{ExistingPolicy, FileSystem, Links, ObjectId, Preserve, Publish, Safety};
     use std::sync::{Arc, Mutex};
@@ -2457,6 +2460,287 @@ mod trees_tests {
         let fs = fake();
         crash(&fs, &["a", "b"], "rename_no_replace", n);
         fs
+    }
+
+    fn resume_cfg(n: u8) -> RunConfig {
+        RunConfig { operation_id: format!("{:032x}", n), resume: true, ..cfg() }
+    }
+
+    fn two() -> Vec<SourceSpec> {
+        ["a", "b"].map(spec).to_vec()
+    }
+
+    /// `crash` for a run under `c`, which `crash` itself cannot take.
+    fn crash_under(fs: &FaultFs, c: &RunConfig, op: &str, nth: u32) {
+        fs.on_nth(op, nth, |_| panic!("the test's crash point"));
+        let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            go_with(fs, two(), &opts(), c)
+        }));
+        assert!(died.is_err(), "the run was meant to die at {op} #{nth}");
+    }
+
+    /// The 1-based count, among the calls named `op`, of the first one at or after log index `mark` that mentions
+    /// `needle`.
+    fn nth_after(fs: &FaultFs, mark: usize, op: &str, needle: &str) -> u32 {
+        let head = format!("{op}(");
+        let log = calls(fs);
+        let mut n = 0;
+        for (i, c) in log.iter().enumerate() {
+            if c.starts_with(&head) {
+                n += 1;
+                if i >= mark && c.contains(needle) {
+                    return n;
+                }
+            }
+        }
+        panic!("no {op} mentioning {needle} after {mark} in {log:?}");
+    }
+
+    /// `fake()` with a modification time on every source file: a resume skips a complete file only when the
+    /// source and destination times agree, and the fake leaves them unset.
+    fn fake_timed() -> FaultFs {
+        let fs = fake();
+        for path in ["/src/a/x", "/src/a/sub/y", "/src/b/k", "/src/c/z", "/src/f"] {
+            fs.set_modified(path, secs(1_000));
+        }
+        fs
+    }
+
+    /// A fake whose `["a", "b"]` run died at the publish of `b/k`: `a` is complete, `b` partial.
+    fn crashed_late() -> FaultFs {
+        let n = reference(fake_timed, &["a", "b"], "rename_no_replace", "/p/dest/b/k");
+        let fs = fake_timed();
+        crash(&fs, &["a", "b"], "rename_no_replace", n);
+        fs
+    }
+
+    fn expect_tree(fs: &FaultFs) {
+        assert_eq!(fs.read_file("/p/dest/a/x").as_deref(), Some(&b"ax"[..]));
+        assert_eq!(fs.read_file("/p/dest/a/sub/y").as_deref(), Some(&b"ay"[..]));
+        assert_eq!(fs.read_file("/p/dest/b/k").as_deref(), Some(&b"bk"[..]));
+    }
+
+    #[test]
+    fn a_several_source_resume_continues_a_crashed_run() {
+        let fs = crashed_late();
+        assert_eq!(prefix_lock_files(&fs).len(), 2, "{:?}", prefix_lock_files(&fs));
+        let mark = calls(&fs).len();
+        let (r, _) = go_with(&fs, two(), &opts(), &resume_cfg(0x22));
+        let out = ok(&r);
+        match &r.run.resumed {
+            Some(ResumeNote::Adopted { operation_id, .. }) => assert_eq!(operation_id, ID),
+            other => panic!("expected an adoption, got {other:?}"),
+        }
+        assert!(out.files_resumed >= 1, "{out:?}");
+        let log = calls(&fs);
+        let after = &log[mark..];
+        assert!(
+            !after.iter().any(|c| c.starts_with("create_new(") && c.contains("/p/dest/a/x")),
+            "the completed file is not copied again: {after:?}"
+        );
+        expect_tree(&fs);
+        assert!(lock_files(&fs).is_empty(), "{:?}", lock_files(&fs));
+        assert!(!fs.exists(format!("/p/dest/.flux/operations/{ID}")));
+    }
+
+    #[test]
+    fn a_second_kill_and_a_second_resume_finish_the_run() {
+        // The reference resume says which publish of `b/k` to die at.
+        let reference_fs = crashed_late();
+        let mark = calls(&reference_fs).len();
+        let (r, _) = go_with(&reference_fs, two(), &opts(), &resume_cfg(0x22));
+        ok(&r);
+        let n = nth_after(&reference_fs, mark, "rename_no_replace", "/p/dest/b/k");
+
+        let fs = crashed_late();
+        crash_under(&fs, &resume_cfg(0x22), "rename_no_replace", n);
+        assert_eq!(manifest(&fs).state, OpState::Transferring);
+        let (r, _) = go_with(&fs, two(), &opts(), &resume_cfg(0x33));
+        ok(&r);
+        expect_tree(&fs);
+        assert!(lock_files(&fs).is_empty(), "{:?}", lock_files(&fs));
+        // Each resume sets the previous run's lock aside under ITS OWN id (and removes the aside once its own lock is
+        // taken), so the call log names both.
+        let log = calls(&fs);
+        for name in ["a", "b"] {
+            for n in [0x22u8, 0x33] {
+                let aside = format!(
+                    "rename_no_replace(/p/dest/{name}.flux-lock -> /p/dest/{name}.flux-lock.broken.{n:032x})"
+                );
+                assert!(log.contains(&aside), "no {aside} in {log:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_resume_with_no_prior_starts_new_over_prefix_lock_residue() {
+        let n = reference(fake, &["a", "b"], "create_lock", "/p/dest/b.flux-lock");
+        let fs = fake();
+        crash(&fs, &["a", "b"], "create_lock", n);
+        assert!(
+            fs.exists("/p/dest/a.flux-lock")
+                && !fs.exists(format!("/p/dest/.flux/operations/{ID}"))
+        );
+        // The destination lock's record is written only after the workspace exists, so the dead run left it empty:
+        // the run is told to break it.
+        let c = RunConfig { break_lock: true, ..resume_cfg(0x22) };
+        let (r, _) = go_with(&fs, two(), &opts(), &c);
+        ok(&r);
+        assert!(matches!(r.run.resumed, Some(ResumeNote::StartedNew)), "{:?}", r.run.resumed);
+        expect_tree(&fs);
+        assert!(lock_files(&fs).is_empty(), "{:?}", lock_files(&fs));
+    }
+
+    /// Every prefix lock file is removed before the destination's own lock file is, in the calls after `mark`: the
+    /// refusal releases them inside `adopt`, while the destination lock still protects DEST.
+    fn assert_prefix_locks_go_before_the_destination_lock(fs: &FaultFs, mark: usize) {
+        let log = calls(fs);
+        let after = &log[mark..];
+        let dest = after
+            .iter()
+            .position(|c| *c == format!("remove_file({LOCK})"))
+            .expect("the destination lock is discarded");
+        for name in ["a", "b"] {
+            let release = format!("remove_file(/p/dest/{name}.flux-lock)");
+            let at =
+                after.iter().position(|c| *c == release).unwrap_or_else(|| panic!("no {release}"));
+            assert!(
+                at < dest,
+                "{release} at {at} comes after the destination lock at {dest}: {after:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_resume_whose_adoption_is_refused_leaves_no_lock_file() {
+        // A target that is no longer what the prior recorded.
+        let fs = crashed_ab();
+        assert!(!fs.exists("/p/dest/b"), "the crash came before root b");
+        fs.write_file("/p/dest/b", b"in the way");
+        let mark = calls(&fs).len();
+        let (r, _) = go_with(&fs, two(), &opts(), &resume_cfg(0x22));
+        match &r.run.stop {
+            Some(RunError::Refused { refusal, .. }) => {
+                assert_eq!(refusal.code, LockCode::DestinationNamespaceCollision);
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(prefix_lock_files(&fs).is_empty(), "{:?}", prefix_lock_files(&fs));
+        assert_eq!(manifest(&fs).state, OpState::Transferring);
+        assert!(fs.exists(format!("/p/dest/.flux/operations/{ID}")));
+        assert_prefix_locks_go_before_the_destination_lock(&fs, mark);
+
+        // A torn store.
+        let fs = crashed_ab();
+        let ops = format!("/p/dest/.flux/operations/{ID}");
+        // The fake keeps the dead run's store behind the file: take it out, then leave garbage in its place.
+        fs.destination_root(Path::new(&ops)).unwrap().remove_file(OsStr::new("state.db")).unwrap();
+        fs.write_file(format!("{ops}/state.db"), b"garbage");
+        let mark = calls(&fs).len();
+        let (r, _) = go_with(&fs, two(), &opts(), &resume_cfg(0x22));
+        match &r.run.stop {
+            Some(RunError::Refused { refusal, .. }) => {
+                assert_eq!(refusal.code, LockCode::StateCorrupt);
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(prefix_lock_files(&fs).is_empty(), "{:?}", prefix_lock_files(&fs));
+        assert_eq!(manifest(&fs).state, OpState::Transferring);
+        assert_prefix_locks_go_before_the_destination_lock(&fs, mark);
+    }
+
+    #[test]
+    fn a_created_prior_without_a_store_resumes_with_a_fresh_store() {
+        // The first call after the destination lock's record is written and before the manifest turns TRANSFERRING:
+        // the manifest is CREATED and the store has no claims.
+        let marker = format!("remove_file(/p/dest/.flux/operations/{ID}/manifest.tmp)");
+        let n = {
+            let fs = fake();
+            let (r, _) = go(&fs, &["a", "b"]);
+            ok(&r);
+            let log = calls(&fs);
+            let at = log.iter().position(|c| *c == marker).expect("the transferring manifest");
+            u32::try_from(log[..=at].iter().filter(|c| c.starts_with("remove_file(")).count())
+                .unwrap()
+        };
+        for how in 0..3 {
+            let fs = fake();
+            crash(&fs, &["a", "b"], "remove_file", n);
+            assert_eq!(manifest(&fs).state, OpState::Created, "{how}");
+            let ops = format!("/p/dest/.flux/operations/{ID}");
+            // The fake keeps the dead run's store behind the file: take it out first.
+            fs.destination_root(Path::new(&ops))
+                .unwrap()
+                .remove_file(OsStr::new("state.db"))
+                .unwrap();
+            match how {
+                0 => {}
+                1 => fs.write_file(format!("{ops}/state.db"), b""),
+                _ => fs.write_file(format!("{ops}/state.db"), b"garbage"),
+            }
+            let (r, _) = go_with(&fs, two(), &opts(), &resume_cfg(0x22));
+            ok(&r);
+            match &r.run.resumed {
+                Some(ResumeNote::Adopted { operation_id, .. }) => assert_eq!(operation_id, ID),
+                other => panic!("{how}: expected an adoption, got {other:?}"),
+            }
+            expect_tree(&fs);
+            assert!(lock_files(&fs).is_empty(), "{how}: {:?}", lock_files(&fs));
+        }
+    }
+
+    #[test]
+    fn a_one_source_prior_and_a_several_source_resume_refuse_each_other() {
+        // A one-source prior, a several-source resume.
+        let n = reference(fake, &["a", "b"], "rename_no_replace", "/p/dest/a/x");
+        let fs = fake();
+        fs.on_nth("rename_no_replace", n, |_| panic!("the test's crash point"));
+        let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::run::tree(
+                &fs,
+                Path::new("/src/a"),
+                Path::new("/p/dest"),
+                &opts(),
+                &cfg(),
+                &mut |_| {},
+            )
+        }));
+        assert!(died.is_err());
+        let (r, _) = go_with(&fs, two(), &opts(), &resume_cfg(0x22));
+        match &r.run.stop {
+            Some(RunError::Refused { refusal, .. }) => {
+                assert_eq!(refusal.code, LockCode::IncompatibleState);
+                assert!(
+                    refusal.detail.contains("the operation has 1 roots, this run names 2"),
+                    "{}",
+                    refusal.detail
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(lock_files(&fs).iter().all(|p| p == LOCK) && prefix_lock_files(&fs).is_empty());
+
+        // A several-source prior, a one-source resume.
+        let fs = crashed_ab();
+        let r = crate::run::tree(
+            &fs,
+            Path::new("/src/a"),
+            Path::new("/p/dest"),
+            &opts(),
+            &resume_cfg(0x22),
+            &mut |_| {},
+        );
+        match &r.stop {
+            Some(RunError::Refused { refusal, .. }) => {
+                assert_eq!(refusal.code, LockCode::IncompatibleState);
+                assert!(
+                    refusal.detail.contains("the operation has 2 roots, this run names 1"),
+                    "{}",
+                    refusal.detail
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 
     #[test]
