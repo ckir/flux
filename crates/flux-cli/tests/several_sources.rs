@@ -148,42 +148,6 @@ fn dest_that_is_a_file_exits_2() {
 }
 
 #[test]
-fn resume_exits_2_naming_the_flag() {
-    let d = TempDir::new().unwrap();
-    let (alpha, beta) = (folder(d.path(), "alpha"), folder(d.path(), "beta"));
-    let out_dir = d.path().join("out");
-    let out = flux()
-        .arg("copy")
-        .arg("--resume")
-        .arg("--json")
-        .arg(&alpha)
-        .arg(&beta)
-        .arg(&out_dir)
-        .output()
-        .unwrap();
-    let err = stderr(&out);
-    assert_eq!(out.status.code(), Some(2), "{err}");
-    assert!(err.contains("error: --resume with several sources is not supported yet"), "{err}");
-    assert!(!err.contains("cleanup"), "{err}");
-    assert!(err.contains("run again with --restart"), "{err}");
-    assert!(out.stdout.is_empty(), "a usage error prints no JSON");
-    assert!(!out_dir.exists(), "nothing may be created");
-    // --dry-run passes the gate, so --dry-run --resume is refused for --resume.
-    let out = flux()
-        .args(["copy", "--dry-run", "--resume", "--json"])
-        .arg(&alpha)
-        .arg(&beta)
-        .arg(&out_dir)
-        .output()
-        .unwrap();
-    let err = stderr(&out);
-    assert_eq!(out.status.code(), Some(2), "{err}");
-    assert!(err.contains("--resume with several sources is not supported yet"), "{err}");
-    assert!(out.stdout.is_empty(), "a usage error prints no JSON");
-    assert!(!out_dir.exists(), "nothing may be created");
-}
-
-#[test]
 fn a_dry_run_of_several_sources_prints_the_plan_and_changes_nothing() {
     let d = TempDir::new().unwrap();
     let (alpha, beta) = (folder(d.path(), "alpha"), folder(d.path(), "beta"));
@@ -706,4 +670,98 @@ fn a_dry_restart_on_a_fresh_dest_exits_0() {
 
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     assert!(!out_dir.exists());
+}
+
+#[test]
+fn a_resume_over_a_killed_run_finishes_it() {
+    let d = TempDir::new().unwrap();
+    let marks = TempDir::new().unwrap();
+    let (alpha, beta) = (folder(d.path(), "alpha"), folder(d.path(), "beta"));
+    let out = d.path().join("out");
+    Stalled::start_several(&[&alpha, &beta], &out, STALL_AT, marks.path(), &[]).kill();
+    assert!(has_partial_a(&out.join("alpha")), "{:?}", snapshot(&out).keys().collect::<Vec<_>>());
+
+    let resumed = flux()
+        .current_dir(d.path())
+        .args(["copy", "--resume", "--json", "alpha", "beta", "out"])
+        .output()
+        .unwrap();
+
+    let err = stderr(&resumed);
+    assert_eq!(resumed.status.code(), Some(0), "stderr: {err}");
+    let v = json(&resumed);
+    let roots = v["roots"].as_array().unwrap_or_else(|| panic!("{v}"));
+    assert_eq!(roots.len(), 2, "{v}");
+    assert!(roots.iter().all(|r| r["status"] == "completed"), "{v}");
+    // The resumed count is the skipped count (as the one-source resume test asserts).
+    // Under the default durability a kill loses the unsynced claims, so the resume may find none and print no
+    // `resumed` line: then nothing was skipped.
+    let n: u64 = err.find("resumed ").map_or(0, |at| {
+        err[at + "resumed ".len()..]
+            .split(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap_or_else(|_| panic!("{err}"))
+    });
+    assert_eq!(Some(n), v["files_skipped"].as_u64(), "{err} {v}");
+    assert_eq!(snapshot(&out.join("alpha")), snapshot(&alpha));
+    assert_eq!(snapshot(&out.join("beta")), snapshot(&beta));
+    assert!(control_plane_names(&out).is_empty(), "{:?}", control_plane_names(&out));
+    assert!(!d.path().join("out.flux-lock").exists());
+    let locks: Vec<_> =
+        snapshot(d.path()).into_keys().filter(|k| k.ends_with(".flux-lock")).collect();
+    assert!(locks.is_empty(), "{locks:?}");
+}
+
+#[test]
+fn a_resume_with_a_changed_source_list_is_refused_naming_restart() {
+    let d = TempDir::new().unwrap();
+    let marks = TempDir::new().unwrap();
+    let (alpha, beta) = (folder(d.path(), "alpha"), folder(d.path(), "beta"));
+    let out = d.path().join("out");
+    Stalled::start_several(&[&alpha, &beta], &out, STALL_AT, marks.path(), &[]).kill();
+    // A swapped argument order is no change: the roots are sorted by their destination name (the result does not
+    // depend on argument order), so the changed list replaces a source.
+    folder(d.path(), "gamma");
+
+    let swapped = flux()
+        .current_dir(d.path())
+        .args(["copy", "--resume", "--json", "alpha", "gamma", "out"])
+        .output()
+        .unwrap();
+
+    let err = stderr(&swapped);
+    assert_eq!(swapped.status.code(), Some(3), "stderr: {err}");
+    assert!(err.contains("INCOMPATIBLE_STATE"), "{err}");
+    assert!(err.contains("--restart"), "{err}");
+    assert!(err.contains("root "), "{err}");
+}
+
+#[test]
+fn a_resume_with_no_prior_run_copies_normally() {
+    let d = TempDir::new().unwrap();
+    let (alpha, beta) = (folder(d.path(), "alpha"), folder(d.path(), "beta"));
+    let out_dir = d.path().join("out");
+
+    let out =
+        flux().args(["copy", "--resume"]).arg(&alpha).arg(&beta).arg(&out_dir).output().unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(snapshot(&out_dir.join("alpha")), snapshot(&alpha));
+    assert_eq!(snapshot(&out_dir.join("beta")), snapshot(&beta));
+}
+
+#[test]
+fn help_says_all_four_flags_work_with_one_or_several_sources() {
+    let out = flux().args(["copy", "--help"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).replace('\n', " ");
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        text.contains(
+            "--restart, --break-lock, --dry-run and --resume work with one or several sources"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("--resume needs exactly one source"), "{text}");
 }
