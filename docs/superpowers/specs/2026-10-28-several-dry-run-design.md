@@ -107,11 +107,14 @@ Real filesystem (`crates/flux-core/tests/dry_run_std_fs.rs` style): snapshot bef
 - R6. Prefix locks print one aggregated `DryRunPrefixLocks` note, not one `DryRunLockRecord` each (panel rounds 1 and 2: the existing note names no lock, and `dry_lock` pushes it itself, so the loop drops those).
 - R7. The alias check on lock files compares identities only (targets are not compared), and the fold-probe of step 2 (vi) predicts the fresh-destination case for ASCII case folding (owner decision 2026-10-28, after panel round 5 had narrowed the design to lock files only: build it in this cut). It is lazy, read-only, and every doubtful path is undecided.
 
-## 9. Panel record (adversarial panel, rounds 1 to 5 GREEN, round 6 on the fold-probe delta)
+## 9. Panel record (adversarial panel, rounds 1 to 5 GREEN, round 6 on the fold-probe delta, shipped at the round cap by owner decision)
 
 Rounds: 1 (solo FINDINGS-7, agy FINDINGS-4), 2 (FINDINGS-9, FINDINGS-3), 3 (FINDINGS-8, FINDINGS-4), 4 (FINDINGS-3, FINDINGS-2), 5 (solo FINDINGS-1 low, folded; agy GREEN). Each finding was verified against the code before it was folded; the folds that changed the design are R2 (amended), R6, R7 and the lock-file-only alias rule. After GREEN the owner asked for the fold-probe to be built in this cut (decision 2026-10-28); it was added as step 2 (vi), T16 and the amended N3 and R7, and reviewed as round 6 (delta). Every fold of one round was re-audited in the next and several were found wrong (the plain identity compare, the global `.flux-dir.lock` check, the aggregated note).
 
+Round 6 (delta, the fold-probe the owner asked for after GREEN): solo FINDINGS-2 (parent fallback for an existing DEST; unbounded candidate walk), agy FINDINGS-3 (the same fallback, a fixture that cannot coexist on a folding filesystem, two unkillable mutants); all folded. The round cap was reached with findings still arriving; the owner decided to ship (2026-10-28), with the accepted residual N3 (d). The plan panel and the capstone review the probe as code.
+
 ## Stand-downs
+- ACCEPTED-BY-OWNER (round 6): N3 (d), a parent-based fold answer for an existing empty DEST whose own case flag differs from its parent's on one volume.
 
 - REJECTED (round 3): "`plan_roots` does not bound name length": `roots.rs:113` calls `prefix_lock_fits`.
 - REJECTED (round 3): crediting an absent folder root's directory only after the walk's `root_state`: the live `folder_root` creates the directory first (`tree.rs:857`), so a live refusal after it is a changed run.
