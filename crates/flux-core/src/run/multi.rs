@@ -2370,10 +2370,15 @@ mod trees_tests {
         assert!(r2.stop.is_none(), "{:?}", r2.stop);
         let k = nth_of_from(&fs2, mark2, "create_new", &format!("operations/{ID}/manifest"));
 
-        let fs = crashed_ab();
-        fs.on_nth("create_new", k, |_| panic!("the restart's crash point"));
-        let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| one_source(&fs)));
-        assert!(died.is_err(), "the restart was meant to die before abandoning its prior");
+        // The twice-crashed fake: the several-source run died, then the one-source restart died before abandoning it.
+        let crashed_twice = || {
+            let fs = crashed_ab();
+            fs.on_nth("create_new", k, |_| panic!("the restart's crash point"));
+            let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| one_source(&fs)));
+            assert!(died.is_err(), "the restart was meant to die before abandoning its prior");
+            fs
+        };
+        let fs = crashed_twice();
         assert_eq!(manifest_of(&fs, ID).state, OpState::Transferring);
         // Measured: the restart died before it wrote anything past its own first manifest, which is still CREATED.
         assert_eq!(
@@ -2382,8 +2387,33 @@ mod trees_tests {
             "the restart's own workspace exists"
         );
 
+        // The reference restart on a fake crashed the same way says which `rename_no_replace` retires each prior.
+        let fs3 = crashed_twice();
+        let (r3, _) = go_with(&fs3, ["a", "b"].map(spec).to_vec(), &opts(), &restart_cfg(0x29));
+        ok(&r3);
+        let k_first = nth_of(&fs3, "rename_no_replace", &format!("operations/{ID}.removing"));
+        let k_second = nth_of(&fs3, "rename_no_replace", &format!("operations/{id2}.removing"));
+        // Both priors must have been marked ABANDONED, by this run, before their workspaces were retired: the content
+        // of every prior's manifest is read just before its own retiring rename.
+        let seen_first = watch_manifest_of(&fs, ID, "rename_no_replace", k_first);
+        let seen_second = watch_manifest_of(&fs, &id2, "rename_no_replace", k_second);
+
         let (r, _) = go_with(&fs, ["a", "b"].map(spec).to_vec(), &opts(), &restart_cfg(0x29));
         ok(&r);
+        for (which, seen) in
+            [("the crashed run", &seen_first), ("the crashed restart", &seen_second)]
+        {
+            let prior =
+                seen.lock().unwrap().clone().unwrap_or_else(|| {
+                    panic!("{which}: its manifest was read at its retiring rename")
+                });
+            assert_eq!(prior.state, OpState::Abandoned, "{which}");
+            assert_eq!(
+                prior.superseded_by.as_deref(),
+                Some(format!("{:032x}", 0x29).as_str()),
+                "{which}"
+            );
+        }
         assert!(!fs.exists(format!("/p/dest/.flux/operations/{ID}")));
         assert!(!fs.exists(format!("/p/dest/.flux/operations/{id2}")));
         assert_eq!(fs.read_file("/p/dest/a/x").as_deref(), Some(&b"ax"[..]));
