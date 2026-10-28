@@ -1,0 +1,77 @@
+# `flux copy --resume` with several sources (cut 19)
+
+Status: draft (2026-10-28), branch `feat/several-resume` off main `c7a4798f73f0e309fdca3fad04275f0cb8139fb6`. Not yet reviewed by a panel.
+
+## 1. Intent
+
+`flux copy a b c DEST` is one operation: one manifest (format 5, one `Root` per source), one `state.db` of claims keyed per root, one WAL, one destination lock, and one prefix lock file `DEST/<name>.flux-lock` per root. `--restart` (cut 17) and `--dry-run` (cut 18) work with several sources; `--resume` is the last flag the several-source flag gate refuses (`crates/flux-cli/src/main.rs:650`, `several_flag_gate`; the engine asserts `!cfg.resume` at `crates/flux-core/src/run/multi.rs:693`; `MultiPlace::adopt` refuses at `multi.rs:598`; the dry preview refuses at `multi.rs:938`). This cut lets an operator continue a killed several-source run exactly as `--resume` continues a one-source tree run, and preview that with `--dry-run --resume`.
+
+Owner decisions (2026-10-28): slicing F3(a): the real resume and the dry preview land in ONE cut (agy recommended it; the author preferred two cuts and the owner chose one). Settled by agy and the author without dissent: F1 exact source-list match; F2 re-take the prior's prefix locks at adoption; F4 the single keyed claim store suffices.
+
+## 2. Goals, non-goals, anti-goals
+
+Goals
+- G1. `flux copy --resume a b c DEST` over a killed several-source run continues it as the same operation: the files the prior completed are skipped and verified as the one-source resume does (cuts 9a, 9b, 9f, 15), the half-copied ones continue, the rest are copied; the prior's workspace is retired at the end; every prefix lock ends released.
+- G2. `--resume` with no resumable prior starts a new operation (`ResumeNote::StartedNew`), as the one-source resume does.
+- G3. The source list must equal the prior's: same count, and, root by root in prefix order, the same name, kind, and source (identity where `Strong`, else the lexical path). Any difference is `INCOMPATIBLE_STATE` naming the first differing root and `--restart`. Every other row of `resume::validate`'s table applies unchanged.
+- G4. `flux copy --dry-run --resume a b c DEST` previews the real invocation: the compatibility verdict, the claim count and recovery notes, the files it would skip, continue and copy, with the real run's refusal codes for what a read can decide. It writes nothing under DEST, takes no lock, and its output keys match the one-source dry resume's.
+- G5. Every refusal of the one-source resume has its several-source analogue with the same code (`INCOMPATIBLE_STATE`, `STATE_CORRUPT`, `COMMIT_STATE_UNCERTAIN`, the prefix-lock refusals).
+
+Non-goals
+- N1. A changed source list (an added, removed or reordered source), by any merge: it is refused and `--restart` is the way out.
+- N2. Resuming a one-source tree prior with several sources, or the converse: refused by the count row of `validate` (exists today).
+- N3. Everything N2, N3, N4 of the cut 18 spec say about the dry run's blind spots (a prefix lock's held state; fold-probe limits; two lock names hard-linked to one file) stays as accepted.
+- N4. Any change to the one-source resume or dry resume output.
+
+Anti-goals
+- A1. A resumed run that leaves a prefix lock file behind, or releases one a live run holds.
+- A2. A resume test that passes because everything was copied again: tests assert skipped counts and the identity and mtime of a completed file.
+
+## 3. Approaches considered
+
+Slicing. F3(a), chosen: real resume plus dry preview in one cut. F3(b): real resume now and the dry preview as cut 20, `--dry-run --resume` staying exit 2 in between (the author's recommendation: cut 18's dry preview was about as large as its engine). F3(c): tree roots only first. The owner chose (a); the cost is one larger cut, reviewed in two stages inside it (engine tasks, then dry tasks).
+
+Prefix locks. P-A, chosen: `MultiPlace::adopt` takes the prefix locks (the dead run's files are recovered by the existing rule, `a_dead_prefix_lock_with_a_none_record_is_recovered`, `run/prefix.rs`) under THIS run's id, and `MultiPlace::remove(id)` releases them when `id` is this run's id or the adopted id. P-B (agy's wording): write the records under the adopted prior's id. Rejected as a call by the author: `obtain` names its move-aside file `<name>.flux-lock.broken.<id>` after the id it is given (`lock/obtain.rs:106`, the parameter doc), so the prior's id would repeat as the aside name across successive resumes of one operation; this run's own id is unique per run. The record's `operation_id` is read only to tell an intra-run alias from a foreign holder (`run/prefix.rs:139`), where either choice behaves the same. If the owner prefers P-B the change is one line plus the aside-id parameter.
+
+Claims and the walk. F4: no change. Each root's claims are keyed by its prefix (`tree.rs`, `keyed_under`), the one store is opened by `TreePlace::adopt` (`run/place.rs:604`), and `MultiPlace::tree` is a `TreePlace`. **To verify in the plan**, not claimed here: that the real multi driver passes `resume` and the store through the walk (`Shared.resume`, `run/mod.rs:583` is the one-tree driver; the multi driver's equivalent is the first thing task 1 reads).
+
+## 4. Design
+
+### 4.1 Flag gate and docs
+`several_flag_gate` is deleted (its only arm was `--resume`); `copy_several` stops calling it. The `Copy` doc comment (`main.rs:39`) says all four flags work with one or several sources; the `--resume` help line is unchanged apart from that. The test `resume_exits_2_naming_the_flag` (`crates/flux-cli/tests/several_sources.rs:151`) is replaced (section 5). ROADMAP.md (Phase 2 and Phase 8 rows), TODO.md (L1 and the several-source open items), `docs/accepted-boundaries.md` (L1 text), and the cut 17 and cut 18 specs (a dated note under their N1) are updated.
+
+### 4.2 Compatibility: `resume::validate`
+`validate` (`run/resume.rs:81`) checks `roots.len()` against the stored count, then compares only `roots.first()` and `then.destination_prefix != now.destination_prefix`. It is generalised to every root, in order: for root `i`, `kind` equal (a manifest `kind` is `Some` for format 5; a one-root manifest has `None` and is compared only when both are `Some`), `destination_prefix` equal, source identity equal where both are `Strong`, else `source_root` equal, else the existing `source_mismatch` message extended with the root's name when there is more than one root. **(call)** the existing one-root messages do not change byte for byte (the one-source tests pin them); the multi-root text adds `root <name>: ` in front. Everything after the roots row is untouched.
+
+### 4.3 Adoption: `MultiPlace::adopt` (`multi.rs:598`)
+Today it refuses. It becomes, in this order:
+1. Open the prefix locks as `create` does: `lock_directory`, `PrefixLocks::acquire(dir, capability, &names, &prefix_id)`, store them in `self.prefix`, push the `.broken` leftovers as `BrokenLeftover` warnings; a refusal goes through `prefix_error` as today. `acquire` has released what it took.
+2. `check_targets()` (wrong-kind and same-as-source refusals); on error release the locks (`warn_release`) and return it. A resumed DEST holds the partial copies, which pass: a directory at a folder root, a file at a file root.
+3. `self.tree.adopt(prior, durability, warnings)` (the one-source adoption: open or recreate the store, commit recovery). On error release the locks. The error changed nothing (the one-source adoption's own rule); the prefix lock files are removed by the release, so a refused resume leaves DEST as it found it except for `.broken` residue a recovery moved aside.
+4. Remember the adopted id: `self.adopted: Option<String>`.
+Order rationale: the locks are the only step of the three that can be undone by a release, so they go first; the store is last because its `CREATED` repair removes and creates a file.
+
+### 4.4 Release: `MultiPlace::remove` (`multi.rs:545`)
+Releases the prefix locks when `id` equals `self.prefix_id.operation_id` OR `Some(id) == self.adopted.as_deref()`; otherwise only retires the workspace as today. This is the defect the `debug_assert` at `multi.rs:693` guards: a resumed run's `finish` calls `place.remove(&locked.state.operation_id)` (`run/mod.rs:1189`) with the ADOPTED id, which today matches neither branch's intent and would leave the locks held. The assert is deleted. Superseding a prior (`--restart`) is unchanged: `adopted` is `None` there.
+
+### 4.5 The real run
+`trees()` (`multi.rs:683`) no longer asserts `!cfg.resume`. `session.rs` step 4 already picks `scan.resumable.remove(0)` under `cfg.resume` and calls `validate(&prior, &place.roots(), ...)` then `place.adopt`; `MultiPlace::roots()` already returns one `Root` per source. The report shows the one-source resume notes (`resume_lines`, `report.rs:830`) and the per-root lines; `files_resumed` is a total. **To verify in the plan:** which counters a resumed several-source report prints per root (the `root <name>:` line shows copied and failed; skipped-as-resumed is in the total).
+
+### 4.6 The dry preview
+`dry_trees` (`multi.rs:918`) replaces its refusing `resume_preview` with the one-source shape (`run/mod.rs:1427`): `dry_adopt` on a private copy of the store, parked for the walk; the walk then runs with `claims` = the copy, `resume: true`, `dry_prior: Some(id)`, `dry_partials` set. `dry_adopt` and `adopt_on_copy` (`run/dry_prior.rs:267`, `287`) take a `&TreePlace` and call `place.roots()`, which for the tree inside a `MultiPlace` is the ONE-root answer; they gain a `roots: &[Root]` parameter (the one-source caller passes `place.roots()`). **(call)** the dry preview takes the prefix locks' preview (`dry_create_preview`) AFTER the resume decision exactly as the real run orders it (locks, then `check_targets`, then the store adoption), so a refusal has the real run's order. The aggregated `DryRunPrefixLocks` note and `owner_liveness` are as in cut 18 (N2 there).
+
+## 5. Tests (the oracles the plan names; each must fail under its mutant)
+Engine (`multi.rs` test modules, fake filesystem): (T1) a killed several-source run (the fixture kills after root 1 completed and during root 2) resumed to completion: files completed before the kill are not rewritten (identity and mtime), the counts say `resumed`, the tree equals an uninterrupted run's, the prefix lock files are gone (A1, A2). (T2) `MultiPlace::remove(adopted id)` releases the locks; `remove(other id)` does not (mutants: drop the `adopted` arm; always release). (T3) `validate` rows: a different count, a swapped pair, a renamed root, a kind change, a changed source identity, each refused with the first differing root named; the one-root messages unchanged. (T4) adoption refusals release the locks: a foreign prefix lock, a wrong-kind target, a torn store, `COMMIT_STATE_UNCERTAIN` (mutants: skip the release). (T5) `--resume` with no prior starts new (`StartedNew`), with a dead prefix lock residue present (the kill-between-locks state). (T6) a `CREATED` prior without a store is recreated. (T7) a one-source tree prior with several sources, and a several-source prior with one source, are refused `INCOMPATIBLE_STATE`.
+Dry: (T8) `dry_agrees`-style: the dry resume plan of T1's state agrees with the real resume's counts and changes nothing under DEST; (T9) each refusal of T3 and T4 is predicted with the real code; (T10) `--dry-run --resume` with no prior plans fresh; (T11) the temporary store copy is removed.
+CLI (`several_sources.rs`, the Linux-only kill harness cut 17 copied): (T12) kill mid-run, `--resume`, exit 0, the destination equals the sources, completed files untouched; (T13) the same with `--dry-run`, nothing changes; (T14) `--resume` with a changed list exits with `INCOMPATIBLE_STATE`'s exit code, the text names `--restart`; (T15) `--help` mentions several sources for all four flags. Windows and macOS legs are read on CI after the push.
+
+## 6. Accepted boundaries and residuals
+- B1. A prefix lock file of a dead run whose record is unreadable refuses the resume as `TARGET_LOCK_UNCERTAIN` (the text of cut 17 and 18), and the operator removes it or uses `--restart`. This is the existing prefix-lock rule, not a resume decision.
+- B2. A source list that changed since the kill is refused (N1).
+- B3. The cut 18 dry-run blind spots (N2 to N4 of that spec) apply to the dry resume.
+
+## 7. Process
+AGY-FIRST done for F1 to F4 (seam `.clavity/seams/several-resume-fork.md`, `[VERDICT: ALIGNED]`; one claim was measured false: agy said the locks would be released at the end, `multi.rs:547` and `run/mod.rs:1189` show they would not, section 4.4). The design then goes to the adversarial panel (AGY-AFTER), then a plan against the code as it is, then subagent-driven execution, capstone and test audit.
+
+## 8. Self-audit (exhaustiveness) at drafting
+Closed in this document: the flag gate, validate generalisation, adoption order, release rule, dry preview wiring, the test table, docs to update. Open and where they close: (a) the real multi driver's resume plumbing and the per-root resumed counters (section 3 and 4.5) close in the PLAN, by reading the driver first; (b) `check_targets` during a resume is claimed to pass for partial copies and is pinned by T1 and T4; (c) the exact JSON keys of the dry resume come from the one-source dry resume and are pinned by T8 and T13; (d) a resume of a `Completed` or superseded prior is whatever `scan` already does and is out of scope (N4).
