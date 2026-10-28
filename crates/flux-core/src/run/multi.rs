@@ -8,20 +8,25 @@
 //! source. Its `create` makes DEST, takes the prefix locks inside it, checks the names the sources take, and only then
 //! makes the workspace, so a refusal at any of those finds no workspace and releases every lock it took.
 
+use super::dry_prior::dry_restart;
 use super::place::{AdoptedStore, LocatedTree, Place, TreePlace, locate_dest, refused_state};
 use super::prefix::{PrefixId, PrefixIdOwned, PrefixLocks, PrefixRefusal};
 use super::roots::{SourceKind, SourceSpec, plan_roots};
 use super::session::{Fault, Locked, failed, from_lock, lock_io};
-use super::{Run, RunConfig, RunError, RunStep, RunWarning, TreeAt, checkpoint_policy, drive};
-use crate::copy::{CopyError, CopyStep};
+use super::{
+    DryStart, Run, RunConfig, RunError, RunStep, RunWarning, TreeAt, batch_policy,
+    checkpoint_policy, drive, dry_hardlink_slot, dry_start,
+};
+use crate::copy::{CopyError, CopyStep, no_heartbeat, unguarded};
+use crate::dry_run::{DryPrior, NullClaimStore};
 use crate::lock::{LockCode, LockError, LockResult, LockSite, Refusal, check_capability};
 use crate::prior::{PriorOp, Scan, check_control_plane};
 use crate::state::{
     Kind, OperationState, Root, RootKind, absolute_lexical, identity_text, native_hex, wall_time_ns,
 };
 use crate::tree::{
-    RootDone, RootInput, RootStatus, TreeAbort, TreeFailure, TreeOutcome, containment,
-    copy_roots_at, preflight, prepare_source,
+    RootDone, RootInput, RootStatus, RootsDest, Shared, TreeAbort, TreeFailure, TreeOutcome,
+    containment, copy_roots_at, preflight, prepare_source,
 };
 use crate::walk::MountPolicy;
 use flux_fs::{
@@ -158,7 +163,11 @@ impl<'p, F: DestinationRoot> MultiPlace<'p, F> {
     /// Group 2: what is at `DEST/<name>` now. An object of the other kind than the root is a collision; a file root
     /// whose target is the source itself is unsafe. An object of the right kind is the engine's per-file decision.
     fn check_targets(&self) -> Result<(), RunError> {
-        let dest = self.tree.dest.as_ref().expect("create_dest made it");
+        self.check_targets_in(self.tree.dest.as_ref().expect("create_dest made it"))
+    }
+
+    /// `check_targets` against `dest`: the directory `create_dest` made, or (a dry run) the one that exists.
+    fn check_targets_in(&self, dest: &F::Dir) -> Result<(), RunError> {
         for root in &self.roots {
             let shown = self.tree.dest_shown.join(&root.name);
             let found = match dest.metadata(&root.name) {
@@ -456,7 +465,6 @@ pub fn trees<F: DestinationRoot>(
 ) -> MultiRun {
     // A one-root manifest would be format 4 with a `kind`, which the validator rejects: the caller routes one source
     // to `tree` or `file`.
-    debug_assert!(!cfg.dry_run, "a dry run of several sources is not supported");
     // Adoption (`--resume`) is the unsupported case: `MultiPlace::remove` releases the prefix locks only for this
     // run's own id, so a supersede (`--restart`) removing a prior's workspace leaves them held.
     debug_assert!(!cfg.resume, "several sources do not support --resume");
@@ -611,6 +619,9 @@ pub fn trees<F: DestinationRoot>(
         },
         prefix: RefCell::new(None),
     };
+    if cfg.dry_run {
+        return dry_trees(fs, run, out, place, &site, anchor, cfg, &opts, inputs, on_report);
+    }
     let mut done: Vec<RootDone> = Vec::new();
     let run = drive(
         fs,
@@ -627,8 +638,14 @@ pub fn trees<F: DestinationRoot>(
         on_report,
         |cx, place, out, report| {
             let dest = place.tree.dest.as_ref().expect("step 5 made DEST");
-            let (roots, walked) =
-                copy_roots_at(cx, dest, place.tree.created_dest, inputs, out, report);
+            let (roots, walked) = copy_roots_at(
+                cx,
+                RootsDest::Existing(dest),
+                place.tree.created_dest,
+                inputs,
+                out,
+                report,
+            );
             done = roots;
             walked
         },
@@ -638,10 +655,15 @@ pub fn trees<F: DestinationRoot>(
             place.warn_release(failed, warnings);
         },
     );
-    let roots = if done.is_empty() && run.copy.is_some() {
-        // The copy ended before any root was begun (the checkpoint log could not be opened): every root is unstarted.
-        place
-            .roots
+    let roots = root_reports(&place.roots, done, run.copy.is_some());
+    MultiRun { run, roots }
+}
+
+/// One report per root, in prefix order. `done` is empty while the copy ran when it ended before any root was begun
+/// (the checkpoint log could not be opened): every root is then unstarted.
+fn root_reports(plans: &[RootPlan], done: Vec<RootDone>, copy_ran: bool) -> Vec<RootReport> {
+    if done.is_empty() && copy_ran {
+        plans
             .iter()
             .map(|r| RootReport {
                 name: r.name.clone(),
@@ -659,7 +681,113 @@ pub fn trees<F: DestinationRoot>(
                 files_failed: d.files_failed,
             })
             .collect()
+    }
+}
+
+/// The dry branch of `trees` (spec 4.2): the fresh plan. The lock preview and the scan are `dry_start`'s, then every
+/// root is planned in prefix order against what DEST holds, over a claim store that stores nothing and one hardlink
+/// slot all the roots share. DEST is never made: an absent one is planned, and counted after the walk unless it
+/// refused with nothing changed (I7), as `dry_tree` counts it. `out` is the outcome `trees` has already filled with the
+/// pre-flight and containment warnings.
+// One input per piece of the run, as `dry_tree`'s.
+#[allow(clippy::too_many_arguments)]
+fn dry_trees<F: DestinationRoot>(
+    fs: &F,
+    mut run: Run<Result<TreeOutcome, TreeAbort>>,
+    mut out: TreeOutcome,
+    place: MultiPlace<'_, F>,
+    site: &LockSite<'_, F::Dir>,
+    anchor: FileIdentity,
+    cfg: &RunConfig,
+    opts: &CopyOptions,
+    inputs: Vec<RootInput<'_, F>>,
+    on_report: &mut dyn FnMut(TreeFailure),
+) -> MultiRun {
+    let (dest_shown, operations_shown, absent) =
+        (place.tree.dest_shown.clone(), place.tree.operations_shown(), place.tree.dest.is_none());
+    let mut restart_preview = |priors: &[PriorOp], warnings: &mut Vec<RunWarning>| {
+        if absent {
+            DryPrior::Restart { superseded: Vec::new(), partials_found: Vec::new(), states: 0 }
+        } else {
+            dry_restart(fs, &dest_shown, &operations_shown, priors, warnings, &mut *on_report)
+        }
     };
+    // Several sources do not resume: the refusal `MultiPlace::adopt` gives, were a prior resumable.
+    let mut resume_preview = |_: &PriorOp, _: &mut Vec<RunWarning>| {
+        Err(refused_state(
+            LockCode::IncompatibleState,
+            "resuming several sources is not supported in this version".to_string(),
+        ))
+    };
+    let mut dry = match dry_start(
+        site,
+        place.capability,
+        &place,
+        cfg,
+        &mut restart_preview,
+        &mut resume_preview,
+        &mut |_, _| Ok(()),
+        &mut run.warnings,
+    ) {
+        DryStart::Plan(dry) => dry,
+        DryStart::Stop(stop, dry) => {
+            run.stop = Some(stop);
+            run.dry = Some(dry);
+            return ended_early(run);
+        }
+    };
+    let temp_root = cfg.dry_temp_root.clone().unwrap_or_else(std::env::temp_dir);
+    let (hardlink_slot, hardlinks_path) = dry_hardlink_slot(fs, &temp_root, cfg, opts);
+    let null = RefCell::new(NullClaimStore);
+    let partials = std::cell::Cell::new(0u64);
+    let src_root = place.tree.src_root.clone();
+    let cx = Shared {
+        fs,
+        // Read only through `for_root`, which gives each root its own.
+        src_root: &src_root,
+        src_identity: place.tree.src_identity,
+        opts,
+        guard: &unguarded,
+        beat: &no_heartbeat,
+        claims: Some(&null),
+        resume: false,
+        batch: batch_policy(cfg),
+        ckpt: None,
+        dry_run: true,
+        dry_prior: None,
+        dry_partials: Some(&partials),
+        key_prefix: None,
+        hardlinks: hardlink_slot.as_ref(),
+        anchor_root: None,
+    };
+    let dest = match &place.tree.dest {
+        Some(d) => RootsDest::Existing(d),
+        None => RootsDest::Planned(anchor),
+    };
+    let (done, walked) = copy_roots_at(&cx, dest, false, inputs, &mut out, on_report);
+    // Cut 12: the index file and its private directory go with the slot.
+    if let Some(slot) = hardlink_slot {
+        let failure = slot.failure();
+        drop(slot.close(true));
+        if let Some(code) = failure {
+            run.warnings.push(RunWarning::HardlinkIndexUnavailable { path: hardlinks_path, code });
+        }
+    }
+    let mut result = match walked {
+        Ok(()) => Ok(out),
+        Err(error) => Err(TreeAbort { error, outcome: out }),
+    };
+    // I7: DEST's creation is counted after the walk, unless the walk refused with nothing changed.
+    if absent && !matches!(&result, Err(a) if a.refused_unchanged()) {
+        match &mut result {
+            Ok(o) => o.directories_created += 1,
+            Err(a) => a.outcome.directories_created += 1,
+        }
+    }
+    dry.unprobed_noreplace = true;
+    run.dry = Some(dry);
+    run.copy = Some(result);
+    let roots = root_reports(&place.roots, done, true);
     MultiRun { run, roots }
 }
 
@@ -1020,6 +1148,7 @@ mod tests {
 #[cfg(test)]
 mod trees_tests {
     use super::*;
+    use crate::dry_run::{PlannedAction, PlannedObject};
     use crate::fault_fs::FaultFs;
     use crate::run::ResumeVerify;
     use crate::state::{OpState, decode as decode_state, from_native_hex};
@@ -2418,5 +2547,342 @@ mod trees_tests {
         assert!(!fs.exists(format!("/p/dest/.flux/operations/{id2}")));
         assert_eq!(fs.read_file("/p/dest/a/x").as_deref(), Some(&b"ax"[..]));
         assert_eq!(fs.read_file("/p/dest/b/k").as_deref(), Some(&b"bk"[..]));
+    }
+
+    // ----- Several sources, --dry-run: the fresh plan (cut 18 task 2) -----
+
+    fn dry_fake() -> FaultFs {
+        let fs = fake();
+        fs.create_dir(Path::new("/tmp")).unwrap();
+        fs
+    }
+
+    fn dry_cfg() -> RunConfig {
+        RunConfig { dry_run: true, dry_temp_root: Some(PathBuf::from("/tmp")), ..cfg() }
+    }
+
+    /// `nth_of` for the LAST call mentioning `needle`: the fake's `open_dir` ends in the last `metadata` of a path.
+    fn last_nth_of(fs: &FaultFs, op: &str, needle: &str) -> u32 {
+        let head = format!("{op}(");
+        let (mut n, mut found) = (0, None);
+        for c in calls(fs) {
+            if c.starts_with(&head) {
+                n += 1;
+                if c.contains(needle) {
+                    found = Some(n);
+                }
+            }
+        }
+        found.unwrap_or_else(|| panic!("no {op} mentioning {needle} in {:?}", calls(fs)))
+    }
+
+    type Counters = (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64);
+
+    fn counters(o: &TreeOutcome) -> Counters {
+        (
+            o.files_copied,
+            o.bytes_copied,
+            o.directories_created,
+            o.files_overwritten,
+            o.files_total,
+            o.failures.total(),
+            o.excluded,
+            o.files_skipped,
+            o.bytes_skipped,
+            o.files_hardlinked,
+        )
+    }
+
+    fn rows(r: &MultiRun) -> Vec<(OsString, RootStatus, u64, u64)> {
+        r.roots.iter().map(|x| (x.name.clone(), x.status, x.files_copied, x.files_failed)).collect()
+    }
+
+    /// The real run on `build()` and the dry run on another `build()`: the same counters, pre-flight warnings and
+    /// per-root rows, the dry one having touched nothing it must not. Returns the dry run and what it streamed.
+    fn dry_agrees(
+        build: impl Fn() -> FaultFs,
+        names: &[&str],
+        o: &CopyOptions,
+    ) -> (MultiRun, Vec<TreeFailure>) {
+        let real_fs = build();
+        let (real, _) = go_with(&real_fs, names.iter().map(|n| spec(n)).collect(), o, &cfg());
+        let fs = build();
+        let base = calls(&fs).len();
+        let (dry, got) = go_with(&fs, names.iter().map(|n| spec(n)).collect(), o, &dry_cfg());
+        assert!(dry.run.stop.is_none(), "{:?}", dry.run.stop);
+        assert_eq!(counters(ok(&dry)), counters(ok(&real)));
+        assert_eq!(ok(&dry).warnings, ok(&real).warnings);
+        assert_eq!(rows(&dry), rows(&real));
+        crate::run::tests::forbidden_in(&calls(&fs)[base..]);
+        (dry, got)
+    }
+
+    fn planned(got: &[TreeFailure], path: &str) -> Vec<(PlannedObject, PlannedAction)> {
+        got.iter()
+            .filter(|f| f.path == Path::new(path))
+            .filter_map(|f| match &f.cause {
+                crate::tree::TreeFailureCause::Planned(e) => Some((e.object, e.action)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_dry_run_plans_two_folders_and_a_file_into_an_absent_dest() {
+        let real_fs = dry_fake();
+        let (real, _) = go(&real_fs, &["a", "b", "f"]);
+        let real_dirs = ok(&real).directories_created;
+        assert_eq!(real_dirs, 4);
+
+        let fs = dry_fake();
+        let (r, got) =
+            go_with(&fs, ["a", "b", "f"].iter().map(|n| spec(n)).collect(), &opts(), &dry_cfg());
+
+        let out = ok(&r);
+        assert!(r.run.stop.is_none());
+        assert_eq!(names(&r), os(&["a", "b", "f"]));
+        assert_eq!(statuses(&r), vec![RootStatus::Completed; 3]);
+        let per_root: Vec<u64> = r.roots.iter().map(|x| x.files_copied).collect();
+        assert_eq!(per_root, [2, 1, 1]);
+        assert_eq!(out.files_copied, per_root.iter().sum::<u64>());
+        assert_eq!(out.files_copied, 4);
+        assert_eq!(out.directories_created, real_dirs);
+        assert!(
+            got.iter().all(|f| f.path != Path::new("dest") && f.path != Path::new("")),
+            "{got:?}"
+        );
+        let would_create = (PlannedObject::Dir, PlannedAction::CreateDir);
+        assert_eq!(planned(&got, "a"), [would_create]);
+        assert_eq!(planned(&got, "b"), [would_create]);
+        assert!(r.run.dry.is_some());
+    }
+
+    #[test]
+    fn a_dry_run_agrees_with_the_real_run_and_changes_nothing() {
+        let (r, _) = dry_agrees(dry_fake, &["a", "b", "f"], &opts());
+
+        assert!(r.run.dry.as_ref().unwrap().unprobed_noreplace);
+
+        // A source directory with a weak identity: the pre-flight warning `trees` records is the dry outcome's too.
+        let weak = || {
+            let fs = dry_fake();
+            fs.set_identity("/src/a", FileIdentity::Weak(ObjectId { volume: 5, index: 1 }));
+            fs
+        };
+        let (r, _) = dry_agrees(weak, &["a", "b", "f"], &opts());
+        assert_ne!(ok(&r).warnings, crate::tree::WeakIdentityWarnings::default());
+        assert!(
+            !r.run
+                .warnings
+                .iter()
+                .any(|w| matches!(w, RunWarning::HardlinkIndexUnavailable { .. }))
+        );
+    }
+
+    #[test]
+    fn a_dry_run_over_existing_targets_overwrites_or_skips_per_root() {
+        let existing = || {
+            let fs = dry_fake();
+            for d in ["/p/dest", "/p/dest/a", "/p/dest/b"] {
+                fs.create_dir(Path::new(d)).unwrap();
+            }
+            fs.write_file("/p/dest/a/x", b"OTHER BYTES");
+            fs.write_file("/p/dest/b/k", b"bk");
+            fs
+        };
+        for existing_policy in [ExistingPolicy::Overwrite, ExistingPolicy::SkipExisting] {
+            let o = CopyOptions { existing: existing_policy, ..opts() };
+            let (_, got) = dry_agrees(existing, &["a", "b", "f"], &o);
+            assert!(!got.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_root_holding_a_dot_flux_file_is_planned_as_the_real_run_copies_it() {
+        let as_file = || {
+            let fs = dry_fake();
+            fs.write_file("/src/c/.flux", b"a file named like the control directory");
+            fs
+        };
+        let as_dir = || {
+            let fs = dry_fake();
+            fs.create_dir(Path::new("/src/c/.flux")).unwrap();
+            fs.write_file("/src/c/.flux/g", b"g");
+            fs
+        };
+        for build in [&as_file as &dyn Fn() -> FaultFs, &as_dir] {
+            let (r, got) = dry_agrees(build, &["b", "c"], &opts());
+            assert!(
+                got.iter().all(|f| !matches!(
+                    &f.cause,
+                    crate::tree::TreeFailureCause::Copy(e) if e.code() == Code::SafetyRejected
+                )),
+                "{got:?}"
+            );
+            assert_eq!(ok(&r).failures.total(), 0);
+        }
+    }
+
+    #[test]
+    fn a_dry_run_shares_one_hardlink_slot_across_roots() {
+        let grouped = || {
+            let fs = dry_fake();
+            for d in ["/s1", "/s2"] {
+                fs.create_dir(Path::new(d)).unwrap();
+            }
+            fs.write_file("/s1/a", b"shared");
+            let (d1, d2) = (
+                fs.destination_root(Path::new("/s1")).unwrap(),
+                fs.destination_root(Path::new("/s2")).unwrap(),
+            );
+            d2.create_hardlink(OsStr::new("a"), &d1, OsStr::new("a")).unwrap();
+            fs
+        };
+        let specs = || {
+            ["s1", "s2"]
+                .map(|n| SourceSpec {
+                    src: Path::new("/").join(n),
+                    name: OsString::from(n),
+                    kind: SourceKind::Folder,
+                })
+                .to_vec()
+        };
+        let real_fs = grouped();
+        let (real, _) = go_with(&real_fs, specs(), &opts(), &cfg());
+        assert_eq!(ok(&real).files_hardlinked, 1);
+
+        let fs = grouped();
+        let (r, _) = go_with(&fs, specs(), &opts(), &dry_cfg());
+
+        assert_eq!(counters(ok(&r)), counters(ok(&real)));
+        assert_eq!((ok(&r).files_copied, ok(&r).files_hardlinked), (1, 1));
+    }
+
+    #[test]
+    fn a_dry_run_counts_excluded_per_root_and_in_total() {
+        let typed = ["x".to_string(), "k".to_string()];
+        let o =
+            CopyOptions { selection: flux_fs::Selection::compile(&typed, true).unwrap(), ..opts() };
+
+        let (r, _) = dry_agrees(dry_fake, &["a", "b", "f"], &o);
+
+        assert_eq!(ok(&r).excluded, 2);
+        let per_root: Vec<u64> = r.roots.iter().map(|x| x.files_copied).collect();
+        assert_eq!(per_root, [1, 0, 1]);
+    }
+
+    #[test]
+    fn a_dry_run_into_an_absent_dest_reads_no_locks_and_plans_every_root_new() {
+        for safety in [Safety::Default, Safety::Strict] {
+            let fs = dry_fake();
+            let o = CopyOptions { safety, ..opts() };
+
+            let (r, _) =
+                go_with(&fs, ["a", "b", "f"].iter().map(|n| spec(n)).collect(), &o, &dry_cfg());
+
+            assert_eq!(statuses(&r), vec![RootStatus::Completed; 3], "{safety:?}");
+            ok(&r);
+            let log = calls(&fs);
+            assert!(!log.iter().any(|c| c.starts_with("read_file(/p/dest/")), "{log:?}");
+            assert!(!log.iter().any(|c| c == "metadata(/p/dest/a)"), "{log:?}");
+        }
+    }
+
+    /// A DEST that exists with none of the roots in it, and the dry run reference on it.
+    fn dest_only() -> FaultFs {
+        let fs = dry_fake();
+        fs.create_dir(Path::new("/p/dest")).unwrap();
+        fs
+    }
+
+    fn dry_names(fs: &FaultFs, names: &[&str]) -> (MultiRun, Vec<TreeFailure>) {
+        go_with(fs, names.iter().map(|n| spec(n)).collect(), &opts(), &dry_cfg())
+    }
+
+    #[test]
+    fn a_folder_root_that_cannot_be_opened_aborts_with_the_create_step_error() {
+        let reference = dest_only();
+        dry_names(&reference, &["a", "b", "f"]);
+        let n = last_nth_of(&reference, "metadata", "/p/dest/a)");
+        let fs = dest_only();
+        fs.fail_nth("metadata", n, Code::IoError, ErrorKind::PermissionDenied);
+
+        let (r, _) = dry_names(&fs, &["a", "b", "f"]);
+
+        assert!(r.run.stop.is_none(), "{:?}", r.run.stop);
+        let Some(Err(abort)) = &r.run.copy else { panic!("expected an abort: {:?}", r.run.copy) };
+        assert_eq!(abort.error.step, CopyStep::Create);
+        assert_eq!(
+            statuses(&r),
+            [RootStatus::Failed, RootStatus::NotStarted, RootStatus::NotStarted]
+        );
+    }
+
+    #[test]
+    fn a_failed_root_aborts_and_a_counted_failure_does_not() {
+        // T12: the second root cannot be opened.
+        let reference = dest_only();
+        dry_names(&reference, &["a", "b", "f"]);
+        let n = last_nth_of(&reference, "metadata", "/p/dest/b)");
+        let fs = dest_only();
+        fs.fail_nth("metadata", n, Code::IoError, ErrorKind::PermissionDenied);
+        let (r, _) = dry_names(&fs, &["a", "b", "f"]);
+        assert_eq!(
+            statuses(&r),
+            [RootStatus::Completed, RootStatus::Failed, RootStatus::NotStarted]
+        );
+
+        // T12b: a source file of the second root that cannot be read (`read_dir` is made before the lock, in
+        // `prepare_source`, so it cannot fail mid-plan) is a counted failure, and the third root goes on.
+        let reference = dest_only();
+        dry_names(&reference, &["a", "b", "f"]);
+        let n = nth_of(&reference, "metadata", "/src/b/k");
+        let fs = dest_only();
+        fs.fail_nth("metadata", n, Code::IoError, ErrorKind::PermissionDenied);
+        let (r, _) = dry_names(&fs, &["a", "b", "f"]);
+        assert_eq!(
+            statuses(&r),
+            [RootStatus::Completed, RootStatus::Failed, RootStatus::Completed]
+        );
+        assert!(ok_or_abort_outcome(&r).failures.total() >= 1);
+    }
+
+    fn ok_or_abort_outcome(r: &MultiRun) -> &TreeOutcome {
+        match copy_of(r) {
+            Ok(o) => o,
+            Err(a) => &a.outcome,
+        }
+    }
+
+    #[test]
+    fn dest_is_counted_once_when_the_plan_completes() {
+        let real_fs = dry_fake();
+        let (real, _) = go(&real_fs, &["a", "f"]);
+        let fs = dry_fake();
+
+        let (r, _) = dry_names(&fs, &["a", "f"]);
+
+        assert_eq!(ok(&r).directories_created, ok(&real).directories_created);
+    }
+
+    #[test]
+    fn dest_is_not_counted_when_the_plan_refuses_with_nothing_changed() {
+        let fs = dry_fake();
+        fs.write_file("/src/g", b"G");
+        fs.set_identity("/p", FileIdentity::Weak(ObjectId { volume: 5, index: 1 }));
+        let o = CopyOptions { safety: Safety::Strict, ..opts() };
+        let files = ["f", "g"]
+            .map(|n| SourceSpec {
+                src: Path::new("/src").join(n),
+                name: OsString::from(n),
+                kind: SourceKind::File,
+            })
+            .to_vec();
+
+        let (r, _) = go_with(&fs, files, &o, &dry_cfg());
+
+        let Some(Err(abort)) = &r.run.copy else { panic!("expected an abort: {:?}", r.run.copy) };
+        assert!(abort.refused_unchanged(), "{abort:?}");
+        assert_eq!(abort.outcome.directories_created, 0);
     }
 }

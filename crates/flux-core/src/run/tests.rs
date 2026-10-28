@@ -7811,7 +7811,7 @@ fn dry() -> RunConfig {
 
 /// True for a call that names no path, or one whose path is `/p` or `/src` or below.
 /// A call that names a claim key, not a path, is always in scope.
-fn in_scope(call: &str) -> bool {
+pub(super) fn in_scope(call: &str) -> bool {
     let name = call.split('(').next().unwrap_or(call);
     if name.starts_with("claim_") || ["try_lock", "write_at_start", "lock_sync_all"].contains(&name)
     {
@@ -7865,7 +7865,7 @@ fn forbidden_for_resume(fs: &FaultFs, base: usize) {
     forbidden_in(&kept);
 }
 
-fn forbidden_in(after: &[String]) {
+pub(super) fn forbidden_in(after: &[String]) {
     let scoped: Vec<&String> = after.iter().filter(|c| in_scope(c)).collect();
     for banned in [
         "create_dir(",
