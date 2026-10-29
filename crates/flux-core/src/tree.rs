@@ -13,9 +13,9 @@ pub use crate::checkpoint::Discard;
 use crate::checkpoint::{Checkpoints, FileCkpt, Hook};
 use crate::copy::{
     BeforeCreate, BeforePublish, CopyError, CopyStep, FilePlan, Guard, Heartbeat, PublishIntent,
-    Reuse, Stage, Staged, SyncAt, copy_file_checkpointed, copy_file_guarded, discard,
-    identity_gate, no_before_create, no_before_publish, no_heartbeat, plan_file, publish_staged,
-    split_destination, stage_file, sync_staged_many, unguarded, weaker,
+    Reuse, Stage, Staged, SyncAt, copy_file_checkpointed, discard, identity_gate, no_before_create,
+    no_before_publish, no_heartbeat, plan_file, publish_staged, split_destination, stage_file,
+    sync_staged_many, unguarded, weaker,
 };
 use crate::dry_run::{PlannedAction, PlannedEntry, PlannedObject, SkipReason};
 use crate::hardlinks::{Candidacy, anchor_parent, candidacy, shown, strong};
@@ -1784,6 +1784,8 @@ fn copy_one<F: DestinationRoot>(
     let name_owned = path.file_name().expect("a walk path ends in a name").to_os_string();
     let name = name_owned.as_os_str();
     let src = cx.src_root.join(&path);
+    // Taken once, before any closure that makes the copy call: the keyless branch and both copies below share it.
+    let progress = out.progress.clone();
     let (Some(parent_id), Some(claims)) = (claim_parent, cx.claims) else {
         // No claims for this directory (a lockless copy, or an identity that cannot key them): exactly the cut 4b
         // behaviour. An existing name is a collision.
@@ -1819,7 +1821,7 @@ fn copy_one<F: DestinationRoot>(
             publish: Publish::NoReplace,
             ..cx.opts.clone()
         };
-        let published = copy_file_guarded(
+        let published = copy_file_checkpointed(
             cx.fs,
             &src,
             parent,
@@ -1829,7 +1831,10 @@ fn copy_one<F: DestinationRoot>(
             cx.beat,
             &no_before_create,
             &no_before_publish,
-        );
+            None,
+            progress.as_deref(),
+        )
+        .map(|(outcome, _)| outcome);
         return finish_copy(cx.key_prefix, path, published, out, on_report);
     };
     let target = match FluxPathKey::from_relative(&cx.keyed(&path)) {
@@ -2160,6 +2165,7 @@ fn copy_one<F: DestinationRoot>(
                 &no_before_create,
                 before_publish,
                 fc.as_ref().map(Hook::Logged),
+                progress.as_deref(),
             );
             let (result, reuse) = split_reuse(result);
             let result = discard_note_on_failure(
@@ -2307,6 +2313,7 @@ fn copy_one<F: DestinationRoot>(
                 &before_create,
                 before_publish,
                 fc.as_ref().map(Hook::Logged),
+                progress.as_deref(),
             );
             let (result, reuse) = split_reuse(result);
             let result = discard_note_on_failure(
@@ -3671,6 +3678,8 @@ fn stage_into_batch<F: DestinationRoot>(
     }
     let name = path.file_name().expect("a walk path ends in a name");
     let opts = CopyOptions { existing: ExistingPolicy::Overwrite, publish, ..cx.opts.clone() };
+    // Cloned before the closure: `stage` runs twice with `flush_batch(.., out, ..)` between the runs.
+    let progress = out.progress.clone();
     let stage = || {
         stage_file(
             cx.fs,
@@ -3689,6 +3698,7 @@ fn stage_into_batch<F: DestinationRoot>(
                 SyncAt::Staging
             },
             fc.map(Hook::Logged),
+            progress.as_deref(),
         )
     };
     let staged = match stage() {

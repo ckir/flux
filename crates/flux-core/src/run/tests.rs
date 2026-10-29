@@ -11281,6 +11281,56 @@ fn a_clean_tree_copy_ticks_the_counters_to_the_outcome() {
     assert_eq!(s.copied, out.files_copied);
     assert_eq!((s.resumed, s.errors), (0, 0));
     assert!(s.discovered > 0 && s.copied > 0, "{s:?}");
+    assert_eq!(s.bytes, out.bytes_copied);
+}
+
+#[test]
+fn a_keyless_tree_copy_ticks_bytes_to_the_outcome() {
+    // A weak destination root keys no claims, so `a` takes the keyless branch of `copy_one`.
+    let fs = dest_fake();
+    fs.set_identity("/p/dest", FileIdentity::Weak(ObjectId { volume: 9, index: 9 }));
+    let p = crate::progress::Progress::new();
+    let c = RunConfig { progress: Some(p.clone()), ..cfg() };
+    let (r, got) = run_tree(&fs, &c);
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(fs.claim_count(), 1, "only sub/b is claimed: a took the keyless branch");
+    assert!(out.bytes_copied > 0);
+    assert_eq!(p.snapshot().bytes, out.bytes_copied);
+}
+
+#[test]
+fn a_single_file_copy_ticks_bytes_and_sets_the_expected_size() {
+    let fs = fake();
+    fs.write_file("/src/a", &[5u8; 777]);
+    let p = crate::progress::Progress::new();
+    let r = run_file(&fs, &RunConfig { progress: Some(p.clone()), ..cfg() });
+    assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+    let s = p.snapshot();
+    assert_eq!(s.bytes, 777);
+    assert_eq!(s.expected_bytes, Some(777));
+    assert_eq!((s.discovered, s.copied, s.resumed), (0, 0, 0));
+}
+
+#[test]
+fn a_zero_length_single_file_has_no_expected_size() {
+    let fs = fake();
+    fs.write_file("/src/a", b"");
+    let p = crate::progress::Progress::new();
+    let r = run_file(&fs, &RunConfig { progress: Some(p.clone()), ..cfg() });
+    assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+    assert_eq!(p.snapshot().expected_bytes, None);
+}
+
+#[test]
+fn a_resumed_single_file_has_no_expected_size() {
+    let fs = fake();
+    file_prior3(&fs, 5, None);
+    let p = crate::progress::Progress::new();
+    let r = run_file(&fs, &RunConfig { progress: Some(p.clone()), ..resume() });
+    assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+    assert!(matches!(r.resumed, Some(ResumeNote::Adopted { .. })), "{:?}", r.resumed);
+    assert_eq!(p.snapshot().expected_bytes, None);
 }
 
 #[test]
