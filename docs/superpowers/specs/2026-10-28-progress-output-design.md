@@ -60,15 +60,16 @@ pub struct Snapshot {
     pub discovered: u64,        // non-directory entries the walk has yielded
     pub copied: u64,            // files published by this run
     pub resumed: u64,           // files a prior run completed and this one verified and skipped
+    pub skipped: u64,           // files the existing-file policy (`--update`, `--skip-existing`) skipped
     pub errors: u64,            // records counted as failures (3.3)
     pub bytes: u64,             // bytes this run has written, per chunk
     pub expected_bytes: Option<u64>, // Some only for a single-file copy that is not a resume (3.4)
 }
 ```
 
-Methods: `Progress::new() -> Arc<Progress>`, `add_discovered()`, `add_copied()`, `add_resumed()`, `add_error()`, `add_bytes(n: u64)`, `set_expected_bytes(n: u64)`, `snapshot() -> Snapshot`. Every store and load is `Relaxed`. A snapshot reads each field once and is NOT a consistent cut; the renderer clamps (3.2).
+Methods: `Progress::new() -> Arc<Progress>`, `add_discovered()`, `add_copied()`, `add_resumed()`, `add_skipped()`, `add_error()`, `add_bytes(n: u64)`, `set_expected_bytes(n: u64)`, `snapshot() -> Snapshot`. Every store and load is `Relaxed`. A snapshot reads each field once and is NOT a consistent cut; the renderer clamps (3.2).
 
-`Processed` (the spec's word for the unknown-total shape) is `copied + resumed`, clamped to `discovered`.
+`Processed` (the spec's word for the unknown-total shape) is `copied + resumed + skipped`, clamped to `discovered`.
 
 ### 3.2 The renderer (`flux-ui`, new module)
 
@@ -81,13 +82,14 @@ Processed     98,412
 Transferred   4.2 GiB
 Speed         312 MiB/s
 Resumed       1,204        (only when resumed > 0)
+Skipped       85           (only when skipped > 0)
 Errors        3            (only when errors > 0)
 ```
 
 - Single file with a known size (section 3.4): `indicatif`'s bar with `Transferred`, percent, `Speed`, `ETA`; the lines above do not apply.
 - Speed is `bytes / elapsed` over the whole run so far (N5). With `elapsed == 0` or `bytes == 0` the speed line shows `-`. `Transferred` counts bytes THIS run wrote, never bytes a resume skipped (so a resume's speed does not jump).
-- Clamps: `processed = min(copied + resumed, discovered)`; a single-file percent is clamped to 100.
-- `Display` owns an `indicatif::ProgressBar` and one sampler thread. If the thread cannot be spawned, `Display::start` returns `None` and the CLI takes the plain path; `finish` and `Drop` ignore a sampler panic (the join error is discarded), so a display fault never reaches the copy. `Display::start(progress: Arc<Progress>, target: ProgressDrawTarget) -> Display`; `Display::println(&self, line: &str)` prints one record line above the bar (`ProgressBar::suspend`, which runs the closure even when the target is hidden); `Display::finish(self)` clears the bar and joins the thread. `Drop` does the same, so an unwind or an early return cannot leave the thread or the bar behind.
+- Clamps: `processed = min(copied + resumed + skipped, discovered)`; a single-file percent is clamped to 100.
+- `Display` owns an `indicatif::ProgressBar` and one sampler thread. If the thread cannot be spawned, `Display::start` returns `None` and the CLI takes the plain path; `finish` and `Drop` ignore a sampler panic (the join error is discarded), so a display fault never reaches the copy (no reachable panic exists in the sampler; with `panic = "abort"` in the release profile a sampler panic would abort the process, so this holds only for unwinding builds). `Display::start(progress: Arc<Progress>, target: ProgressDrawTarget) -> Display`; `Display::println(&self, line: &str)` prints one record line above the bar (`ProgressBar::suspend`, which runs the closure even when the target is hidden); `Display::finish(self)` clears the bar and joins the thread. `Drop` does the same, so an unwind or an early return cannot leave the thread or the bar behind.
 - The sampler wakes every 250 ms, reads `snapshot()`, renders, and updates the bar. Every draw error is ignored (indicatif discards them: `state.rs:69,89,149,176,185,189`, `progress_bar.rs:443` at tag 0.18.6), so a closed or full stderr never fails the copy (A2).
 
 ### 3.3 Where the engine bumps the counters (`flux-core`)
@@ -100,15 +102,16 @@ Errors        3            (only when errors > 0)
 | `bytes` | `bytes_copied += n as u64;` (`copy.rs:957`) | per buffer (at most `COPY_BUF_MAX`), after the write succeeds |
 | `copied` | `out.files_copied += 1;` in `finish_copy` (`tree.rs:4324`) | on the `Ok` arm only |
 | `resumed` | `out.files_resumed += 1;` (`tree.rs:1918`) | beside it |
+| `skipped` | `out.files_skipped += 1;` in `copy_one` and `link_one` (`tree.rs`), through `note_skipped` | beside it, so the two cannot drift |
 | `errors` | the CLI's `on_report` closure (`main.rs:492, 694`), not the engine | a record counts when `FailureTally` counts it: `Walk`, `CreateDir`, `Copy`, `PublishedWithComplaints`, `ClaimNotRecorded`; not `SpecialFileSkipped`, `SymlinkSkipped`, `MountSkipped` |
 
-`bytes` counts a partial that a later failure discards, so the live `Transferred` can exceed the final `bytes_copied` after a failure. It is exact in a clean run (G6, test T3). Hardlinked, symlinked, excluded and special entries are in `discovered` and in no other counter, so `Processed` can end below `Discovered`; the display is cleared before the summary, which is the authority.
+`bytes` counts a partial that a later failure discards, so the live `Transferred` can exceed the final `bytes_copied` after a failure. It is exact in a clean run (G6, test T3). Hardlinked members, links skipped by `--links=skip`, special files and mount roots are in `discovered` and in no other counter (and failed files only in `errors`), so `Processed` can end below `Discovered`; entries excluded by `--exclude` never count as `discovered`; the display is cleared before the summary, which is the authority.
 
-**Implementation notes (2026-10-29).** The plan deviated from this section in these places, each under a ruling. The carrier of the discovered/copied/resumed counters is `TreeOutcome` (field `progress`, methods `note_discovered`/`note_copied`/`note_resumed`), not `Shared`, because `finish_copy` and the walk's counting sites hold `out` (PR-1). Bytes ride a trailing `progress: Option<&Progress>` parameter on `stage_file` and `copy_file_checkpointed`; `files_resumed` has a second site, in `link_one` (PR-2). The keyless branch of `copy_one` and the single-file branch of `run::file` call `copy_file_checkpointed(.., None, progress)` instead of `copy_file_guarded` (PR-5, PR-7). `Display::println` uses `ProgressBar::println`, not `suspend`, because `Display::start` returns `None` for a hidden target (PF-7 of the execution ledger). `Live::start` takes a `plain: fn(&str)` parameter (PR-4). Test T5 (bytes move inside a file) is realised as a failed write after K-1 buffers, because the fake has no hook-on-write.
+**Implementation notes (2026-10-29).** The plan deviated from this section in these places, each under a ruling. The carrier of the discovered/copied/resumed counters is `TreeOutcome` (field `progress`, methods `note_discovered`/`note_copied`/`note_resumed`), not `Shared`, because `finish_copy` and the walk's counting sites hold `out` (PR-1). Bytes ride a trailing `progress: Option<&Progress>` parameter on `stage_file` and `copy_file_checkpointed`; `files_resumed` has a second site, in `link_one` (PR-2). The keyless branch of `copy_one` and the single-file branch of `run::file` call `copy_file_checkpointed(.., None, progress)` instead of `copy_file_guarded` (PR-5, PR-7). `Display::println` uses `ProgressBar::println`, not `suspend`, because `Display::start` returns `None` for a hidden target (PF-7 of the execution ledger). `Live::start` takes a `plain: fn(&str)` parameter (PR-4). Final-review fix wave (PF-10, PF-11): a `skipped` counter (`note_skipped`, a `Skipped` line, `Processed = copied + resumed + skipped`) so an incremental re-sync shows progress, and the resume carry bytes in `stage_file` now tick `bytes` (I1). Test T5 (bytes move inside a file) is realised as a failed write after K-1 buffers, because the fake has no hook-on-write.
 
 ### 3.4 A single file
 
-The single-file path does not use `finish_copy` or the walk, so `discovered`, `copied` and `resumed` stay zero and the single-file frame uses only `bytes` and `expected_bytes`. `run::file` sets `expected_bytes` from the source's length, which it already reads, only when that length is greater than zero (a zero-length file shows the counters frame) and only when `cfg.resume` is false: a resumed single file writes fewer bytes than its length, so a percent against the full length would never reach 100. A resumed single file shows the counters shape.
+The single-file path does not use `finish_copy` or the walk, so `discovered`, `copied` and `resumed` stay zero and the single-file frame uses only `bytes` and `expected_bytes`. `run::file` sets `expected_bytes` from the source's length, read with one `fs.metadata(src)` call that exists only when a handle is set, only when that length is greater than zero (a zero-length file shows the counters frame) and only when `cfg.resume` is false: a resumed single file writes fewer bytes than its length, so a percent against the full length would never reach 100. A resumed single file shows the counters shape.
 
 ### 3.5 When the display runs (the CLI, `copy` and `copy_several`)
 
@@ -150,7 +153,7 @@ The `--json` object, the stdout records, the exit codes, the summary text, `flux
 ## 6. Accepted boundaries
 
 - B1. The live `Transferred` can exceed the final `bytes_copied` after a failed file (a discarded partial was written). Exact in a clean run.
-- B2. `Processed` ends below `Discovered` when links, symlinks, special files or excluded entries are present.
+- B2. `Processed` ends below `Discovered` when the tree holds hardlinked members, links skipped by `--links=skip`, special files or mount roots, or when files failed; entries excluded by `--exclude` never count as `Discovered`.
 - B3. Ctrl-C and `SIGKILL` end the process as today; the bar's last frame may stay on the terminal. No signal handler is added.
 - B4. The speed is an average over the whole run (N5).
 - B5. The `Discovered` counter races the final `files_total` by design: it is sampled while the walk runs.

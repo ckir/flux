@@ -133,6 +133,14 @@ impl TreeOutcome {
         }
     }
 
+    /// Count one more file skipped by the existing-file policy, and tick the live view with it.
+    pub(crate) fn note_skipped(&mut self) {
+        self.files_skipped += 1;
+        if let Some(p) = &self.progress {
+            p.add_skipped();
+        }
+    }
+
     /// Count one more entry resumed, and tick the live view with it.
     pub(crate) fn note_resumed(&mut self) {
         self.files_resumed += 1;
@@ -1999,7 +2007,7 @@ fn copy_one<F: DestinationRoot>(
                 }
             };
             if let Some(len) = skip {
-                out.files_skipped += 1;
+                out.note_skipped();
                 out.bytes_skipped += len;
                 if let Some(group) = &group {
                     skipped_member(cx, group, &target, &meta, &path, out);
@@ -3101,7 +3109,7 @@ fn link_one<F: DestinationRoot>(
                 }
             };
             if let Some(reason) = skip {
-                out.files_skipped += 1;
+                out.note_skipped();
                 if cx.dry_run {
                     let skipped = PlannedEntry {
                         object: PlannedObject::Symlink,

@@ -44,7 +44,8 @@ pub fn render(s: &Snapshot, elapsed: Duration) -> Vec<String> {
             ]
         }
         _ => {
-            let processed = s.copied.saturating_add(s.resumed).min(s.discovered);
+            let processed =
+                s.copied.saturating_add(s.resumed).saturating_add(s.skipped).min(s.discovered);
             let mut lines = vec![
                 line("Discovered", &HumanCount(s.discovered).to_string()),
                 line("Processed", &HumanCount(processed).to_string()),
@@ -53,6 +54,9 @@ pub fn render(s: &Snapshot, elapsed: Duration) -> Vec<String> {
             ];
             if s.resumed > 0 {
                 lines.push(line("Resumed", &HumanCount(s.resumed).to_string()));
+            }
+            if s.skipped > 0 {
+                lines.push(line("Skipped", &HumanCount(s.skipped).to_string()));
             }
             if s.errors > 0 {
                 lines.push(line("Errors", &HumanCount(s.errors).to_string()));
@@ -80,7 +84,14 @@ mod tests {
     use std::time::Duration;
 
     fn s(d: u64, c: u64, r: u64, e: u64, b: u64) -> Snapshot {
-        Snapshot { discovered: d, copied: c, resumed: r, errors: e, bytes: b, expected_bytes: None }
+        Snapshot {
+            discovered: d,
+            copied: c,
+            resumed: r,
+            errors: e,
+            bytes: b,
+            ..Snapshot::default()
+        }
     }
 
     fn single(d: u64, c: u64, b: u64) -> Snapshot {
@@ -185,6 +196,43 @@ mod tests {
                     "Transferred   0 B",
                     "Speed         -",
                     "Resumed       1",
+                ],
+            ),
+            (
+                Snapshot {
+                    discovered: 100,
+                    copied: 10,
+                    skipped: 85,
+                    bytes: 1024,
+                    ..Snapshot::default()
+                },
+                secs(2),
+                vec![
+                    "Discovered    100",
+                    "Processed     95",
+                    "Transferred   1.00 KiB",
+                    "Speed         512 B/s",
+                    "Skipped       85",
+                ],
+            ),
+            (
+                Snapshot {
+                    discovered: 10,
+                    copied: 1,
+                    resumed: 2,
+                    skipped: 3,
+                    errors: 4,
+                    ..Snapshot::default()
+                },
+                secs(1),
+                vec![
+                    "Discovered    10",
+                    "Processed     6",
+                    "Transferred   0 B",
+                    "Speed         -",
+                    "Resumed       2",
+                    "Skipped       3",
+                    "Errors        4",
                 ],
             ),
         ];

@@ -16,6 +16,7 @@ pub struct Progress {
     discovered: AtomicU64,
     copied: AtomicU64,
     resumed: AtomicU64,
+    skipped: AtomicU64,
     errors: AtomicU64,
     bytes: AtomicU64,
     expected_bytes: AtomicU64,
@@ -27,6 +28,7 @@ pub struct Snapshot {
     pub discovered: u64,
     pub copied: u64,
     pub resumed: u64,
+    pub skipped: u64,
     pub errors: u64,
     pub bytes: u64,
     /// `None` when never set or set to 0.
@@ -52,6 +54,10 @@ impl Progress {
         self.resumed.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn add_skipped(&self) {
+        self.skipped.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn add_error(&self) {
         self.errors.fetch_add(1, Ordering::Relaxed);
     }
@@ -73,6 +79,7 @@ impl Progress {
             discovered: self.discovered.load(Ordering::Relaxed),
             copied: self.copied.load(Ordering::Relaxed),
             resumed: self.resumed.load(Ordering::Relaxed),
+            skipped: self.skipped.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
             bytes: self.bytes.load(Ordering::Relaxed),
             expected_bytes: if expected == 0 { None } else { Some(expected) },
@@ -92,7 +99,7 @@ mod tests {
     #[test]
     fn each_add_moves_only_its_own_field() {
         type Act = fn(&Progress);
-        let cases: [(&str, Act, Snapshot); 6] = [
+        let cases: [(&str, Act, Snapshot); 7] = [
             (
                 "discovered",
                 |p| p.add_discovered(),
@@ -100,6 +107,7 @@ mod tests {
             ),
             ("copied", |p| p.add_copied(), Snapshot { copied: 1, ..Snapshot::default() }),
             ("resumed", |p| p.add_resumed(), Snapshot { resumed: 1, ..Snapshot::default() }),
+            ("skipped", |p| p.add_skipped(), Snapshot { skipped: 1, ..Snapshot::default() }),
             ("errors", |p| p.add_error(), Snapshot { errors: 1, ..Snapshot::default() }),
             ("bytes", |p| p.add_bytes(7), Snapshot { bytes: 7, ..Snapshot::default() }),
             (

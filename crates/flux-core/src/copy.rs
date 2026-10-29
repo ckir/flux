@@ -935,6 +935,9 @@ pub(crate) fn stage_file<F: DestinationRoot>(
                 break 'stream Err(StreamFail::Discard(CopyStep::Stream, copy_code(&e), e));
             }
             bytes_copied += carry.len() as u64;
+            if let Some(p) = progress {
+                p.add_bytes(carry.len() as u64);
+            }
             if let Some(s) = sink.as_mut()
                 && let Err(e) = s.wrote(&carry, beat)
             {

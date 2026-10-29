@@ -499,6 +499,7 @@ fn copy(args: &CopyArgs) -> u8 {
             let run = flux_core::run::tree(&fs, &src, &dst, &opts, &cfg, &mut |f| {
                 let counted = flux_cli::live::counts_as_failure(&f.cause);
                 for (index, line) in report::record_lines(&f).into_iter().enumerate() {
+                    // one error per record, not per line of the record
                     live.record(&line, counted && index == 0);
                 }
             });
@@ -710,6 +711,7 @@ fn copy_several(args: &CopyArgs) -> u8 {
     let multi = flux_core::run::trees(&fs, specs, &dst, &opts, &cfg, &mut |f| {
         let counted = flux_cli::live::counts_as_failure(&f.cause);
         for (index, line) in report::record_lines(&f).into_iter().enumerate() {
+            // one error per record, not per line of the record
             live.record(&line, counted && index == 0);
         }
     });

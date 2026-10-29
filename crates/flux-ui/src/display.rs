@@ -43,19 +43,24 @@ impl Display {
         let started = Instant::now();
         draw(&bar, &progress, started);
         let stop = Arc::new(AtomicBool::new(false));
-        let sampler = std::thread::Builder::new()
-            .name("flux-progress".to_owned())
-            .spawn({
-                let (bar, progress, stop) = (bar.clone(), Arc::clone(&progress), Arc::clone(&stop));
-                move || loop {
-                    std::thread::park_timeout(SAMPLE_INTERVAL);
-                    if stop.load(Ordering::Acquire) {
-                        break;
-                    }
-                    draw(&bar, &progress, started);
+        let spawned = std::thread::Builder::new().name("flux-progress".to_owned()).spawn({
+            let (bar, progress, stop) = (bar.clone(), Arc::clone(&progress), Arc::clone(&stop));
+            move || loop {
+                std::thread::park_timeout(SAMPLE_INTERVAL);
+                if stop.load(Ordering::Acquire) {
+                    break;
                 }
-            })
-            .ok()?;
+                draw(&bar, &progress, started);
+            }
+        });
+        let sampler = match spawned {
+            Ok(handle) => handle,
+            Err(_) => {
+                // The first frame is already on screen: clear it rather than leave a stale frame behind.
+                bar.finish_and_clear();
+                return None;
+            }
+        };
         Some(Display { bar, progress, started, stop, sampler: Some(sampler) })
     }
 
