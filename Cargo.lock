@@ -383,6 +383,7 @@ dependencies = [
  "flux-platform",
  "flux-ui",
  "indicatif",
+ "libc",
  "redb",
  "serde",
  "serde_json",

@@ -23,5 +23,6 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 indicatif = { workspace = true, features = ["in_memory"] }
+libc = { workspace = true }
 redb = { workspace = true }
 tempfile = { workspace = true }
