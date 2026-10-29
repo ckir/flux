@@ -89,6 +89,7 @@ impl Drop for Display {
         self.shutdown();
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

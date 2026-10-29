@@ -27,8 +27,24 @@ pub fn render(s: &Snapshot, elapsed: Duration) -> Vec<String> {
     };
     let speed = bytes_per_second.map_or_else(|| "-".to_owned(), |b| format!("{}/s", HumanBytes(b)));
     match s.expected_bytes {
-        None => {
-            let processed = (s.copied + s.resumed).min(s.discovered);
+        Some(total) if total > 0 => {
+            let done = s.bytes.min(total);
+            let pct = u128::from(done) * 100 / u128::from(total);
+            let filled = (pct * BAR_WIDTH / 100) as usize;
+            let bar = format!("{}{}", "#".repeat(filled), ".".repeat(BAR_WIDTH as usize - filled));
+            let eta = match bytes_per_second {
+                Some(b) if b > 0 => eta_text((total - done) / b),
+                _ => "-".to_owned(),
+            };
+            vec![
+                line("Transferred", &format!("{} / {}", HumanBytes(s.bytes), HumanBytes(total))),
+                line("Progress", &format!("[{bar}] {pct}%")),
+                line("Speed", &speed),
+                line("ETA", &eta),
+            ]
+        }
+        _ => {
+            let processed = s.copied.saturating_add(s.resumed).min(s.discovered);
             let mut lines = vec![
                 line("Discovered", &HumanCount(s.discovered).to_string()),
                 line("Processed", &HumanCount(processed).to_string()),
@@ -43,20 +59,6 @@ pub fn render(s: &Snapshot, elapsed: Duration) -> Vec<String> {
             }
             lines
         }
-        Some(total) => {
-            let done = s.bytes.min(total);
-            let pct = u128::from(done) * 100 / u128::from(total);
-            let filled = (pct * BAR_WIDTH / 100) as usize;
-            let bar = format!("{}{}", "#".repeat(filled), ".".repeat(BAR_WIDTH as usize - filled));
-            let eta = bytes_per_second
-                .map_or_else(|| "-".to_owned(), |b| eta_text((total - done) / b.max(1)));
-            vec![
-                line("Transferred", &format!("{} / {}", HumanBytes(s.bytes), HumanBytes(total))),
-                line("Progress", &format!("[{bar}] {pct}%")),
-                line("Speed", &speed),
-                line("ETA", &eta),
-            ]
-        }
     }
 }
 
@@ -70,6 +72,7 @@ pub(crate) fn eta_text(secs: u64) -> String {
         format!("{s}s")
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +160,33 @@ mod tests {
                     "Errors        1",
                 ],
             ),
+            (
+                Snapshot {
+                    discovered: 2,
+                    copied: 1,
+                    bytes: 1024,
+                    expected_bytes: Some(0),
+                    ..Snapshot::default()
+                },
+                secs(2),
+                vec![
+                    "Discovered    2",
+                    "Processed     1",
+                    "Transferred   1.00 KiB",
+                    "Speed         512 B/s",
+                ],
+            ),
+            (
+                Snapshot { discovered: 5, copied: u64::MAX, resumed: 1, ..Snapshot::default() },
+                secs(0),
+                vec![
+                    "Discovered    5",
+                    "Processed     5",
+                    "Transferred   0 B",
+                    "Speed         -",
+                    "Resumed       1",
+                ],
+            ),
         ];
         for (i, (snap, elapsed, want)) in cases.into_iter().enumerate() {
             assert_eq!(render(&snap, elapsed), want, "case {}", i + 1);
@@ -204,6 +234,16 @@ mod tests {
                 ],
             ),
             (single(9, 9, 1024), secs(2), case2),
+            (
+                single(0, 0, 1),
+                secs(10),
+                vec![
+                    "Transferred   1 B / 4.00 KiB",
+                    "Progress      [....................] 0%",
+                    "Speed         0 B/s",
+                    "ETA           -",
+                ],
+            ),
         ];
         for (i, (snap, elapsed, want)) in cases.into_iter().enumerate() {
             assert_eq!(render(&snap, elapsed), want, "case {}", i + 1);
