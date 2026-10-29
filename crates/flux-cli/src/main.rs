@@ -11,6 +11,7 @@ use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use flux_cli::exit_code;
 use flux_cli::report::{self, Report};
 use flux_cli::resolve::{self, Job, Stop};
+use flux_cli::verbosity::{self, Verbosity};
 use flux_cli::verify_report;
 use flux_core::run::RunConfig;
 use flux_core::verify::VerifyError;
@@ -25,6 +26,14 @@ use std::time::Instant;
 #[derive(Parser)]
 #[command(name = "flux", version)]
 struct Cli {
+    /// More detail: on `flux verify` also print the `match` records on stdout; on `copy` and
+    /// `cleanup` add per-item lines on stderr. Repeat (`-vv`, `-vvv`) for more; above three is
+    /// the same as three. Cannot be combined with --quiet.
+    #[arg(short = 'v', long = "verbose", action = ArgAction::Count, global = true)]
+    verbose: u8,
+    /// Print only errors, the summary line and the dry-run notes. Cannot be combined with -v.
+    #[arg(short = 'q', long = "quiet", global = true)]
+    quiet: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -78,9 +87,6 @@ struct VerifyArgs {
     /// One JSON object per record on stdout, then one {"summary": ...} object.
     #[arg(long)]
     json: bool,
-    /// Also print each `match` record (the default prints only what is not a match).
-    #[arg(long)]
-    verbose: bool,
     /// Leave out every entry whose name or path matches PATTERN (repeatable; matched entries are neither compared nor
     /// reported, and not entered, on either side, and are counted as `excluded`). A pattern without `/` is matched against each entry's own name at any
     /// depth (`*.tmp`); with a leading or inner `/` it is anchored and matched against the whole path below the source
@@ -289,11 +295,24 @@ enum SafetyArg {
 }
 
 fn main() -> ExitCode {
-    ExitCode::from(match Cli::parse().command {
+    let cli = Cli::parse();
+    match verbosity_of(&cli) {
+        Ok(v) => verbosity::set(v),
+        Err(msg) => {
+            err(&format!("error: {msg}"));
+            return ExitCode::from(exit_code::USAGE);
+        }
+    }
+    ExitCode::from(match cli.command {
         Commands::Copy(args) => copy(&args),
         Commands::Cleanup(args) => cleanup(&args),
         Commands::Verify(args) => verify(&args),
     })
+}
+
+/// The verbosity the global flags ask for; `-v` with `--quiet` is a usage error.
+fn verbosity_of(cli: &Cli) -> Result<Verbosity, String> {
+    Verbosity::from_flags(cli.verbose, cli.quiet)
 }
 
 /// Parses one `--exclude` value; the clap error is the pattern's own message.
@@ -850,7 +869,7 @@ fn verify_one(args: &VerifyArgs, source: &Path, dest: &Path) -> u8 {
     };
     let opts = verify_options(args);
     let mut sink = |r: flux_core::verify::Record| {
-        let routed = verify_report::route_record(&r, args.json, args.verbose);
+        let routed = verify_report::route_record(&r, args.json, verbosity::get().level >= 1);
         if let Some(line) = &routed.stdout {
             stdout_or_exit(line);
         }
@@ -941,7 +960,7 @@ fn verify_several_cli(args: &VerifyArgs) -> u8 {
     let collected: Vec<PathBuf> = specs.iter().map(|s| s.src.clone()).collect();
     let opts = verify_options(args);
     let mut sink = |r: flux_core::verify::Record| {
-        let routed = verify_report::route_record(&r, args.json, args.verbose);
+        let routed = verify_report::route_record(&r, args.json, verbosity::get().level >= 1);
         if let Some(line) = &routed.stdout {
             stdout_or_exit(line);
         }
@@ -1050,6 +1069,43 @@ mod tests {
         args
     }
 
+    fn verbosity_for(argv: &[&str]) -> Result<Verbosity, String> {
+        verbosity_of(&Cli::try_parse_from(argv).unwrap())
+    }
+
+    fn level_of(argv: &[&str]) -> u8 {
+        verbosity_for(argv).unwrap().level
+    }
+
+    #[test]
+    fn v_and_q_conflict_in_every_position() {
+        for argv in [
+            &["flux", "copy", "-v", "-q", "a", "b"][..],
+            &["flux", "-q", "copy", "-v", "a", "b"],
+            &["flux", "-v", "copy", "-q", "a", "b"],
+            &["flux", "verify", "-vq", "a", "b"],
+            &["flux", "cleanup", "-v", "-q", "d"],
+        ] {
+            assert!(verbosity_for(argv).is_err(), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn flags_are_global_both_positions() {
+        assert_eq!(level_of(&["flux", "-v", "copy", "a", "b"]), 1);
+        assert_eq!(level_of(&["flux", "copy", "-v", "a", "b"]), 1);
+    }
+
+    #[test]
+    fn verbose_long_form_is_the_same_count() {
+        assert_eq!(level_of(&["flux", "copy", "--verbose", "--verbose", "a", "b"]), 2);
+    }
+
+    #[test]
+    fn vvvv_is_accepted_as_three() {
+        assert_eq!(level_of(&["flux", "copy", "-vvvv", "a", "b"]), 3);
+    }
+
     #[test]
     fn cross_filesystems_reaches_the_engine_mount_policy() {
         use flux_core::walk::MountPolicy;
@@ -1068,7 +1124,8 @@ mod tests {
         assert_eq!(bare.paths[0], PathBuf::from("s"));
         assert_eq!(bare.paths[1], PathBuf::from("d"));
         assert!(matches!(bare.links, LinksArg::Copy));
-        assert!(!bare.cross_filesystems && !bare.json && !bare.verbose);
+        assert!(!bare.cross_filesystems && !bare.json);
+        assert_eq!(level_of(&["flux", "verify", "a", "b"]), 0);
         let all = parse_verify(&[
             "flux",
             "verify",
@@ -1081,7 +1138,21 @@ mod tests {
             "--verbose",
         ]);
         assert!(matches!(all.links, LinksArg::Skip));
-        assert!(all.cross_filesystems && all.json && all.verbose);
+        assert!(all.cross_filesystems && all.json);
+        assert_eq!(
+            level_of(&[
+                "flux",
+                "verify",
+                "s",
+                "d",
+                "--links",
+                "skip",
+                "--cross-filesystems",
+                "--json",
+                "--verbose",
+            ]),
+            1
+        );
         for argv in [&["flux", "verify", "s"][..], &["flux", "verify", "s", "d", "--resume"]] {
             assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
         }

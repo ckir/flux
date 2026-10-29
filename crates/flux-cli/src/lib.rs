@@ -13,4 +13,5 @@ pub mod exit_code;
 pub mod live;
 pub mod report;
 pub mod resolve;
+pub mod verbosity;
 pub mod verify_report;
