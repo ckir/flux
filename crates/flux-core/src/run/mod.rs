@@ -40,6 +40,7 @@ use crate::hardlinks::{HardlinkSlot, strong};
 use crate::lock::record::LockRecord;
 use crate::lock::site::NAME_LIMIT;
 use crate::lock::{LockCode, LockSite, Refusal, Released, check_capability};
+use crate::oplog::{self, Verb};
 use crate::prior::{check_control_plane, resumable_refusal};
 use crate::state::{HARDLINK_INDEX, OpState, file_names_fit, identity_text, native_hex};
 use crate::tree::{
@@ -892,6 +893,11 @@ pub(crate) fn file_with<F: DestinationRoot>(
         Err(_) => Ended::Failed,
     };
     run.stop = finish(&mut place, locked, ended, &mut run.warnings);
+    // A failure announces nothing. A replaced single file also reads `Copied` in this cut (ruling PR-6).
+    if let Ok(o) = &copied {
+        let verb = if o.skipped { Verb::Skipped } else { Verb::Copied };
+        oplog::emit(verb, dst, (!o.skipped).then_some(o.bytes_copied), None);
+    }
     run.copy = Some(copied);
     run
 }

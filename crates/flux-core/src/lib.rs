@@ -14,6 +14,7 @@ pub(crate) mod hardlinks;
 pub mod ids;
 pub mod lock;
 mod names;
+pub mod oplog;
 pub mod prior;
 pub mod progress;
 pub mod run;
