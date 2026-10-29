@@ -245,7 +245,6 @@ Each was measured, and each is deliberately NOT fixed in that PR.
 - [ ] **Progress counts only the bytes this run writes.** The re-read of `--verify=destination|full` and of `--resume-verify` moves no byte counter, so `Transferred` is still while a big file is verified (spec boundary B7); a verifying-phase counter is the follow-up.
 - [ ] **No percent or ETA for a folder.** It needs a pre-scan or a bounded background count (spec N2, section 52's known-total form).
 - [ ] **`flux verify` has no progress display, and the `Hardlinks`, `Degraded` and `Capacity wait` lines of section 52 are not shown** (spec N1, N4).
-- [ ] **Logging and `--quiet` (section 54) are not built.** The progress display has no off switch other than redirecting stderr (spec N3).
 
 ## Engine (walker cut 4) prerequisites
 
