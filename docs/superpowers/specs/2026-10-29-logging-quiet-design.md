@@ -26,14 +26,14 @@ Non-goals (the owner decided or I propose; each is a later cut if wanted)
 - N1. No `--log-file`, no JSON log format, no `RUST_LOG` or `FLUX_LOG` environment filter, no timestamps, no colour. The `json` and `env-filter` features of `tracing-subscriber` pinned in `Cargo.toml:68` stay unused.
 - N2. No percent or `n/m files` for a folder: that needs a pre-scan, which the progress spec rejected (its N2).
 - N3. The failure line text stays `CODE: path: message` (for example `PERMISSION_DENIED: locked: Permission denied (os error 13)`). The codes are the registry's normative identifiers (spec section 55) and about a dozen tests and any user script match them.
-- N4. `flux verify` and `flux cleanup` keep their record and table texts and their summaries. Only the gating by `-v` and `--quiet` and the new stderr events are added.
+- N4. `flux verify` and `flux cleanup` keep their record and table texts and their summaries. For `verify`, `-v` is exactly today's `--verbose` (the `match` records on stdout), `-vv` and `-vvv` add `tracing` diagnostics on stderr and never change the stdout records, and `verify` has no verb lines. For `cleanup`, `-v` adds `Removed` lines on stderr; its table stays on stdout.
 - N5. The progress display's frame is unchanged.
 
 Anti-goals (a failure even if everything else works)
 - A1. A verbosity flag changes an exit code, a `--json` byte, or hides the cause of a non-zero exit.
 - A2. A log call panics, blocks or fails the copy because stderr is closed or slow.
-- A3. A file name with a control or escape sequence reaches the terminal unescaped (it could erase the progress bar or forge a line).
-- A4. With logging off, the copy gets measurably slower (spec section 76: performance is measured).
+- A3. A file name with a control or escape sequence reaches a terminal unescaped (it could erase the progress bar or forge a line). This covers every line written through the display, including the existing failure lines (section 5.6).
+- A4. With logging off, the copy gets measurably slower (spec section 76: performance is measured). Checkable: on the many-small-files case of `benches/copy.rs`, two warm runs with and without the logging code compiled in give overlapping ranges (the project's timing rules: owner's go-ahead, idle machine, range quoted, uncontrolled load stated).
 - A5. `--quiet` leaves an operator unable to tell why a run exited non-zero.
 
 ## 3. Decisions the owner made (in conversation, 2026-10-29)
@@ -41,7 +41,7 @@ Anti-goals (a failure even if everything else works)
 | # | Decision |
 |---|---|
 | D1 | `-v` line style "A", action verbs, in Cargo style: the verb capitalised and right-aligned, then the path: `   Created sub`, `    Copied a (2 B)`, `    Linked lnk -> a`. |
-| D2 | On a terminal, `-v` keeps the live progress bar at the bottom and prints the lines above it (cut 20's `Live::record` and `ProgressBar::println`). The flicker risk is the accepted B8 of the progress spec; it is to be measured on a large tree before the plan is final. |
+| D2 | On a terminal, `-v` keeps the live progress bar at the bottom and prints the lines above it (cut 20's `Live::record` and `ProgressBar::println`). The flicker risk is the accepted B8 of the progress spec; it is to be measured on a large tree before the plan is final (the numbers are recorded in the plan; the owner decides whether they are acceptable, and the fallback is a rate-limited batch of `-v` lines, not removing the bar). |
 | D3 | `--quiet` still prints **warnings** (hardlink degradation, weak identity, metadata complaints) and the failure lines, refusals and abort hints; it keeps the complete `--dry-run` output. |
 | D4 | Scope: `flux copy`, `flux verify` and `flux cleanup`. `flux verify --verbose` becomes an alias of `-v`. |
 | D5 | Approach 1 (section 4): `tracing` everywhere, with a custom formatter in `flux-cli`. |
@@ -52,7 +52,7 @@ Anti-goals (a failure even if everything else works)
 
 Three ways to produce the `-v` lines and the `-vv`/`-vvv` detail. agy (a peer reviewer) and I consulted on this fork (`.clavity/seams/logging-quiet-approach.md`; reply `.clavity/scratch/logging-quiet-approach/r1-reply.md`); the claims below were measured by reading the code.
 
-- **Approach 1, `tracing` everywhere (chosen).** The engine emits `tracing` events; `flux-cli` installs a subscriber with a custom formatter that renders the `flux::op` events as the verb lines. Cost: no function signature changes; a dozen or so emission sites (the plan counts them: the three `note_*` callers alone are eight call sites in `tree.rs`); one subscriber setup. Fits `run::file`, `verify` and `cleanup` uniformly.
+- **Approach 1, `tracing` everywhere (chosen).** The engine emits `tracing` events; `flux-cli` installs a subscriber with a custom formatter that renders the `flux::op` events as the verb lines. Cost: no function signature changes; about sixteen emission sites (measured by their counters in `tree.rs`: `note_copied` 1, `note_resumed` 2, `note_skipped` 2, `files_overwritten += 1` 6, `files_hardlinked += 1` 2, plus `enter_dir`, `link_one` and the cleanup deletion; the plan fixes the list); one subscriber setup. Fits `run::file`, `verify` and `cleanup` uniformly.
 - **Approach 2, hybrid.** `-v` lines as typed success records through the existing `on_report: &mut dyn FnMut(TreeFailure)` stream; `tracing` only for `-vv`/`-vvv`. Cost: `on_report` appears 201 times and 38 function signatures take it in `crates/flux-core/src/tree.rs`; `run::file` and `cleanup` have no such stream and would need new APIs. Benefit: tests need no subscriber. Rejected on cost, since the scope covers three commands.
 - **Approach 3, an event channel in `RunConfig`.** A `Sender<EngineEvent>` the CLI drains. Cost: a new mechanism beside `tracing`, a thread or a poll, and still two output paths. Rejected.
 
@@ -62,7 +62,7 @@ Claims in agy's reply that did not hold when measured, and are not reasons for t
 
 ### 5.1 Flags
 
-`-v` is a count (`-v`, `-vv`, `-vvv`, also `-v -v`); `--quiet` (short `-q`) is a flag. They are global: accepted by `copy`, `verify` and `cleanup`, defined once. `--verbose` is the long form of `-v` (so `flux verify --verbose` is `-v`, and is `-v` on the other two commands too). `-v` with `--quiet` is a usage error: exit 2, a message naming both. They are not stored in any operation state; spec line 5833 already lets them change on a `--resume`, and a test pins that a resume with different verbosity is accepted.
+`-v` is a count (`-v`, `-vv`, `-vvv`, also `-v -v`); `--quiet` (short `-q`) is a flag. They are global (clap `global = true`): accepted by `copy`, `verify` and `cleanup`, defined once, and accepted before or after the subcommand (`flux -v copy ...` and `flux copy -v ...`). No short flag exists in `main.rs` today, so `-v` and `-q` collide with nothing. `--verbose` is the long form of the same count (so `flux verify --verbose` is `-v`, and is `-v` on the other two commands too); the field `VerifyArgs.verbose` and the parse test that reads it (`!bare.verbose`, `all.verbose`) are replaced by the shared verbosity value. `-v` with `--quiet` is a usage error: exit 2, a message naming both. They are not stored in any operation state; spec line 5833 already lets them change on a `--resume`, and a test pins that a resume with different verbosity is accepted.
 
 Setting | tracing level shown | meaning
 ---|---|---
@@ -72,11 +72,11 @@ Setting | tracing level shown | meaning
 `-vv` | `debug` | adds engine decisions
 `-vvv` | `trace` | adds chunk and claim events
 
-The existing direct prints (failure lines, warnings, the summary, resume notes, the dry-run plan) stay direct prints; they are not routed through `tracing`. The verbosity value gates them where section 5.3 says so.
+The existing direct prints (failure lines, warnings, the summary, resume notes, the dry-run plan) stay direct prints; they are not routed through `tracing`. The verbosity value gates them where section 5.3 says so. The engine emits no `warn` or `error` events in this cut, so the `warn` filter of the first two rows shows nothing from `tracing`; the value is reserved. The subscriber renders only events whose target starts with `flux` (so a future dependency that uses `tracing` cannot leak into the output).
 
 ### 5.2 The `-v` verb lines
 
-Each is one `tracing` `INFO` event with target `flux::op` and fields `action`, `path` (relative to the source root, `/`-separated, as `report::rel` writes it) and, when it applies, `bytes` and `to`. The formatter renders `{verb:>10} {path}` followed by the detail; the verb column is 10 wide (the longest verb, `Hardlinked`).
+Each is one `tracing` `INFO` event with target `flux::op` and fields `action`, `path` and, when it applies, `bytes` and `to`. `path` is relative to the destination root, `/`-separated, as `report::rel` writes it: for one source tree it equals the path below the source root; in a several-source run it starts with the root's name (`alpha/a`), so two roots never print the same path; for a single file it is the destination path as the user typed it. The formatter renders `{verb:>10} {path}` followed by the detail; the verb column is 10 wide (the longest verb, `Hardlinked`).
 
 | `action` | Verb | Line | When the engine emits it |
 |---|---|---|---|
@@ -115,24 +115,25 @@ One rule, stated once: **`--quiet` prints only (a) the cause of a non-zero exit,
 | `--json` object (stdout) | shown | shown |
 | Skip records (symlink, special file, mount skipped by policy; exit 0) | shown | hidden |
 | Resume notes (`resume_lines`) | shown | hidden |
-| The summary line of `copy` | shown | hidden |
-| `flux verify`: `match`, `missing`, `mismatched`, `extra` records and the summary (stdout) | records shown (`match` only with `-v`); summary shown | when the exit is 0: nothing; when it is 1: the differing records only, no summary |
+| The summary line of `copy`, and in a several-source run the per-root lines and the total | shown | hidden |
+| `flux verify`, human output (stdout): `match`, `missing`, `mismatched`, `extra` records and the summary | records shown (`match` only with `-v`); summary shown | exit 0: nothing, including `extra` records (`extra` never fails a verify, `verify.rs` `Summary::failed`); exit 1: the `missing`, `mismatched` and unreadable records only, no summary |
+| `flux verify` stderr notices (mount not entered, unreadable extra, absent DEST) | shown | shown (they are warnings) |
 | `flux cleanup`: the table (stdout) | shown | when the exit is 0 and not `--dry-run`: hidden; otherwise shown |
 | The live progress bar | drawn on a terminal | not drawn |
 
-(For `verify` and `cleanup` the results are on stdout, so rule (a) is read as "the records that explain a non-zero exit", and a clean run prints nothing, like a clean `copy`.) With `--json` plus `--quiet`, stdout is the JSON object only and stderr carries (a) and (b) only.
+(For `verify` and `cleanup` the results are on stdout, so rule (a) is read as "the records that explain a non-zero exit", and a clean run prints nothing, like a clean `copy`.) With `--json` (any command), `--quiet` changes nothing on stdout: the whole JSON output stays, including the records and the `{"summary": ...}` object of `verify --json`; stderr carries (a) and (b) only. A test enumerates every non-zero exit path of the three commands and asserts that `--quiet` still prints at least one cause line for each (A5).
 
 ### 5.4 `-v` on a terminal and the progress bar
 
-`-v`, `-vv` and `-vvv` keep the bar (D2). The subscriber's writer hands each rendered line to the display (`Display::println`) while it exists, and writes straight to stderr before the display starts and after `live.finish()`. The writer discards I/O errors (A2). `--json` and `--dry-run` never draw the bar (cut 20's rule), but `-v` lines still print, plain, to stderr.
+`-v`, `-vv` and `-vvv` keep the bar (D2). There is one display per process run (`copy`, `copy_several` and the single-file path each build one `Live` through `Live::for_copy`, shared by all roots). The subscriber is installed first, so its writer reads a process-global slot that `Live::for_copy` fills with a shareable handle to the display and `live.finish()` empties; while the slot is full the writer hands each rendered line to `Display::println`, and before and after that window it writes straight to stderr. The writer discards I/O errors (A2). `--json` and `--dry-run` never draw the bar (cut 20's rule), but `-v` lines still print, plain, to stderr.
 
 ### 5.5 `-vv` and `-vvv`
 
-Plain lines on stderr: `{level:>5} {module}: {message} key=value ...`, no timestamp, no colour (N1), for example `debug tree: copy_one path=a size=2 plan=New`. The exact set of events is the plan's to fix, within these rules: every event that concerns a file carries `path` and the same escaping as section 5.6; `trace` events inside the per-chunk copy loop (`copy_file_checkpointed`) are guarded with `tracing::enabled!` so the loop pays one inline check with logging off (A4); no event is emitted while the claim store, WAL or destination lock is held across an I/O that can block on stderr; the exact bytes printed by `-vv`/`-vvv` are not a stable interface and are not pinned by tests beyond "the lines exist and carry `path`".
+Plain lines on stderr: `{level:>5} {module}: {message} key=value ...`, no timestamp, no colour (N1), for example `debug tree: copy_one path=a size=2 plan=New`. The formatter and the writer never panic: the shipped binary is built with `panic = "abort"` (`Cargo.toml:110`), so a panic there ends the process; no `unwrap`, `expect` or indexing in them, and a test drives them with a failing writer and hostile names. The exact set of events is the plan's to fix, within these rules: every event that concerns a file carries `path` and the same escaping as section 5.6; `trace` events inside the per-chunk copy loop (`copy_file_checkpointed`) are guarded with `tracing::enabled!` so the loop pays one inline check with logging off (A4); no event is emitted while the claim store, WAL or destination lock is held across an I/O that can block on stderr; the exact bytes printed by `-vv`/`-vvv` are not a stable interface and are not pinned by tests beyond "the lines exist and carry `path`".
 
 ### 5.6 Escaping
 
-Every path and symlink target that reaches a log line is escaped by the formatter: control characters, `\x1b`, `\r`, `\n` and a lone surrogate or non-UTF-8 byte are written as `\xNN` or `\u{..}` escapes, printable Unicode is left as is. The same helper serves the verb lines and the `-vv`/`-vvv` lines. (A3. The existing failure lines build the path with `report::rel`, which converts lossily to UTF-8 and does not escape control characters; this cut does not change them, and that is recorded as a known edge, not a regression.)
+Every path and symlink target that reaches a log line is escaped: control characters, `\x1b`, `\r`, `\n` and a non-UTF-8 byte are written as `\xNN` or `\u{..}` escapes, printable Unicode is left as is. A tracing field cannot carry raw bytes, and `Display` on a path is lossy, so the engine records each path through one helper that returns the already-escaped text (so the non-UTF-8 byte is still visible as an escape, not as U+FFFD), and the formatter escapes control characters in any field value again as a second guard. The same helper serves the verb lines and the `-vv`/`-vvv` lines. Separately, every line written through the display (`Display::println`) has its control characters escaped whatever its origin, which covers the existing failure lines (built with `report::rel`, lossy and unescaped today) while stderr is a terminal; a name without control characters prints byte for byte as before, and a piped stderr is unchanged.
 
 ## 6. The summary line (D6)
 
@@ -155,7 +156,7 @@ Rules:
 
 | Part | Where | What |
 |---|---|---|
-| Dependencies | `Cargo.toml` (workspace: `tracing`, `tracing-subscriber` already pinned), `crates/flux-core/Cargo.toml`, `crates/flux-cli/Cargo.toml`; remove both from the `ignored` list at `Cargo.toml:117` | `flux-core` depends on `tracing` only; `flux-cli` on both |
+| Dependencies | `Cargo.toml` (workspace: `tracing`, `tracing-subscriber` already pinned, but absent from `Cargo.lock` today, so the new crates enter the lock), `crates/flux-core/Cargo.toml`, `crates/flux-cli/Cargo.toml`; remove both from the `ignored` list at `Cargo.toml:117` | `flux-core` depends on `tracing` only; `flux-cli` on both, with the minimal `tracing-subscriber` features the custom formatter needs (no `env-filter`, no `json`, no `tracing-log`: N1); `just check` and `just deny` must pass |
 | Emission | `crates/flux-core/src/tree.rs` (the `note_copied`, `note_resumed`, `note_skipped` sites, `enter_dir`, `link_one`, the hardlink and replace paths), `run/mod.rs` (`file`), `copy.rs`, `cleanup/delete.rs` | `INFO` `flux::op` events (5.2); `DEBUG`/`TRACE` events (5.5) |
 | Flags | `crates/flux-cli/src/main.rs` (`Cli`, global args; `VerifyArgs.verbose` replaced) | `-v` count, `--verbose`, `-q`/`--quiet`, the conflict error |
 | Verbosity value | `crates/flux-cli/src/live.rs` or a new module `crates/flux-cli/src/verbosity.rs` | `Quiet`, `Normal`, `Verbose(n)`; gating of the direct prints |
@@ -196,6 +197,11 @@ The plan (not this document) fixes the file-level wiring and line numbers, after
 8. Elapsed-time formats and the use of `indicatif::HumanBytes` (section 6).
 9. `verify` and `cleanup` keep their record and summary texts (N4), and `cleanup` gets `Removed` lines at `-v` only.
 10. Warnings still print under `--quiet` is the owner's (D3); the choice that skip records are not warnings is mine.
+11. Under `--quiet`, `flux verify` hides `extra` records (they never fail a verify) and prints the `missing`, `mismatched` and unreadable ones only when the exit is 1.
+12. Under `--quiet`, the per-root and total lines of a several-source run are hidden with the summary.
+13. `path` in a `-v` line is relative to the destination root (the root's name leads in a several-source run); for a single file it is the destination as typed.
+14. Control characters are escaped on every line written through the display, which also changes how an existing failure line prints for a hostile name (never for an ordinary one).
+15. `flux verify -v` has no verb lines; it is today's `--verbose` and nothing more.
 
 ## 11. What is left to the plan
 
