@@ -11285,6 +11285,37 @@ fn a_clean_tree_copy_ticks_the_counters_to_the_outcome() {
 }
 
 #[test]
+fn an_overwriting_tree_copy_ticks_bytes_for_replaced_files() {
+    let fs = dest_fake();
+    fs.write_file("/p/dest/a", b"old and different");
+    let p = crate::progress::Progress::new();
+    let c = RunConfig { progress: Some(p.clone()), ..cfg() };
+    let (r, got) = run_tree_with(&fs, &c, &with_policy(ExistingPolicy::Overwrite));
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert!(out.files_overwritten >= 1, "{out:?}");
+    assert!(out.bytes_copied > 0);
+    assert_eq!(p.snapshot().bytes, out.bytes_copied);
+}
+
+#[test]
+fn a_strict_tree_copy_ticks_bytes_through_the_batch_path() {
+    let fs = fake();
+    let p = crate::progress::Progress::new();
+    let c = RunConfig { progress: Some(p.clone()), ..cfg() };
+    let (r, got) = run_tree_with(&fs, &c, &strict());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    // The batch path: each directory's notes are written by one `prepare_many` (as the neighbouring Strict tests).
+    let calls = calls(&fs);
+    assert_eq!(count(&calls, "claim_prepare_many("), 2, "{calls:?}");
+    let s = p.snapshot();
+    assert!(out.bytes_copied > 0);
+    assert_eq!(s.bytes, out.bytes_copied);
+    assert_eq!(s.copied, out.files_copied);
+}
+
+#[test]
 fn a_keyless_tree_copy_ticks_bytes_to_the_outcome() {
     // A weak destination root keys no claims, so `a` takes the keyless branch of `copy_one`.
     let fs = dest_fake();
