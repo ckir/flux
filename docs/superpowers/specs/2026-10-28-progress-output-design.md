@@ -131,7 +131,7 @@ The `--json` object, the stdout records, the exit codes, the summary text, `flux
 
 ## 4. Tests
 
-- T1 (`flux-ui`, headless): `render` over a table of snapshots: empty; folder shape; `resumed` and `errors` lines appear only when non-zero; `processed` clamps to `discovered`; speed `-` at zero elapsed; single-file shape with percent clamped to 100; thousands separators. Each row asserts the exact lines.
+- T1 (`flux-ui`, headless): `render` over a table of snapshots: empty; folder shape; `resumed`, `skipped` and `errors` lines appear only when non-zero; `processed` clamps to `discovered`; speed `-` at zero elapsed; single-file shape with percent clamped to 100; thousands separators. Each row asserts the exact lines.
 - T2 (`flux-ui`, `indicatif` `InMemoryTerm`, feature `in_memory`, dev-dependency only): `Display` over an in-memory terminal draws the folder frame after one tick; `println` puts the line above the bar; `finish` leaves the bar cleared; a hidden target runs `println` through (the closure still runs) and draws nothing.
 - T3 (`flux-core`, fake filesystem): a clean tree copy with a `Progress` ends with `discovered == files_total`, `copied == files_copied`, `bytes == bytes_copied`, and the same for a several-source copy (sum over roots) and for a `--resume` (`resumed == files_resumed`, `bytes` excludes the resumed bytes). Mutants: dropping any one bump site turns a named assertion red.
 - T4 (`flux-core`): the `None` path: the existing suites are the oracle (nothing changes).
@@ -166,7 +166,7 @@ The `--json` object, the stdout records, the exit codes, the summary text, `flux
 - R1. Keep a `Resumed` line (non-zero only), against agy's final list. Cost if wrong: one extra counter and one conditional line, removable without touching the engine's other counters.
 - R2. `Errors` is counted in the CLI closure, not the engine, so the engine gains no error hook. Cost if wrong: an error raised without an `on_report` record would not show live; the final summary still reports it.
 - R3. `Display` is hidden-aware: the CLI builds no display when the target is hidden, so the non-terminal path is today's code. Cost if wrong: a divergence in how a hidden bar prints records, which G2's byte-identical tests would catch.
-- R4. The spec's `Processed` is `copied + resumed` (not including errors). Cost if wrong: the label of one line.
+- R4. The spec's `Processed` is `copied + resumed + skipped` (not including errors; `skipped` was added by the final-review fix wave, ruling PF-10). Cost if wrong: the label of one line.
 
 ## 8. Exhaustiveness self-audit (writing-plans checklist, run by the author)
 
