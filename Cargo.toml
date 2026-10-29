@@ -113,6 +113,5 @@ strip = true
 # `just unused-deps` (cargo shear) fails on a dependency nothing uses. The pins above are spec §67
 # candidates that no member crate has adopted yet (TODO.md, "Final dependency selection"), so they
 # are listed here until adopted. Delete an entry the moment a member crate adopts the crate.
-# flux-ui is a member now, but no crate depends on it yet (flux-cli will).
 [workspace.metadata.cargo-shear]
-ignored = ["anyhow", "crossbeam-channel", "flux-ui", "rayon", "tracing", "tracing-subscriber"]
+ignored = ["anyhow", "crossbeam-channel", "rayon", "tracing", "tracing-subscriber"]

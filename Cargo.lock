@@ -381,6 +381,8 @@ dependencies = [
  "flux-core",
  "flux-fs",
  "flux-platform",
+ "flux-ui",
+ "indicatif",
  "redb",
  "serde",
  "serde_json",

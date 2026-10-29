@@ -17,9 +17,11 @@ clap = { workspace = true }
 flux-core = { path = "../flux-core" }
 flux-fs = { path = "../flux-fs" }
 flux-platform = { path = "../flux-platform" }
+flux-ui = { path = "../flux-ui" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+indicatif = { workspace = true, features = ["in_memory"] }
 redb = { workspace = true }
 tempfile = { workspace = true }

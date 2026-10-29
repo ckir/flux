@@ -485,16 +485,24 @@ fn copy(args: &CopyArgs) -> u8 {
         }
     };
     let opts = options(args);
-    let cfg = run_config(args);
+    let mut cfg = run_config(args);
     let fs = flux_platform::StdFileSystem;
+    let live = flux_cli::live::Live::start(
+        flux_cli::live::display_wanted(args.dry_run, args.json),
+        flux_ui::ProgressDrawTarget::stderr(),
+        err,
+    );
+    cfg.progress = live.progress();
     match job {
         Job::Tree { src, dst } => {
             let started = Instant::now();
             let run = flux_core::run::tree(&fs, &src, &dst, &opts, &cfg, &mut |f| {
-                for line in report::record_lines(&f) {
-                    err(&line);
+                let counted = flux_cli::live::counts_as_failure(&f.cause);
+                for (index, line) in report::record_lines(&f).into_iter().enumerate() {
+                    live.record(&line, counted && index == 0);
                 }
             });
+            live.finish();
             let ms = millis(started);
             let rep = Report::tree_run(&run, ms);
             tree_output(args, &opts, &run, rep, &[], None);
@@ -503,6 +511,7 @@ fn copy(args: &CopyArgs) -> u8 {
         Job::File { src, dst, target_existed } => {
             let started = Instant::now();
             let run = flux_core::run::file(&fs, &src, &dst, &opts, &cfg);
+            live.finish();
             let ms = millis(started);
             let mut rep = Report::file_run(&run, target_existed, ms);
             rep.dry_run = args.dry_run;
@@ -654,7 +663,7 @@ fn copy_several(args: &CopyArgs) -> u8 {
         return exit_code::USAGE;
     }
     let (sources, destination) = args.paths.split_at(args.paths.len() - 1);
-    let cfg = run_config(args);
+    let mut cfg = run_config(args);
     let (specs, dst) = match resolve::several(
         sources,
         &destination[0],
@@ -689,14 +698,22 @@ fn copy_several(args: &CopyArgs) -> u8 {
             return exit_code::FAILED;
         }
     };
+    let live = flux_cli::live::Live::start(
+        flux_cli::live::display_wanted(args.dry_run, args.json),
+        flux_ui::ProgressDrawTarget::stderr(),
+        err,
+    );
+    cfg.progress = live.progress();
     let opts = options(args);
     let fs = flux_platform::StdFileSystem;
     let started = Instant::now();
     let multi = flux_core::run::trees(&fs, specs, &dst, &opts, &cfg, &mut |f| {
-        for line in report::record_lines(&f) {
-            err(&line);
+        let counted = flux_cli::live::counts_as_failure(&f.cause);
+        for (index, line) in report::record_lines(&f).into_iter().enumerate() {
+            live.record(&line, counted && index == 0);
         }
     });
+    live.finish();
     let rep = Report::several_run(&multi, millis(started));
     tree_output(args, &opts, &multi.run, rep, &multi.roots, Some(&destination[0]));
     exit_code::for_multi_run(&multi)
