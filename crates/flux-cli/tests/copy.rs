@@ -159,6 +159,14 @@ fn a_folders_contents_are_copied_onto_a_fresh_destination() {
         "{}",
         stderr(&out)
     );
+    assert!(
+        stderr(&out)
+            .lines()
+            .any(|l| l.starts_with("copied 2 files (3 B), created 2 directories in ")
+                && l.ends_with("s; 0 failed, 0 skipped")),
+        "{}",
+        stderr(&out)
+    );
 }
 
 #[test]

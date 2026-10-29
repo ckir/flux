@@ -490,7 +490,8 @@ pub fn human_bytes(n: u64) -> String {
 
 /// A wall-clock duration: two decimals under 10 s, one decimal under a minute, then `2m 03s` and `1h 02m 03s`.
 pub fn elapsed_text(ms: u64) -> String {
-    if ms < 10_000 {
+    if ms < 9_995 {
+        // Two decimals; the bound keeps a value that rounds up to 10.00 s on the one-decimal branch.
         let h = (ms + 5) / 10;
         return format!("{}.{:02}s", h / 100, h % 100);
     }
@@ -498,7 +499,7 @@ pub fn elapsed_text(ms: u64) -> String {
         let t = (ms + 50) / 100;
         return format!("{}.{}s", t / 10, t % 10);
     }
-    let secs = (ms + 500) / 1000;
+    let secs = ms / 1000 + u64::from(ms % 1000 >= 500);
     if secs < 3600 {
         format!("{}m {:02}s", secs / 60, secs % 60)
     } else {
@@ -1143,6 +1144,9 @@ mod tests {
             (0, "0.00s"),
             (350, "0.35s"),
             (9_994, "9.99s"),
+            (9_995, "10.0s"),
+            (9_999, "10.0s"),
+            (10_000, "10.0s"),
             (12_300, "12.3s"),
             (59_949, "59.9s"),
             (59_950, "1m 00s"),
@@ -1153,6 +1157,12 @@ mod tests {
         ] {
             assert_eq!(elapsed_text(ms), want, "{ms} ms");
         }
+    }
+
+    #[test]
+    fn elapsed_text_survives_the_largest_value() {
+        // u64::MAX ms is 18_446_744_073_709_552 s after rounding; no overflow, no wrap to a tiny time.
+        assert_eq!(elapsed_text(u64::MAX), "5124095576030h 25m 52s");
     }
 
     #[test]
