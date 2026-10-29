@@ -962,6 +962,9 @@ pub(crate) fn stage_file<F: DestinationRoot>(
             if let Some(p) = progress {
                 p.add_bytes(n as u64);
             }
+            if tracing::enabled!(target: "flux_core::copy", tracing::Level::TRACE) {
+                tracing::trace!(target: "flux_core::copy", chunk = n, total = bytes_copied);
+            }
             // Cut 9h (spec 3.4): only a buffer already written is handed over (I1); the sink returns one at full
             // length to read into next. Without a sink `buf` is never taken.
             if let Some(s) = sink.as_mut() {

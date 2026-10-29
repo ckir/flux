@@ -9,6 +9,7 @@
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use flux_cli::exit_code;
+use flux_cli::logging;
 use flux_cli::report::{self, Report};
 use flux_cli::resolve::{self, Job, Stop};
 use flux_cli::verbosity::{self, Verbosity};
@@ -297,7 +298,10 @@ enum SafetyArg {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match verbosity_of(&cli) {
-        Ok(v) => verbosity::set(v),
+        Ok(v) => {
+            verbosity::set(v);
+            logging::install(v);
+        }
         Err(msg) => {
             err(&format!("error: {msg}"));
             return ExitCode::from(exit_code::USAGE);

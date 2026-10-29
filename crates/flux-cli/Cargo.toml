@@ -20,6 +20,8 @@ flux-platform = { path = "../flux-platform" }
 flux-ui = { path = "../flux-ui" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 indicatif = { workspace = true, features = ["in_memory"] }

@@ -52,7 +52,7 @@ impl Verb {
 
 /// `Display` for a path with control characters and (on Unix) non-UTF-8 bytes escaped, so a
 /// hostile file name cannot drive the terminal. Lazy: nothing is built until it is formatted.
-struct EscapedPath<'a>(&'a Path);
+pub struct EscapedPath<'a>(pub &'a Path);
 
 impl fmt::Display for EscapedPath<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

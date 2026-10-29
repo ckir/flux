@@ -1608,6 +1608,12 @@ fn enter_dir<D: DirHandle>(
         }
     };
 
+    tracing::debug!(
+        target: "flux_core::tree",
+        path = %oplog::EscapedPath(path),
+        created = !pre_existing,
+    );
+
     // A destination directory about to be entered must not BE the source root (owner, cut 4b capstone round 1):
     // a bind mount inside the destination can present the source under a destination name, and `open_dir`
     // refuses only name-surrogates. Aliases of source SUBdirectories stay the section 42 mount cut's. Before the
@@ -2063,6 +2069,12 @@ fn copy_one<F: DestinationRoot>(
         }
     };
 
+    tracing::debug!(
+        target: "flux_core::tree",
+        path = %oplog::EscapedPath(&path),
+        plan = if matches!(plan, Plan::New) { "new" } else { "replace" },
+    );
+
     // Cut 12: a file that will be copied meets the degradations that need no index (a skipped one is untouched).
     if hardlink_degradation(cx, src_known.as_ref(), true, &path, out, on_report) {
         return Ok(());
@@ -2421,6 +2433,11 @@ fn record_new<C: ClaimStore + ?Sized>(
     if let Err(e) = recorded {
         report(out, on_report, path.to_path_buf(), TreeFailureCause::ClaimNotRecorded(e));
     }
+    tracing::trace!(
+        target: "flux_core::tree",
+        path = %oplog::EscapedPath(path),
+        status = if strict { "committed" } else { "created" },
+    );
     names.record_publication(target, None, name, None, identity);
 }
 

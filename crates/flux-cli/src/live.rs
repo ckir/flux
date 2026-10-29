@@ -43,6 +43,8 @@ pub struct Live {
     plain: fn(&str),
     /// `--quiet`: the non-failure skip records are not printed.
     quiet: bool,
+    /// This `Live` registered the display sink (and so clears it in `finish`).
+    sink_set: bool,
 }
 
 impl Live {
@@ -58,10 +60,11 @@ impl Live {
                     progress: Some(progress),
                     plain,
                     quiet: false,
+                    sink_set: false,
                 };
             }
         }
-        Live { display: None, progress: None, plain, quiet: false }
+        Live { display: None, progress: None, plain, quiet: false, sink_set: false }
     }
 
     /// The display `flux copy` runs under: wanted unless `--dry-run`, `--json` or `--quiet`. The engine's
@@ -77,6 +80,14 @@ impl Live {
     ) -> Live {
         let mut live = Live::start(display_wanted(dry_run, json, quiet), target, plain);
         live.quiet = quiet;
+        if let Some(display) = &live.display {
+            // The log lines (`-v`) go above the bar while it runs; `finish` takes the route back.
+            let handle = display.handle();
+            crate::logging::set_display_sink(Some(Arc::new(move |line: &str| {
+                handle.println(line)
+            })));
+            live.sink_set = true;
+        }
         *progress = live.progress();
         live
     }
@@ -92,7 +103,7 @@ impl Live {
     pub fn record(&self, line: &str, counted_failure: bool) {
         match (&self.display, &self.progress) {
             (Some(display), Some(progress)) => {
-                display.println(line);
+                display.println(&crate::logging::escape_control(line));
                 if counted_failure {
                     progress.add_error();
                 }
@@ -122,6 +133,10 @@ impl Live {
 
     /// Stop the display and clear the bar; nothing for the plain path.
     pub fn finish(self) {
+        if self.sink_set {
+            // Before the display goes: a log line after this one reaches stderr, not a dead bar.
+            crate::logging::set_display_sink(None);
+        }
         if let Some(display) = self.display {
             display.finish();
         }
@@ -138,6 +153,7 @@ mod tests {
     use flux_ui::ProgressDrawTarget;
     use indicatif::InMemoryTerm;
     use std::cell::RefCell;
+    use tracing_subscriber::fmt::MakeWriter as _;
 
     thread_local! {
         static LINES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
@@ -265,6 +281,38 @@ mod tests {
                 assert!(Arc::ptr_eq(a, &b));
             }
         }
+    }
+
+    #[test]
+    fn record_escapes_control_characters_on_a_display_line() {
+        let term = InMemoryTerm::new(20, 80);
+        let live = Live::start(true, target(&term), plain);
+        live.record("bad\x1b[2Kname", false);
+        let seen = term.contents();
+        assert!(seen.contains("bad\\u{1b}[2Kname"), "{seen}");
+        assert!(!seen.contains('\x1b'), "{seen}");
+        let plain_live = Live::start(false, ProgressDrawTarget::hidden(), plain);
+        plain_live.record("bad\x1b[2Kname", false);
+        assert_eq!(taken(), ["bad\x1b[2Kname"]);
+    }
+
+    #[test]
+    fn for_copy_fills_and_finish_clears_the_display_sink() {
+        use std::io::Write as _;
+        let term = InMemoryTerm::new(20, 80);
+        let mut slot = None;
+        let live = Live::for_copy(false, false, false, target(&term), plain, &mut slot);
+        assert!(crate::logging::has_display_sink());
+        let mut w = crate::logging::LineWriter::new().make_writer();
+        assert!(w.write_all(b"    Copied a (2 B)\n").is_ok());
+        assert!(term.contents().contains("Copied a (2 B)"), "{}", term.contents());
+        live.finish();
+        assert!(!crate::logging::has_display_sink());
+        // No display: nothing registered.
+        let mut slot = None;
+        let live = Live::for_copy(true, false, false, target(&term), plain, &mut slot);
+        assert!(!crate::logging::has_display_sink());
+        live.finish();
     }
 
     #[test]
