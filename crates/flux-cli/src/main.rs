@@ -487,21 +487,18 @@ fn copy(args: &CopyArgs) -> u8 {
     let opts = options(args);
     let mut cfg = run_config(args);
     let fs = flux_platform::StdFileSystem;
-    let live = flux_cli::live::Live::start(
-        flux_cli::live::display_wanted(args.dry_run, args.json),
+    let live = flux_cli::live::Live::for_copy(
+        args.dry_run,
+        args.json,
         flux_ui::ProgressDrawTarget::stderr(),
         err,
+        &mut cfg.progress,
     );
-    cfg.progress = live.progress();
     match job {
         Job::Tree { src, dst } => {
             let started = Instant::now();
             let run = flux_core::run::tree(&fs, &src, &dst, &opts, &cfg, &mut |f| {
-                let counted = flux_cli::live::counts_as_failure(&f.cause);
-                for (index, line) in report::record_lines(&f).into_iter().enumerate() {
-                    // one error per record, not per line of the record
-                    live.record(&line, counted && index == 0);
-                }
+                live.record_failure(&f);
             });
             live.finish();
             let ms = millis(started);
@@ -699,21 +696,18 @@ fn copy_several(args: &CopyArgs) -> u8 {
             return exit_code::FAILED;
         }
     };
-    let live = flux_cli::live::Live::start(
-        flux_cli::live::display_wanted(args.dry_run, args.json),
+    let live = flux_cli::live::Live::for_copy(
+        args.dry_run,
+        args.json,
         flux_ui::ProgressDrawTarget::stderr(),
         err,
+        &mut cfg.progress,
     );
-    cfg.progress = live.progress();
     let opts = options(args);
     let fs = flux_platform::StdFileSystem;
     let started = Instant::now();
     let multi = flux_core::run::trees(&fs, specs, &dst, &opts, &cfg, &mut |f| {
-        let counted = flux_cli::live::counts_as_failure(&f.cause);
-        for (index, line) in report::record_lines(&f).into_iter().enumerate() {
-            // one error per record, not per line of the record
-            live.record(&line, counted && index == 0);
-        }
+        live.record_failure(&f);
     });
     live.finish();
     let rep = Report::several_run(&multi, millis(started));

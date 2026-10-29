@@ -8,8 +8,8 @@
 //! engine's `Progress` and prints record lines above the bar, or is plain and prints each
 //! record line through the caller's sink exactly as before.
 
-use flux_core::TreeFailureCause;
 use flux_core::progress::Progress;
+use flux_core::{TreeFailure, TreeFailureCause};
 use flux_ui::{Display, ProgressDrawTarget};
 use std::sync::Arc;
 
@@ -57,6 +57,21 @@ impl Live {
         Live { display: None, progress: None, plain }
     }
 
+    /// The display `flux copy` runs under: wanted unless `--dry-run` or `--json`. The engine's
+    /// handle is stored in `progress` (`RunConfig.progress`), `None` on the plain path.
+    #[must_use]
+    pub fn for_copy(
+        dry_run: bool,
+        json: bool,
+        target: ProgressDrawTarget,
+        plain: fn(&str),
+        progress: &mut Option<Arc<Progress>>,
+    ) -> Live {
+        let live = Live::start(display_wanted(dry_run, json), target, plain);
+        *progress = live.progress();
+        live
+    }
+
     /// The handle the engine ticks; `None` when no display runs.
     #[must_use]
     pub fn progress(&self) -> Option<Arc<Progress>> {
@@ -74,6 +89,15 @@ impl Live {
                 }
             }
             _ => (self.plain)(line),
+        }
+    }
+
+    /// Print every line of one streamed failure record; a counted failure ticks the error tally
+    /// once per record, not once per line of it.
+    pub fn record_failure(&self, f: &TreeFailure) {
+        let counted = counts_as_failure(&f.cause);
+        for (index, line) in crate::report::record_lines(f).into_iter().enumerate() {
+            self.record(&line, counted && index == 0);
         }
     }
 
@@ -187,5 +211,54 @@ mod tests {
         assert!(!counts_as_failure(&C::SymlinkSkipped));
         assert!(!counts_as_failure(&C::MountSkipped));
         assert!(!counts_as_failure(&C::Planned(planned)));
+    }
+
+    fn complaint(item: MetadataItem) -> MetadataFailure {
+        MetadataFailure { item, error: FsError::new(Code::PermissionDenied, io("no")) }
+    }
+
+    #[test]
+    fn for_copy_hands_the_handle_to_the_config_only_when_wanted() {
+        for (dry_run, json, wanted) in
+            [(false, false, true), (true, false, false), (false, true, false), (true, true, false)]
+        {
+            let term = InMemoryTerm::new(20, 80);
+            let mut slot = None;
+            let live = Live::for_copy(dry_run, json, target(&term), plain, &mut slot);
+            assert_eq!(slot.is_some(), wanted, "dry_run={dry_run} json={json}");
+            assert_eq!(live.progress().is_some(), wanted);
+            if let (Some(a), Some(b)) = (&slot, live.progress()) {
+                assert!(Arc::ptr_eq(a, &b));
+            }
+        }
+    }
+
+    #[test]
+    fn record_failure_counts_one_error_per_record_and_prints_every_line() {
+        let term = InMemoryTerm::new(20, 80);
+        let live = Live::start(true, target(&term), plain);
+        let two = TreeFailure {
+            path: "a".into(),
+            cause: C::PublishedWithComplaints(vec![
+                complaint(MetadataItem::Times),
+                complaint(MetadataItem::Permissions),
+            ]),
+        };
+        live.record_failure(&two);
+        let seen = term.contents();
+        assert_eq!(live.progress().unwrap().snapshot().errors, 1);
+        assert_eq!(seen.matches("a:").count(), 2, "{seen}");
+        let skip = TreeFailure { path: "b".into(), cause: C::SymlinkSkipped };
+        live.record_failure(&skip);
+        assert_eq!(live.progress().unwrap().snapshot().errors, 1);
+        assert!(term.contents().contains("b: object_type=symlink"), "{}", term.contents());
+    }
+
+    #[test]
+    fn record_failure_on_the_plain_path_prints_the_record_lines_unchanged() {
+        let live = Live::start(false, ProgressDrawTarget::hidden(), plain);
+        let f = TreeFailure { path: "c".into(), cause: C::MountSkipped };
+        live.record_failure(&f);
+        assert_eq!(taken(), crate::report::record_lines(&f));
     }
 }
