@@ -13,10 +13,10 @@ use flux_core::{TreeFailure, TreeFailureCause};
 use flux_ui::{Display, ProgressDrawTarget};
 use std::sync::Arc;
 
-/// Whether a live display is wanted at all: not for a dry run and not for `--json`.
+/// Whether a live display is wanted at all: not for a dry run, not for `--json`, not for `--quiet`.
 #[must_use]
-pub fn display_wanted(dry_run: bool, json: bool) -> bool {
-    !dry_run && !json
+pub fn display_wanted(dry_run: bool, json: bool, quiet: bool) -> bool {
+    !dry_run && !json && !quiet
 }
 
 /// Whether a streamed record counts toward the live display's error tally; the variants the
@@ -41,6 +41,8 @@ pub struct Live {
     display: Option<Display>,
     progress: Option<Arc<Progress>>,
     plain: fn(&str),
+    /// `--quiet`: the non-failure skip records are not printed.
+    quiet: bool,
 }
 
 impl Live {
@@ -51,23 +53,30 @@ impl Live {
         if enabled {
             let progress = Progress::new();
             if let Some(display) = Display::start(Arc::clone(&progress), target) {
-                return Live { display: Some(display), progress: Some(progress), plain };
+                return Live {
+                    display: Some(display),
+                    progress: Some(progress),
+                    plain,
+                    quiet: false,
+                };
             }
         }
-        Live { display: None, progress: None, plain }
+        Live { display: None, progress: None, plain, quiet: false }
     }
 
-    /// The display `flux copy` runs under: wanted unless `--dry-run` or `--json`. The engine's
+    /// The display `flux copy` runs under: wanted unless `--dry-run`, `--json` or `--quiet`. The engine's
     /// handle is stored in `progress` (`RunConfig.progress`), `None` on the plain path.
     #[must_use]
     pub fn for_copy(
         dry_run: bool,
         json: bool,
+        quiet: bool,
         target: ProgressDrawTarget,
         plain: fn(&str),
         progress: &mut Option<Arc<Progress>>,
     ) -> Live {
-        let live = Live::start(display_wanted(dry_run, json), target, plain);
+        let mut live = Live::start(display_wanted(dry_run, json, quiet), target, plain);
+        live.quiet = quiet;
         *progress = live.progress();
         live
     }
@@ -96,6 +105,16 @@ impl Live {
     /// once per record, not once per line of it.
     pub fn record_failure(&self, f: &TreeFailure) {
         let counted = counts_as_failure(&f.cause);
+        if self.quiet
+            && matches!(
+                f.cause,
+                TreeFailureCause::SymlinkSkipped
+                    | TreeFailureCause::SpecialFileSkipped
+                    | TreeFailureCause::MountSkipped
+            )
+        {
+            return;
+        }
         for (index, line) in crate::report::record_lines(f).into_iter().enumerate() {
             self.record(&line, counted && index == 0);
         }
@@ -142,10 +161,18 @@ mod tests {
 
     #[test]
     fn display_wanted_truth_table() {
-        assert!(display_wanted(false, false));
-        assert!(!display_wanted(true, false));
-        assert!(!display_wanted(false, true));
-        assert!(!display_wanted(true, true));
+        for dry_run in [false, true] {
+            for json in [false, true] {
+                for quiet in [false, true] {
+                    assert_eq!(
+                        display_wanted(dry_run, json, quiet),
+                        !dry_run && !json && !quiet,
+                        "dry_run={dry_run} json={json} quiet={quiet}"
+                    );
+                }
+            }
+        }
+        assert!(display_wanted(false, false, false));
     }
 
     #[test]
@@ -219,13 +246,20 @@ mod tests {
 
     #[test]
     fn for_copy_hands_the_handle_to_the_config_only_when_wanted() {
-        for (dry_run, json, wanted) in
-            [(false, false, true), (true, false, false), (false, true, false), (true, true, false)]
-        {
+        for (dry_run, json, quiet, wanted) in [
+            (false, false, false, true),
+            (true, false, false, false),
+            (false, true, false, false),
+            (true, true, false, false),
+            (false, false, true, false),
+            (true, false, true, false),
+            (false, true, true, false),
+            (true, true, true, false),
+        ] {
             let term = InMemoryTerm::new(20, 80);
             let mut slot = None;
-            let live = Live::for_copy(dry_run, json, target(&term), plain, &mut slot);
-            assert_eq!(slot.is_some(), wanted, "dry_run={dry_run} json={json}");
+            let live = Live::for_copy(dry_run, json, quiet, target(&term), plain, &mut slot);
+            assert_eq!(slot.is_some(), wanted, "dry_run={dry_run} json={json} quiet={quiet}");
             assert_eq!(live.progress().is_some(), wanted);
             if let (Some(a), Some(b)) = (&slot, live.progress()) {
                 assert!(Arc::ptr_eq(a, &b));
@@ -260,5 +294,35 @@ mod tests {
         let f = TreeFailure { path: "c".into(), cause: C::MountSkipped };
         live.record_failure(&f);
         assert_eq!(taken(), crate::report::record_lines(&f));
+    }
+
+    #[test]
+    fn quiet_live_hides_skip_records_and_keeps_failures() {
+        let mut slot = None;
+        let live =
+            Live::for_copy(false, false, true, ProgressDrawTarget::hidden(), plain, &mut slot);
+        assert!(slot.is_none());
+        for cause in [C::SymlinkSkipped, C::SpecialFileSkipped, C::MountSkipped] {
+            live.record_failure(&TreeFailure { path: "s".into(), cause });
+        }
+        assert!(taken().is_empty());
+        let copy = CopyError {
+            cause: FsError::new(Code::IoError, io("c")),
+            leftover: None,
+            step: CopyStep::Gate,
+        };
+        let failed = TreeFailure { path: "f".into(), cause: C::Copy(copy) };
+        live.record_failure(&failed);
+        assert_eq!(taken(), crate::report::record_lines(&failed));
+        let planned = TreeFailure {
+            path: "p".into(),
+            cause: C::Planned(PlannedEntry {
+                object: PlannedObject::File,
+                action: PlannedAction::Copy,
+            }),
+        };
+        live.record_failure(&planned);
+        assert_eq!(taken(), crate::report::record_lines(&planned));
+        assert!(!crate::report::record_lines(&planned).is_empty());
     }
 }

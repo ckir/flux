@@ -239,9 +239,12 @@ pub struct Routed {
 
 /// The routing of one record (design 6.6): `--json` prints every record to stdout, the human form hides `match`
 /// unless `verbose`; a mount point not entered and an unlistable destination-only directory also say so on stderr.
-pub fn route_record(r: &Record, json: bool, verbose: bool) -> Routed {
+/// Under `quiet` (without `json`) a `match` or `extra` record is not printed either: neither implies a non-zero exit.
+pub fn route_record(r: &Record, json: bool, verbose: bool, quiet: bool) -> Routed {
     let stdout = if json {
         Some(record_json(r))
+    } else if quiet && matches!(r.outcome, Outcome::Match | Outcome::Extra) {
+        None
     } else if r.outcome != Outcome::Match || verbose {
         Some(record_line(r))
     } else {
@@ -529,28 +532,48 @@ mod tests {
     fn a_mount_point_not_entered_always_gets_its_stderr_notice() {
         let m = mount("m");
         let notice = mount_notice_line(Path::new("m"));
-        let human = route_record(&m, false, false);
+        let human = route_record(&m, false, false, false);
         assert_eq!(human, Routed { stdout: None, stderr: vec![notice.clone()] });
-        let verbose = route_record(&m, false, true);
+        let verbose = route_record(&m, false, true, false);
         assert_eq!(
             verbose.stdout.as_deref(),
             Some(format!("match: m: {MOUNT_NOT_ENTERED}").as_str())
         );
         assert_eq!(verbose.stderr, std::slice::from_ref(&notice));
-        let json = route_record(&m, true, false);
+        let json = route_record(&m, true, false, false);
         assert_eq!(json.stdout, Some(record_json(&m)));
         assert_eq!(json.stderr, [notice]);
     }
 
     #[test]
+    fn quiet_drops_match_and_extra_stdout_but_keeps_the_rest() {
+        for outcome in [Outcome::Match, Outcome::Extra] {
+            let r = rec("a", outcome, None, "");
+            assert_eq!(route_record(&r, false, true, true).stdout, None);
+            assert_eq!(route_record(&r, true, false, true).stdout, Some(record_json(&r)));
+        }
+        for outcome in [Outcome::Missing, Outcome::Mismatched] {
+            let r = rec("a", outcome, None, "");
+            assert_eq!(route_record(&r, false, false, true).stdout, Some(record_line(&r)));
+        }
+        let u = rec("u", Outcome::Unreadable, Some(Code::PermissionDenied), "x");
+        assert_eq!(route_record(&u, false, false, true).stdout, Some(record_line(&u)));
+        let l = lost("lost+found");
+        let q = route_record(&l, false, false, true);
+        assert_eq!(q.stdout, None);
+        assert_eq!(q.stderr.len(), 1, "the unreadable-extra warning is kept");
+        assert_eq!(route_record(&mount("m"), false, false, true).stderr.len(), 1);
+    }
+
+    #[test]
     fn a_match_is_hidden_in_human_mode_unless_verbose_and_always_shown_as_json() {
         let m = rec("a", Outcome::Match, None, "");
-        assert_eq!(route_record(&m, false, false), Routed { stdout: None, stderr: vec![] });
-        assert_eq!(route_record(&m, false, true).stdout.as_deref(), Some("match: a"));
-        assert_eq!(route_record(&m, true, false).stdout, Some(record_json(&m)));
+        assert_eq!(route_record(&m, false, false, false), Routed { stdout: None, stderr: vec![] });
+        assert_eq!(route_record(&m, false, true, false).stdout.as_deref(), Some("match: a"));
+        assert_eq!(route_record(&m, true, false, false).stdout, Some(record_json(&m)));
         let x = rec("b", Outcome::Missing, None, "");
-        assert_eq!(route_record(&x, false, false).stdout.as_deref(), Some("missing: b"));
-        assert!(route_record(&x, false, false).stderr.is_empty());
+        assert_eq!(route_record(&x, false, false, false).stdout.as_deref(), Some("missing: b"));
+        assert!(route_record(&x, false, false, false).stderr.is_empty());
     }
 
     #[test]
@@ -558,18 +581,18 @@ mod tests {
         let r = lost("lost+found");
         let want = "warning: could not read destination-only directory: lost+found: Permission denied (os error 13)";
         assert_eq!(unreadable_extra_warning_line(&r).as_deref(), Some(want));
-        let human = route_record(&r, false, false);
+        let human = route_record(&r, false, false, false);
         assert_eq!(
             human.stdout.as_deref(),
             Some("extra: lost+found: PERMISSION_DENIED: Permission denied (os error 13)")
         );
         assert_eq!(human.stderr, [want]);
-        assert_eq!(route_record(&r, true, false).stderr, [want]);
+        assert_eq!(route_record(&r, true, false, false).stderr, [want]);
         // A plain extra, and an unreadable that has a code, get no such warning.
         assert_eq!(unreadable_extra_warning_line(&rec("e", Outcome::Extra, None, "")), None);
         let u = rec("u", Outcome::Unreadable, Some(Code::PermissionDenied), "x");
         assert_eq!(unreadable_extra_warning_line(&u), None);
-        assert!(route_record(&u, false, false).stderr.is_empty());
+        assert!(route_record(&u, false, false, false).stderr.is_empty());
     }
 
     #[cfg(unix)]

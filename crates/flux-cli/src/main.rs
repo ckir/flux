@@ -509,6 +509,7 @@ fn copy(args: &CopyArgs) -> u8 {
     let live = flux_cli::live::Live::for_copy(
         args.dry_run,
         args.json,
+        verbosity::get().quiet,
         flux_ui::ProgressDrawTarget::stderr(),
         err,
         &mut cfg.progress,
@@ -570,14 +571,19 @@ fn copy(args: &CopyArgs) -> u8 {
                         Some(d) => {
                             lines(d.prior.iter().flat_map(report::dry_prior_lines).collect())
                         }
-                        None => lines(report::resume_lines(&run, 0)),
+                        None => note_lines(report::resume_lines(&run, 0), args.dry_run),
                     }
-                    lines(report::file_checkpoint_lines(
-                        &run,
-                        &dst.display().to_string(),
-                        opts.durability == Durability::Normal,
-                    ));
-                    lines(report::file_resume_verify_lines(&run));
+                    let shown = dst.display().to_string();
+                    checkpoint_out(
+                        report::file_checkpoint_lines(
+                            &run,
+                            &shown,
+                            opts.durability == Durability::Normal,
+                        ),
+                        report::file_checkpoint_warning_lines(&run, &shown),
+                        args.dry_run,
+                    );
+                    note_lines(report::file_resume_verify_lines(&run), args.dry_run);
                     let mode = if args.resume_verify == Some(ResumeVerifyArg::Full) {
                         "full"
                     } else {
@@ -586,11 +592,11 @@ fn copy(args: &CopyArgs) -> u8 {
                     for line in report::unprobed_lines(&rep.unprobed, mode) {
                         err(&line);
                     }
-                    err(&if args.dry_run {
-                        report::dry_run_summary_line(&rep, 0)
+                    if args.dry_run {
+                        err(&report::dry_run_summary_line(&rep, 0));
                     } else {
-                        report::summary_line(&rep, 0)
-                    });
+                        note(&report::summary_line(&rep, 0), false);
+                    }
                     if let Some(d) = &run.dry {
                         lines(report::dry_extra_lines(d, 0));
                     }
@@ -641,20 +647,26 @@ fn tree_output(
             lines(report::run_lines(run));
             match &run.dry {
                 Some(d) => lines(d.prior.iter().flat_map(report::dry_prior_lines).collect()),
-                None => lines(report::resume_lines(run, outcome.files_resumed)),
+                None => {
+                    note_lines(report::resume_lines(run, outcome.files_resumed), args.dry_run);
+                }
             }
-            lines(report::checkpoint_lines(outcome, opts.durability == Durability::Normal));
-            lines(report::resume_verify_lines(outcome, full));
+            checkpoint_out(
+                report::checkpoint_lines(outcome, opts.durability == Durability::Normal),
+                report::checkpoint_warning_lines(outcome),
+                args.dry_run,
+            );
+            note_lines(report::resume_verify_lines(outcome, full), args.dry_run);
             rep.resume_verify = report::resume_verify_used(outcome, full).then_some("full");
             for line in report::unprobed_lines(&rep.unprobed, mode) {
                 err(&line);
             }
-            lines(report::root_lines(roots, args.dry_run));
-            err(&if args.dry_run {
-                report::dry_run_summary_line(&rep, outcome.directories_created)
+            note_lines(report::root_lines(roots, args.dry_run), args.dry_run);
+            if args.dry_run {
+                err(&report::dry_run_summary_line(&rep, outcome.directories_created));
             } else {
-                report::summary_line(&rep, outcome.directories_created)
-            });
+                note(&report::summary_line(&rep, outcome.directories_created), false);
+            }
             if let Some(d) = &run.dry {
                 lines(report::dry_extra_lines(d, outcome.files_resumed));
             }
@@ -718,6 +730,7 @@ fn copy_several(args: &CopyArgs) -> u8 {
     let live = flux_cli::live::Live::for_copy(
         args.dry_run,
         args.json,
+        verbosity::get().quiet,
         flux_ui::ProgressDrawTarget::stderr(),
         err,
         &mut cfg.progress,
@@ -791,7 +804,14 @@ fn cleanup(args: &CleanupArgs) -> u8 {
             return exit_code::REFUSED;
         }
     };
-    let _ = write!(std::io::stdout(), "{}", cleanup_stdout(args, &dst, &rep));
+    // `--quiet` hides a clean table; any other exit code, `--json` and `--dry-run` keep it.
+    let hide = verbosity::get().quiet
+        && !args.json
+        && !args.dry_run
+        && exit_code::for_cleanup(&rep) == exit_code::SUCCESS;
+    if !hide {
+        let _ = write!(std::io::stdout(), "{}", cleanup_stdout(args, &dst, &rep));
+    }
     if let Some((path, e)) = &rep.listing_failed {
         err(&format!("error: could not list {}: {e}", path.display()));
     }
@@ -869,7 +889,12 @@ fn verify_one(args: &VerifyArgs, source: &Path, dest: &Path) -> u8 {
     };
     let opts = verify_options(args);
     let mut sink = |r: flux_core::verify::Record| {
-        let routed = verify_report::route_record(&r, args.json, verbosity::get().level >= 1);
+        let routed = verify_report::route_record(
+            &r,
+            args.json,
+            verbosity::get().level >= 1,
+            verbosity::get().quiet,
+        );
         if let Some(line) = &routed.stdout {
             stdout_or_exit(line);
         }
@@ -879,7 +904,11 @@ fn verify_one(args: &VerifyArgs, source: &Path, dest: &Path) -> u8 {
     let (src, dst, result) = match job {
         Job::Tree { src, dst } => {
             // The engine says so after the root check passed, so a refused run prints no such line.
-            let mut on_absent = || err(&verify_report::dest_absent_line(&dst));
+            let mut on_absent = || {
+                if !hide_info(args.json) {
+                    err(&verify_report::dest_absent_line(&dst));
+                }
+            };
             let result = flux_core::verify::verify_tree_notifying(
                 &fs,
                 &src,
@@ -911,6 +940,8 @@ fn verify_one(args: &VerifyArgs, source: &Path, dest: &Path) -> u8 {
             &summary,
             code,
         )
+    } else if hide_info(false) {
+        return code;
     } else {
         verify_report::summary_line(&summary)
     };
@@ -960,15 +991,26 @@ fn verify_several_cli(args: &VerifyArgs) -> u8 {
     let collected: Vec<PathBuf> = specs.iter().map(|s| s.src.clone()).collect();
     let opts = verify_options(args);
     let mut sink = |r: flux_core::verify::Record| {
-        let routed = verify_report::route_record(&r, args.json, verbosity::get().level >= 1);
+        let routed = verify_report::route_record(
+            &r,
+            args.json,
+            verbosity::get().level >= 1,
+            verbosity::get().quiet,
+        );
         if let Some(line) = &routed.stdout {
             stdout_or_exit(line);
         }
         lines(routed.stderr);
     };
-    let mut on_absent = |name: &std::ffi::OsStr| err(&verify_report::root_absent_line(&dst, name));
+    let mut on_absent = |name: &std::ffi::OsStr| {
+        if !hide_info(args.json) {
+            err(&verify_report::root_absent_line(&dst, name));
+        }
+    };
     let mut on_root_done = |name: &std::ffi::OsStr, s: &flux_core::verify::Summary| {
-        err(&verify_report::root_line(name, s))
+        if !hide_info(args.json) {
+            err(&verify_report::root_line(name, s));
+        }
     };
     let fs = flux_platform::StdFileSystem;
     let total = match flux_core::verify::verify_several(
@@ -995,6 +1037,8 @@ fn verify_several_cli(args: &VerifyArgs) -> u8 {
             &total,
             code,
         )
+    } else if hide_info(false) {
+        return code;
     } else {
         verify_report::summary_line(&total)
     };
@@ -1024,6 +1068,41 @@ fn stdout_or_exit(line: &str) {
             err(&format!("error: cannot write to standard output: {e}"));
         }
         std::process::exit(i32::from(exit_code::FAILED));
+    }
+}
+
+/// Whether `flux verify` leaves out its informational lines (the human summary, the per-root lines and the
+/// absent-destination notices): `--quiet` without `--json`.
+fn hide_info(json: bool) -> bool {
+    verbosity::get().quiet && !json
+}
+
+/// `line` through `sink` iff the verbosity shows notes (not `--quiet`, except a dry run).
+fn note_to(v: Verbosity, dry_run: bool, line: &str, sink: &mut dyn FnMut(&str)) {
+    if v.shows_notes(dry_run) {
+        sink(line);
+    }
+}
+
+/// One informational line to stderr, hidden under `--quiet` unless `dry_run`.
+fn note(line: &str, dry_run: bool) {
+    note_to(verbosity::get(), dry_run, line, &mut |l| err(l));
+}
+
+/// Each informational line to stderr, hidden under `--quiet` unless `dry_run`.
+fn note_lines(v: Vec<String>, dry_run: bool) {
+    for line in v {
+        note(&line, dry_run);
+    }
+}
+
+/// A checkpoint report: all of `all` normally, only the `warnings` (the `checkpoints discarded` lines) under
+/// `--quiet`. `all` keeps its own order (the `resumed` lines, the discards, the advisory note).
+fn checkpoint_out(all: Vec<String>, warnings: Vec<String>, dry_run: bool) {
+    if verbosity::get().shows_notes(dry_run) {
+        lines(all);
+    } else {
+        lines(warnings);
     }
 }
 
@@ -1400,5 +1479,22 @@ mod tests {
         );
         assert_ne!(cfg.operation_id, cfg.owner_instance_id);
         assert_ne!(run_config(&parse(&[])).operation_id, cfg.operation_id, "one id per invocation");
+    }
+
+    #[test]
+    fn quiet_keeps_warnings() {
+        // `note_to` is the one gate the hidden lines pass through; a warning goes through plain `err`.
+        let loud = Verbosity { level: 0, quiet: false };
+        let quiet = Verbosity { level: 0, quiet: true };
+        for (v, dry_run, shown) in
+            [(loud, false, true), (loud, true, true), (quiet, false, false), (quiet, true, true)]
+        {
+            let mut got = Vec::new();
+            note_to(v, dry_run, "a note", &mut |l| got.push(l.to_string()));
+            assert_eq!(got.len(), usize::from(shown), "quiet={} dry_run={dry_run}", v.quiet);
+            if shown {
+                assert_eq!(got, ["a note"]);
+            }
+        }
     }
 }
