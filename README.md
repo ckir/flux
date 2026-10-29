@@ -100,6 +100,12 @@ re-read may be served by the operating system's page cache, so it does not prove
 (`--durability` still governs syncing). A mismatch is reported as `VERIFY_MISMATCH` and counts as a failed file.
 With `--resume` the check covers the files this run copies or resumes; files a prior run completed are skipped, not verified by `--verify`. With several sources `--resume` needs the same sources again, and the per-root lines count this run's work only; files skipped as already complete are in the totals and the `resumed` line. `--hash` selects the hash used by `--verify` (`blake3`, the default).
 
+### Progress
+
+On a terminal, `flux copy` shows a live display on stderr while it runs. For a folder or several sources it shows `Discovered` and `Processed` files, `Transferred` bytes and `Speed`, plus a `Resumed` line when a `--resume` skipped files and an `Errors` line when a file failed; for a single file it shows a percent bar with speed and ETA (a resumed single file shows the counters form). Record lines (per-file failures) print above the display, and the display is cleared before the summary prints. It is never shown when stderr is not a terminal, with `--json`, or with `--dry-run`; those runs print exactly what they printed before.
+
+Limits: `Transferred` counts the bytes this run writes, so the re-read of `--verify=destination|full` and of `--resume-verify` does not move it (the elapsed time and speed keep updating). `Processed` can finish below `Discovered` when the tree holds links, symlinks, special files or excluded entries. There is no percent or ETA for a folder, because that would need a pre-scan. The display has no flag to turn it off; redirect stderr.
+
 ### Verify
 
 `flux verify SOURCE... DEST [--links=copy|skip] [--exclude PATTERN]... [--recursive|--no-recursive] [--cross-filesystems] [--hash=blake3] [--json] [--verbose]` compares one
