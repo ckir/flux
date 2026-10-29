@@ -28,6 +28,7 @@ Non-goals (the owner decided or I propose; each is a later cut if wanted)
 - N3. The failure line text stays `CODE: path: message` (for example `PERMISSION_DENIED: locked: Permission denied (os error 13)`). The codes are the registry's normative identifiers (spec section 55) and about a dozen tests and any user script match them.
 - N4. `flux verify` and `flux cleanup` keep their record and table texts and their summaries. For `verify`, `-v` is exactly today's `--verbose` (the `match` records on stdout), `-vv` and `-vvv` add `tracing` diagnostics on stderr and never change the stdout records, and `verify` has no verb lines. For `cleanup`, `-v` adds `Removed` lines on stderr; its table stays on stdout.
 - N5. The progress display's frame is unchanged.
+- N6. No two-tier quiet (`-qq` silencing the warnings too). D3 chose warnings printing under `--quiet`; a stricter tier is a later cut if operators ask (a cron job that must be silent even with a warning would use the exit code and `--json`).
 
 Anti-goals (a failure even if everything else works)
 - A1. A verbosity flag changes an exit code, a `--json` byte, or hides the cause of a non-zero exit.
@@ -87,7 +88,7 @@ Each is one `tracing` `INFO` event with target `flux::op` and fields `action`, `
 | replaced | `Replaced` | `  Replaced a (2 B)` | an existing file was atomically replaced (`--overwrite`) |
 | resumed | `Resumed` | `   Resumed a (2 B)` | a resume kept a file or symlink a prior run completed (the two `note_resumed` sites) |
 | skipped | `Skipped` | `   Skipped a` | the existing-file policy left a file (`note_skipped` sites); a symlink, special file or mount skipped by policy keeps its existing record line |
-| removed | `Removed` | `  Removed .flux-x` | `flux cleanup` deleted an entry |
+| removed | `Removed` | `   Removed .flux-x` | `flux cleanup` deleted an entry |
 
 Sizes use the human scale of section 6 (`2 B`, `1.42 GiB`). The root destination directory is not announced; `Created` is for directories below it. The order is the engine's order: sorted by name, so `a`, `lnk`, `locked`, `sub`, `sub/b`, `sub/c` for the sample tree (measured with `--dry-run`).
 
@@ -114,18 +115,19 @@ One rule, stated once: **`--quiet` prints only (a) the cause of a non-zero exit,
 | `--dry-run`: plan lines, `note:` lines, the dry-run summary | shown | shown |
 | `--json` object (stdout) | shown | shown |
 | Skip records (symlink, special file, mount skipped by policy; exit 0) | shown | hidden |
-| Resume notes (`resume_lines`) | shown | hidden |
+| Resume notes (`resume_lines`), the partial-resume lines (`resumed X: reused n bytes, recopied m bytes`), the checkpoint advisory note, and the `--resume-verify=full` level line | shown | hidden |
+| `checkpoints discarded for X: ...` (`checkpoint_lines`, `file_checkpoint_lines`): a resume lost reusable work | shown | shown (a warning) |
 | The summary line of `copy`, and in a several-source run the per-root lines and the total | shown | hidden |
 | `flux verify`, human output (stdout): `match`, `missing`, `mismatched`, `extra` records and the summary | records shown (`match` only with `-v`); summary shown | exit 0: nothing, including `extra` records (`extra` never fails a verify, `verify.rs` `Summary::failed`); exit 1: the `missing`, `mismatched` and unreadable records only, no summary |
 | `flux verify` stderr notices (mount not entered, unreadable extra, absent DEST) | shown | shown (they are warnings) |
 | `flux cleanup`: the table (stdout) | shown | when the exit is 0 and not `--dry-run`: hidden; otherwise shown |
 | The live progress bar | drawn on a terminal | not drawn |
 
-(For `verify` and `cleanup` the results are on stdout, so rule (a) is read as "the records that explain a non-zero exit", and a clean run prints nothing, like a clean `copy`.) With `--json` (any command), `--quiet` changes nothing on stdout: the whole JSON output stays, including the records and the `{"summary": ...}` object of `verify --json`; stderr carries (a) and (b) only. A test enumerates every non-zero exit path of the three commands and asserts that `--quiet` still prints at least one cause line for each (A5).
+(Streams do not change with `--quiet`: `copy` writes its human output to stderr, while `verify` and `cleanup` write their results to stdout, as they do today. So `flux verify --quiet > /dev/null` discards the explaining records exactly as `flux verify > /dev/null` does; rule (a) is read as "the records that explain a non-zero exit, on the stream the command already uses", and a clean run prints nothing, like a clean `copy`.) With `--json` (any command), `--quiet` changes nothing on stdout: the whole JSON output stays, including the records and the `{"summary": ...}` object of `verify --json`; stderr carries (a) and (b) only. A test enumerates every non-zero exit path of the three commands and asserts that `--quiet` still prints at least one cause line for each (A5).
 
 ### 5.4 `-v` on a terminal and the progress bar
 
-`-v`, `-vv` and `-vvv` keep the bar (D2). There is one display per process run (`copy`, `copy_several` and the single-file path each build one `Live` through `Live::for_copy`, shared by all roots). The subscriber is installed first, so its writer reads a process-global slot that `Live::for_copy` fills with a shareable handle to the display and `live.finish()` empties; while the slot is full the writer hands each rendered line to `Display::println`, and before and after that window it writes straight to stderr. The writer discards I/O errors (A2). `--json` and `--dry-run` never draw the bar (cut 20's rule), but `-v` lines still print, plain, to stderr.
+`-v`, `-vv` and `-vvv` keep the bar (D2). There is one display per process run (`copy`, `copy_several` and the single-file path each build one `Live` through `Live::for_copy`, shared by all roots). The subscriber is installed first, so its writer reads a process-global slot that `Live::for_copy` fills with a shareable handle to the display and `live.finish()` empties; while the slot is full the writer hands each rendered line to `Display::println`, and before and after that window it writes straight to stderr. The writer discards I/O errors (A2). `MakeWriter` hands a writer arbitrary byte chunks, and `Display::println` takes one line and redraws the bar, so the formatter emits each event as exactly one newline-terminated line in a single write and the writer buffers until it has whole lines, hands each (without its newline) to the display, and never splits one event across two redraws. The writer takes the slot's handle under a lock held only to clone it, never while writing; a line that arrives while `live.finish()` runs, from the walk thread or from the WAL or hashing threads, goes either through the display or straight to stderr, is never lost, never panics and never blocks `finish`; a test drives that from two threads. `--json` and `--dry-run` never draw the bar (cut 20's rule), but `-v` lines still print, plain, to stderr.
 
 ### 5.5 `-vv` and `-vvv`
 
@@ -156,7 +158,7 @@ Rules:
 
 | Part | Where | What |
 |---|---|---|
-| Dependencies | `Cargo.toml` (workspace: `tracing`, `tracing-subscriber` already pinned, but absent from `Cargo.lock` today, so the new crates enter the lock), `crates/flux-core/Cargo.toml`, `crates/flux-cli/Cargo.toml`; remove both from the `ignored` list at `Cargo.toml:117` | `flux-core` depends on `tracing` only; `flux-cli` on both, with the minimal `tracing-subscriber` features the custom formatter needs (no `env-filter`, no `json`, no `tracing-log`: N1); `just check` and `just deny` must pass |
+| Dependencies | `Cargo.toml` (workspace: `tracing`, `tracing-subscriber` already pinned, but absent from `Cargo.lock` today, so the new crates enter the lock), `crates/flux-core/Cargo.toml`, `crates/flux-cli/Cargo.toml`; remove both from the `ignored` list at `Cargo.toml:117` | `flux-core` depends on `tracing` only; `flux-cli` on both. A member crate inherits the workspace entry's features and cannot remove them, so the **workspace entry itself** (`Cargo.toml:68`, today `features = ["env-filter", "json"]`) is changed to `default-features = false` plus only the features the custom formatter needs (no `env-filter`, no `json`, no `tracing-log`: N1); `just check` and `just deny` must pass |
 | Emission | `crates/flux-core/src/tree.rs` (the `note_copied`, `note_resumed`, `note_skipped` sites, `enter_dir`, `link_one`, the hardlink and replace paths), `run/mod.rs` (`file`), `copy.rs`, `cleanup/delete.rs` | `INFO` `flux::op` events (5.2); `DEBUG`/`TRACE` events (5.5) |
 | Flags | `crates/flux-cli/src/main.rs` (`Cli`, global args; `VerifyArgs.verbose` replaced) | `-v` count, `--verbose`, `-q`/`--quiet`, the conflict error |
 | Verbosity value | `crates/flux-cli/src/live.rs` or a new module `crates/flux-cli/src/verbosity.rs` | `Quiet`, `Normal`, `Verbose(n)`; gating of the direct prints |
@@ -202,7 +204,13 @@ The plan (not this document) fixes the file-level wiring and line numbers, after
 13. `path` in a `-v` line is relative to the destination root (the root's name leads in a several-source run); for a single file it is the destination as typed.
 14. Control characters are escaped on every line written through the display, which also changes how an existing failure line prints for a hostile name (never for an ordinary one).
 15. `flux verify -v` has no verb lines; it is today's `--verbose` and nothing more.
+16. Under `--quiet`, `checkpoints discarded for X: ...` lines are warnings and stay; the partial-resume lines, the advisory note and the full-level line are notes and are hidden.
 
-## 11. What is left to the plan
+## 11. Stand-downs (panel record)
+
+- UNVERIFIED-ACCEPTED: the claim that keeping the bar at `-v` causes severe redraw contention and lowers copy throughput (a second reviewer, round 1). It is unmeasured; the bar at `-v` is the owner's decision D2, the measurement and a rate-limited fallback are in sections 3 and 8.
+- Peer suggestion not taken: a two-tier quiet (`-qq`); recorded as non-goal N6.
+
+## 12. What is left to the plan
 
 The exact emission sites and line numbers; the shape of the writer handle shared by the subscriber and `Live`; the `-vv`/`-vvv` event set; whether `-vvvv` is accepted; the list of tests whose expected summary text changes; the benchmark protocol for the logging-off cost; the README wording.
