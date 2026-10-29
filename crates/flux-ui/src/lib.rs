@@ -7,3 +7,10 @@
 //! Progress and terminal presentation (spec §3.5).
 //!
 //! Scaffold only — no implementation yet.
+
+mod display;
+mod render;
+
+pub use display::Display;
+pub use indicatif::ProgressDrawTarget;
+pub use render::render;
