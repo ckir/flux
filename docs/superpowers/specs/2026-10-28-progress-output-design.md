@@ -44,7 +44,7 @@ The consult files are `.clavity/seams/progress-fork.md` (round 1, `[VERDICT: ALI
 | F4 when shown | Automatic only (section 3.5). | `--progress=auto\|always\|never` and `--quiet`: agy first recommended both, then withdrew them after reading the spec (N3). I proposed `--progress` and withdrew it for the same reason. |
 | F5 slicing | One cut: `copy` (one or several sources, `--resume`). | `verify` as well (N1); counters without in-file bytes: fails G1. |
 
-Agy and I diverged on one line in the negotiation: I wanted a `Skipped` line for resumed files; agy's final list omits it. Ruling R1 (section 7) keeps it, shown only when non-zero, at the cost of one extra counter site.
+Agy and I diverged on one line in the negotiation: I wanted a `Resumed` line (shown when files were skipped by a `--resume`); agy's final list omits it. Ruling R1 (section 7) keeps it, shown only when non-zero, at the cost of one extra counter site.
 
 ## 3. Design
 
