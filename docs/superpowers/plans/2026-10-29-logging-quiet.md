@@ -26,7 +26,7 @@
 - PR-2. A single file's `path` is the destination path as `file_with` receives it (`resolve::job` output), not the string the user typed: `flux-core` never sees the typed form (S5.2 says "as typed"). Cost: a longer path on one line.
 - PR-3. The capture helper for tests is a hand-written `tracing::Subscriber` in `oplog::testing`, so `flux-core` needs no `tracing-subscriber` dev-dependency.
 - PR-4. `Verbosity` lives in a process-global `OnceLock` (set once in `main`), read by `note()`/`note_lines()`; tests of pure functions pass it as an argument. Cost: a test that sets it twice fails loudly.
-- PR-6. A single-file copy prints `Copied` for a published file and `Skipped` for a skipped one; a replaced single file also prints `Copied` in this cut, because `file_with` does not learn whether the target existed (the CLI does, in `Job::File.target_existed`, `main.rs:513`). Cost: one verb less precise on the one-file path; a follow-up can pass the flag in.
+- PR-6. A single-file copy prints `Copied` for a published file and `Skipped` for a skipped one; a replaced single file also prints `Copied` in this cut, because `file_with` does not learn whether the target existed (the CLI does, in `Job::File.target_existed`, `main.rs:509`). Cost: one verb less precise on the one-file path; a follow-up can pass the flag in.
 - PR-5. Control characters are escaped in `Live::record`'s display branch (the one place lines reach `Display::println`), not inside `flux-ui`.
 
 ## Review Focus
