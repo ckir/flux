@@ -63,7 +63,7 @@ Claims in agy's reply that did not hold when measured, and are not reasons for t
 
 ### 5.1 Flags
 
-`-v` is a count (`-v`, `-vv`, `-vvv`, also `-v -v`); `--quiet` (short `-q`) is a flag. They are global (clap `global = true`): accepted by `copy`, `verify` and `cleanup`, defined once, and accepted before or after the subcommand (`flux -v copy ...` and `flux copy -v ...`). No short flag exists in `main.rs` today, so `-v` and `-q` collide with nothing. `--verbose` is the long form of the same count (so `flux verify --verbose` is `-v`, and is `-v` on the other two commands too); the field `VerifyArgs.verbose` and the parse test that reads it (`!bare.verbose`, `all.verbose`) are replaced by the shared verbosity value. `-v` with `--quiet` is a usage error: exit 2, a message naming both. They are not stored in any operation state; spec line 5833 already lets them change on a `--resume`, and a test pins that a resume with different verbosity is accepted.
+`-v` is a count (`-v`, `-vv`, `-vvv`, also `-v -v`); `--quiet` (short `-q`) is a flag. They are global (clap `global = true`): accepted by `copy`, `verify` and `cleanup`, defined once, and accepted before or after the subcommand (`flux -v copy ...` and `flux copy -v ...`). No short flag exists in `main.rs` today, so `-v` and `-q` collide with nothing. `--verbose` is the long form of the same count (so `flux verify --verbose` is `-v`, and is `-v` on the other two commands too); the field `VerifyArgs.verbose` and the parse test that reads it (`!bare.verbose`, `all.verbose`) are replaced by the shared verbosity value. `-v` with `--quiet` is a usage error: exit 2, a message naming both. Clap's `conflicts_with` is not enough: measured with clap 4.6.7, it refuses `flux copy -v -q` and `flux verify -vq` but ACCEPTS `flux -q copy -v` (the two flags sit at different levels), so `main` checks `verbosity > 0 && quiet` itself right after parsing and exits 2 with the message (a test pins the cross-position case). `-vvvv` and more are accepted (clap counts 4) and treated as `-vvv`. They are not stored in any operation state; spec line 5833 already lets them change on a `--resume`, and a test pins that a resume with different verbosity is accepted.
 
 Setting | tracing level shown | meaning
 ---|---|---
@@ -180,7 +180,7 @@ The plan (not this document) fixes the file-level wiring and line numbers, after
 
 - Formatter: unit tests on an in-memory writer with a scoped subscriber: each verb line byte-for-byte (the table in 5.2), the escaping of a name with `\x1b[2K`, `\r` and a non-UTF-8 byte, the 10-column alignment, a closed writer does not panic.
 - Gating: a table test over the section 5.3 matrix (output class x setting), with the exit code.
-- Flags: `-v` with `--quiet` exits 2; `--verbose` equals `-v`; `-vvvv` is accepted as `-vvv` (or refused: the plan decides and pins it); a resume with different verbosity is accepted.
+- Flags: `-v` with `--quiet` exits 2 in every position (`copy -v -q`, `-q copy -v`, `verify -vq`, `-v copy -q`); `--verbose` equals `-v`; `-vvvv` behaves as `-vvv`; `flux -v copy` and `flux copy -v` are the same; a resume with different verbosity is accepted.
 - CLI process tests (piped stderr): the S1 and S2 outputs of this document at each setting; `--json` with `-v` and with `--quiet` (stdout unchanged, stderr per 5.3); `--dry-run --quiet` prints the whole dry run.
 - Terminal: extend `crates/flux-cli/tests/pty.rs` (cut 20): `-v` on a pty draws the bar and prints `Copied` lines, and the bar is cleared before the summary; `--quiet` on a pty draws no frame and prints nothing on success.
 - Summary helpers: unit tests for 0, 1, 2 files and directories, the size scale boundaries (1023 B, 1 KiB), and the elapsed formats at 0.35 s, 12.3 s, 59.99 s, 60 s, 3723 s.
@@ -213,4 +213,4 @@ The plan (not this document) fixes the file-level wiring and line numbers, after
 
 ## 12. What is left to the plan
 
-The exact emission sites and line numbers; the shape of the writer handle shared by the subscriber and `Live`; the `-vv`/`-vvv` event set; whether `-vvvv` is accepted; the list of tests whose expected summary text changes; the benchmark protocol for the logging-off cost; the README wording.
+The exact emission sites and line numbers; the shape of the writer handle shared by the subscriber and `Live`; the `-vv`/`-vvv` event set; the list of tests whose expected summary text changes; the benchmark protocol for the logging-off cost; the README wording.
