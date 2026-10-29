@@ -6,7 +6,7 @@
 
 //! Progress and terminal presentation (spec §3.5).
 //!
-//! The live progress display: [`render`] turns a snapshot into lines and [`Display`] draws them.
+//! The live progress display: [`render()`] turns a snapshot into lines and [`Display`] draws them.
 
 mod display;
 mod render;
