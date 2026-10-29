@@ -99,6 +99,7 @@ fn config() -> RunConfig {
         resume_verify: run::ResumeVerify::Chunks,
         dry_run: true,
         dry_temp_root: None,
+        progress: None,
     }
 }
 

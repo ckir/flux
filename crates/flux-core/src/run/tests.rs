@@ -44,6 +44,7 @@ fn cfg() -> RunConfig {
         resume_verify: ResumeVerify::Chunks,
         dry_run: false,
         dry_temp_root: None,
+        progress: None,
     }
 }
 
@@ -11265,4 +11266,61 @@ fn a_directory_removed_by_both_counts_once() {
     assert!(got.is_empty(), "{got:?}");
     assert_eq!(out.excluded, 1);
     assert!(!fs.exists("/p/dest/sub"));
+}
+
+#[test]
+fn a_clean_tree_copy_ticks_the_counters_to_the_outcome() {
+    let fs = fake();
+    let p = crate::progress::Progress::new();
+    let c = RunConfig { progress: Some(p.clone()), ..cfg() };
+    let (r, got) = run_tree(&fs, &c);
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    let s = p.snapshot();
+    assert_eq!(s.discovered, out.files_total);
+    assert_eq!(s.copied, out.files_copied);
+    assert_eq!((s.resumed, s.errors), (0, 0));
+    assert!(s.discovered > 0 && s.copied > 0, "{s:?}");
+}
+
+#[test]
+fn a_resume_ticks_resumed_not_copied() {
+    let fs = resumable(100, b"o", 101, ClaimStatus::Created);
+    let p = crate::progress::Progress::new();
+    let c = RunConfig { progress: Some(p.clone()), ..resume() };
+    let (r, got) = run_tree_with(&fs, &c, &opts());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    let s = p.snapshot();
+    assert_eq!(out.files_resumed, 1);
+    assert_eq!(s.resumed, out.files_resumed);
+    assert_eq!(s.copied, out.files_copied);
+}
+
+#[test]
+fn a_resumed_symlink_ticks_resumed() {
+    // Built here: `link_only_src` plus a prior 5 holding an equal destination link and a `Created` claim on it.
+    let fs = link_only_src();
+    prior3(&fs, 5, OpState::Transferring);
+    fs.add_symlink_to("/p/dest/l", "/p/keep", flux_fs::LinkKind::Unspecified);
+    claimed(&fs, 5, "l", ClaimStatus::Created, "l");
+    let p = crate::progress::Progress::new();
+    let c = RunConfig { progress: Some(p.clone()), ..resume() };
+    let (r, got) = run_tree_with(&fs, &c, &opts());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert!(out.files_resumed >= 1, "{out:?}");
+    assert_eq!(p.snapshot().resumed, out.files_resumed);
+}
+
+#[test]
+fn a_run_without_a_handle_counts_as_before() {
+    let (r, _) = run_tree(&fake(), &cfg());
+    let plain = ok(&r);
+    let p = crate::progress::Progress::new();
+    let (r2, _) = run_tree(&fake(), &RunConfig { progress: Some(p), ..cfg() });
+    let with = ok(&r2);
+    assert!(plain.progress.is_none());
+    assert_eq!((plain.files_total, plain.files_copied), (with.files_total, with.files_copied));
+    assert!(plain.files_total > 0);
 }

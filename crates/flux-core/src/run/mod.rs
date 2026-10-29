@@ -99,6 +99,8 @@ pub struct RunConfig {
     /// Cut 11b: where a dry resume copies the prior's claim store; `None` means `std::env::temp_dir()`; tests pass a
     /// fake directory.
     pub dry_temp_root: Option<PathBuf>,
+    /// The live counters a display samples; `None` outside the CLI's terminal case.
+    pub progress: Option<std::sync::Arc<crate::progress::Progress>>,
 }
 
 /// §101's heartbeat interval: 5 s.
@@ -119,6 +121,7 @@ impl std::fmt::Debug for RunConfig {
             .field("resume_verify", &self.resume_verify)
             .field("dry_run", &self.dry_run)
             .field("dry_temp_root", &self.dry_temp_root)
+            .field("progress", &self.progress.is_some())
             .finish()
     }
 }
@@ -318,7 +321,7 @@ pub(crate) fn tree_with<F: DestinationRoot>(
     };
     let opts =
         CopyOptions { operation_id: OperationId::new(cfg.operation_id.as_str()), ..opts.clone() };
-    let mut out = TreeOutcome::default();
+    let mut out = TreeOutcome { progress: cfg.progress.clone(), ..TreeOutcome::default() };
     // B1: the source side, then DEST and the identity pre-flight, before anything is created.
     let mut source = match prepare_source(fs, src_root, dst_root, MountPolicy::of(&opts)) {
         Ok(s) => s,

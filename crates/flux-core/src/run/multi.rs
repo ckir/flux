@@ -723,7 +723,7 @@ pub fn trees<F: DestinationRoot>(
     };
     let opts =
         CopyOptions { operation_id: OperationId::new(cfg.operation_id.as_str()), ..opts.clone() };
-    let mut out = TreeOutcome::default();
+    let mut out = TreeOutcome { progress: cfg.progress.clone(), ..TreeOutcome::default() };
     // Group 1: the names, then the sources (B1), before DEST is touched.
     let specs = match plan_roots(specs) {
         Ok(s) => s,
@@ -1438,6 +1438,7 @@ mod trees_tests {
             resume_verify: ResumeVerify::Chunks,
             dry_run: false,
             dry_temp_root: None,
+            progress: None,
         }
     }
 
@@ -2579,6 +2580,28 @@ mod trees_tests {
         expect_tree(&fs);
         assert!(lock_files(&fs).is_empty(), "{:?}", lock_files(&fs));
         assert!(!fs.exists(format!("/p/dest/.flux/operations/{ID}")));
+    }
+
+    #[test]
+    fn several_roots_tick_one_shared_progress_to_the_sum() {
+        let p = crate::progress::Progress::new();
+        let fresh_cfg = RunConfig { progress: Some(p.clone()), ..cfg() };
+        let (r, _) = go_with(&fake_timed(), two(), &opts(), &fresh_cfg);
+        let out = ok(&r);
+        let s = p.snapshot();
+        assert_eq!(s.discovered, out.files_total);
+        assert_eq!(s.copied, out.files_copied);
+        assert!(s.discovered > 0 && s.copied > 0, "{s:?}");
+
+        let p = crate::progress::Progress::new();
+        let c = RunConfig { progress: Some(p.clone()), ..resume_cfg(0x22) };
+        let (r, _) = go_with(&crashed_late(), two(), &opts(), &c);
+        let out = ok(&r);
+        let s = p.snapshot();
+        assert_eq!(s.resumed, out.files_resumed);
+        assert!(s.resumed >= 1, "{s:?}");
+        // a/x, a/sub/y, b/k: every file of the expected tree was either copied or resumed.
+        assert_eq!(s.copied + s.resumed, 3, "{s:?}");
     }
 
     #[test]

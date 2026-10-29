@@ -112,6 +112,34 @@ pub struct TreeOutcome {
     pub hardlink_weak: WeakIdentityWarnings,
     /// Cut 12: the degradations that are NOT weak identity, one count and first example per cause.
     pub hardlinks_unlinked: BTreeMap<UnlinkedWhy, DegradedGroup>,
+    /// The live counters a display samples; `None` outside the CLI's terminal case.
+    pub progress: Option<std::sync::Arc<crate::progress::Progress>>,
+}
+
+impl TreeOutcome {
+    /// Count one more entry the walk yielded, and tick the live view with it.
+    pub(crate) fn note_discovered(&mut self) {
+        self.files_total += 1;
+        if let Some(p) = &self.progress {
+            p.add_discovered();
+        }
+    }
+
+    /// Count one more file copied, and tick the live view with it.
+    pub(crate) fn note_copied(&mut self) {
+        self.files_copied += 1;
+        if let Some(p) = &self.progress {
+            p.add_copied();
+        }
+    }
+
+    /// Count one more entry resumed, and tick the live view with it.
+    pub(crate) fn note_resumed(&mut self) {
+        self.files_resumed += 1;
+        if let Some(p) = &self.progress {
+            p.add_resumed();
+        }
+    }
 }
 
 /// Cut 12: why a hardlink group member was copied independently when its identity was fine.
@@ -973,7 +1001,7 @@ fn file_root<F: DestinationRoot>(
     let cx = base.for_root(src_parent, identity, None);
     let RootState { names, claim_parent, fresh } = state;
     let mut batch = Batch::default();
-    out.files_total += 1;
+    out.note_discovered();
     let path = PathBuf::from(name);
     let walked = if reserved_path(&path) {
         let conflict = CopyError::at(CopyStep::Gate, reserved_conflict());
@@ -1208,7 +1236,7 @@ fn walk_into<F: DestinationRoot>(
                 stack.push(frame);
             }
             WalkEvent::File { path } => {
-                out.files_total += 1;
+                out.note_discovered();
                 if dry_top_level_flux(cx, stack, &path) {
                     dry_flux_entry_failure(stack, path, out, on_report);
                     continue;
@@ -1252,7 +1280,7 @@ fn walk_into<F: DestinationRoot>(
                 }
             }
             WalkEvent::Symlink { path } => {
-                out.files_total += 1;
+                out.note_discovered();
                 if dry_top_level_flux(cx, stack, &path) && cx.opts.links != Links::Skip {
                     dry_flux_entry_failure(stack, path, out, on_report);
                     continue;
@@ -1275,7 +1303,7 @@ fn walk_into<F: DestinationRoot>(
                 }
             }
             WalkEvent::Other { path } => {
-                out.files_total += 1;
+                out.note_discovered();
                 if live {
                     report(out, on_report, path, TreeFailureCause::SpecialFileSkipped);
                 }
@@ -1915,7 +1943,7 @@ fn copy_one<F: DestinationRoot>(
                             && resumed_complete(src_meta, &meta, cx.opts.preserve_times)
                             && resume_keeps(cx, &group, &target, &meta, &path, out, on_report)
                         {
-                            out.files_resumed += 1;
+                            out.note_resumed();
                             out.bytes_resumed += src_meta.len;
                             names.record_publication(
                                 &target,
@@ -3018,7 +3046,7 @@ fn link_one<F: DestinationRoot>(
                         // Resumed only when the claim says `Created` AND the destination is an equal link; anything
                         // else falls through to the policy and republishes.
                         if r.status == ClaimStatus::Created && same_link(parent, &stored, &link) {
-                            out.files_resumed += 1;
+                            out.note_resumed();
                             names.record_publication(
                                 &target,
                                 Some(&stored),
@@ -4321,7 +4349,7 @@ fn finish_copy(
     match result {
         Ok(o) => {
             debug_assert!(!o.skipped, "the tree never lets the copy path skip");
-            out.files_copied += 1;
+            out.note_copied();
             if o.verified {
                 out.files_verified += 1;
             }
