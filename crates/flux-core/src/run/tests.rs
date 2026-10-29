@@ -11529,8 +11529,7 @@ mod op_events {
         let ((r, got), events) = capture(|| run_tree(&fs, &cfg()));
         ok(&r);
         assert!(got.is_empty(), "{got:?}");
-        assert_eq!(actions(&events), vec![("replaced", "l")], "{events:?}");
-        assert_eq!(events[0].to, None);
+        assert_eq!(events, vec![ev("replaced", "l", None, Some("/p/keep"))]);
     }
 
     #[test]
@@ -11685,6 +11684,54 @@ mod op_events {
         ok(&r);
         assert_eq!(got.len(), 1, "{got:?}");
         assert!(!events.iter().any(|e| e.path == "a"), "{events:?}");
+        assert!(events.contains(&ev("copied", "sub/b", Some(2), None)), "{events:?}");
+    }
+
+    #[test]
+    fn logging_off_builds_no_event_arguments() {
+        let build = || {
+            let fs = fake();
+            fs.add_symlink_to("/src/lnk", "/p/keep", flux_fs::LinkKind::Unspecified);
+            fs
+        };
+        let before = crate::oplog::built();
+        let fs = build();
+        let (r, got) = run_tree(&fs, &cfg());
+        assert_eq!(ok(&r).files_copied, 3);
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(crate::oplog::built(), before, "an argument was built with no subscriber");
+
+        // The SAME run with a subscriber builds them and emits the events.
+        let fs = build();
+        let ((r, _), events) = capture(|| run_tree(&fs, &cfg()));
+        assert_eq!(ok(&r).files_copied, 3);
+        assert_eq!(events.len(), 4, "{events:?}");
+        assert_eq!(crate::oplog::built(), before + 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_control_character_in_a_name_reaches_the_event_escaped() {
+        let fs = fake();
+        fs.write_file("/src/x\u{1b}[2Ky", b"Z");
+        let ((r, got), events) = capture(|| run_tree(&fs, &cfg()));
+        ok(&r);
+        assert!(got.is_empty(), "{got:?}");
+        let e = events.iter().find(|e| e.path.starts_with('x')).expect("the file is announced");
+        assert_eq!(e.path, "x\\u{1b}[2Ky");
+        assert!(!e.path.contains('\x1b'), "{:?}", e.path);
+    }
+
+    #[test]
+    fn a_batched_replace_emits_one_replaced_and_no_copied() {
+        let fs = dest_fake();
+        fs.write_file("/p/dest/a", b"old");
+        let ((r, got), events) = capture(|| run_tree_with(&fs, &cfg(), &strict()));
+        ok(&r);
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(count(&calls(&fs), "claim_prepare_many("), 2, "the batch path ran");
+        let for_a: Vec<_> = events.iter().filter(|e| e.path == "a").collect();
+        assert_eq!(for_a, vec![&ev("replaced", "a", Some(1), None)], "{events:?}");
         assert!(events.contains(&ev("copied", "sub/b", Some(2), None)), "{events:?}");
     }
 }

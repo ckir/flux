@@ -4,8 +4,6 @@
 // You may obtain a copy of the License at:
 // https://polyformproject.org/licenses/noncommercial/1.0.0/
 
-//! Flux engine (spec §3.1).
-
 //! Per-operation tracing events (logging design 5.2, 5.6).
 //!
 //! The engine announces each file, directory, link and removal as ONE `INFO` event with target
@@ -108,6 +106,40 @@ pub fn emit(verb: Verb, path: &Path, bytes: Option<u64>, to: Option<&Path>) {
         bytes = bytes,
         to = to.map(|t| tracing::field::display(EscapedPath(t))),
     );
+}
+
+/// Whether any subscriber wants `flux::op` events. Every emission site builds its arguments only behind this, so
+/// with logging off nothing is allocated for an event (design anti-goal A4).
+#[inline]
+#[must_use]
+pub fn enabled() -> bool {
+    tracing::enabled!(target: TARGET, tracing::Level::INFO)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times an argument-building closure ran on this thread (test-only proof of the guard).
+    static BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: the number of argument builds on this thread so far.
+#[cfg(test)]
+pub(crate) fn built() -> usize {
+    BUILT.with(std::cell::Cell::get)
+}
+
+/// `emit` for a site whose arguments cost something to build: `build` runs only when [`enabled`].
+#[inline]
+pub fn emit_lazy(
+    verb: Verb,
+    build: impl FnOnce() -> (std::path::PathBuf, Option<u64>, Option<std::path::PathBuf>),
+) {
+    if enabled() {
+        #[cfg(test)]
+        BUILT.with(|c| c.set(c.get() + 1));
+        let (path, bytes, to) = build();
+        emit(verb, &path, bytes, to.as_deref());
+    }
 }
 
 /// Test support: capture the events a closure emits.
@@ -232,6 +264,19 @@ mod tests {
             let p = PathBuf::from(std::ffi::OsStr::from_bytes(b"a\xffb"));
             assert_eq!(escape_path(&p), "a\\xffb");
         }
+    }
+
+    #[test]
+    fn emit_lazy_builds_nothing_without_a_subscriber() {
+        let before = built();
+        emit_lazy(Verb::Copied, || panic!("built with logging off"));
+        assert!(!enabled());
+        assert_eq!(built(), before);
+        let (_, evs) = testing::capture(|| {
+            emit_lazy(Verb::Copied, || (PathBuf::from("f"), Some(1), None));
+        });
+        assert_eq!(evs.len(), 1);
+        assert_eq!(built(), before + 1);
     }
 
     #[test]

@@ -896,7 +896,9 @@ pub(crate) fn file_with<F: DestinationRoot>(
     // A failure announces nothing. A replaced single file also reads `Copied` in this cut (ruling PR-6).
     if let Ok(o) = &copied {
         let verb = if o.skipped { Verb::Skipped } else { Verb::Copied };
-        oplog::emit(verb, dst, (!o.skipped).then_some(o.bytes_copied), None);
+        oplog::emit_lazy(verb, || {
+            (dst.to_path_buf(), (!o.skipped).then_some(o.bytes_copied), None)
+        });
     }
     run.copy = Some(copied);
     run
