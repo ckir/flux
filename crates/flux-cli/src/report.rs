@@ -478,12 +478,45 @@ fn weak_line(scope: &str, count: u64, example: &str) -> String {
     )
 }
 
+/// `n` and its noun: `1 file`, `0 files`, `2 files`.
+pub fn count_noun(n: u64, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// A byte count on the scale of the progress display (`7 B`, `42.50 KiB`).
+pub fn human_bytes(n: u64) -> String {
+    flux_ui::HumanBytes(n).to_string()
+}
+
+/// A wall-clock duration: two decimals under 10 s, one decimal under a minute, then `2m 03s` and `1h 02m 03s`.
+pub fn elapsed_text(ms: u64) -> String {
+    if ms < 10_000 {
+        let h = (ms + 5) / 10;
+        return format!("{}.{:02}s", h / 100, h % 100);
+    }
+    if ms < 59_950 {
+        let t = (ms + 50) / 100;
+        return format!("{}.{}s", t / 10, t % 10);
+    }
+    let secs = (ms + 500) / 1000;
+    if secs < 3600 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {:02}m {:02}s", secs / 3600, secs % 3600 / 60, secs % 60)
+    }
+}
+
 /// The last stderr line of a run that reached the engine. Its failure figure is the
 /// JSON `errors` value, so an abort counts and a non-zero exit never reads as clean.
 pub fn summary_line(r: &Report, directories_created: u64) -> String {
     let mut s = format!(
-        "copied {} files ({} bytes), created {directories_created} directories; {} failed, {} skipped",
-        r.files_copied, r.bytes_copied, r.errors, r.files_skipped
+        "copied {} ({}), created {} in {}; {} failed, {} skipped",
+        count_noun(r.files_copied, "file", "files"),
+        human_bytes(r.bytes_copied),
+        count_noun(directories_created, "directory", "directories"),
+        elapsed_text(r.duration_ms),
+        r.errors,
+        r.files_skipped
     );
     // Cut 12: each suffix only when non-zero, so a copy without hardlinks prints the line it always did.
     for (n, what) in [
@@ -513,8 +546,13 @@ pub fn dry_run_summary_line(r: &Report, directories_created: u64) -> String {
     let excluded =
         if r.excluded > 0 { format!("; {} excluded", r.excluded) } else { String::new() };
     format!(
-        "dry run: would copy {} files ({} bytes), overwrite {}{links}, skip {}, create {directories_created} directories; {} errors{excluded}",
-        r.files_copied, r.bytes_copied, r.files_overwritten, r.files_skipped, r.errors
+        "dry run: would copy {} ({}), overwrite {}{links}, skip {}, create {}; {} errors{excluded}",
+        count_noun(r.files_copied, "file", "files"),
+        human_bytes(r.bytes_copied),
+        r.files_overwritten,
+        r.files_skipped,
+        count_noun(directories_created, "directory", "directories"),
+        r.errors
     )
 }
 
@@ -1084,6 +1122,70 @@ mod tests {
     }
 
     #[test]
+    fn count_noun_is_singular_only_for_one() {
+        assert_eq!(count_noun(1, "file", "files"), "1 file");
+        assert_eq!(count_noun(0, "file", "files"), "0 files");
+        assert_eq!(count_noun(2, "file", "files"), "2 files");
+    }
+
+    #[test]
+    fn human_bytes_matches_the_progress_display() {
+        assert_eq!(human_bytes(15), "15 B");
+        assert_eq!(human_bytes(1_500), "1.46 KiB");
+        for n in [0, 4 << 30] {
+            assert_eq!(human_bytes(n), flux_ui::HumanBytes(n).to_string());
+        }
+    }
+
+    #[test]
+    fn elapsed_text_formats() {
+        for (ms, want) in [
+            (0, "0.00s"),
+            (350, "0.35s"),
+            (9_994, "9.99s"),
+            (12_300, "12.3s"),
+            (59_949, "59.9s"),
+            (59_950, "1m 00s"),
+            (60_000, "1m 00s"),
+            (123_000, "2m 03s"),
+            (3_599_500, "1h 00m 00s"),
+            (3_723_000, "1h 02m 03s"),
+        ] {
+            assert_eq!(elapsed_text(ms), want, "{ms} ms");
+        }
+    }
+
+    #[test]
+    fn summary_line_reads_correctly_for_one_file_and_one_directory() {
+        let mut r = Report::pre_engine(false);
+        r.errors = 0;
+        r.files_copied = 1;
+        r.bytes_copied = 2;
+        r.duration_ms = 10;
+        assert_eq!(
+            summary_line(&r, 1),
+            "copied 1 file (2 B), created 1 directory in 0.01s; 0 failed, 0 skipped"
+        );
+    }
+
+    #[test]
+    fn summary_line_with_failures_and_suffixes_keeps_the_order() {
+        let mut r = Report::pre_engine(false);
+        r.errors = 2;
+        r.files_copied = 3;
+        r.bytes_copied = 1_500;
+        r.files_skipped = 1;
+        r.duration_ms = 350;
+        r.files_hardlinked = 1;
+        r.files_verified = 3;
+        r.excluded = 4;
+        assert_eq!(
+            summary_line(&r, 2),
+            "copied 3 files (1.46 KiB), created 2 directories in 0.35s; 2 failed, 1 skipped; 1 hardlinked; 3 verified; 4 excluded"
+        );
+    }
+
+    #[test]
     fn the_summary_and_dry_run_lines_end_with_an_excluded_suffix_only_when_non_zero() {
         let mut r = Report::pre_engine(false);
         r.errors = 0;
@@ -1092,18 +1194,18 @@ mod tests {
         r.excluded = 4;
         assert_eq!(
             summary_line(&r, 1),
-            "copied 2 files (3 bytes), created 1 directories; 0 failed, 0 skipped; 4 excluded"
+            "copied 2 files (3 B), created 1 directory in 0.00s; 0 failed, 0 skipped; 4 excluded"
         );
         r.files_verified = 3;
         r.files_mismatched = 1;
         assert_eq!(
             summary_line(&r, 1),
-            "copied 2 files (3 bytes), created 1 directories; 0 failed, 0 skipped; 3 verified; 1 mismatched; 4 excluded",
+            "copied 2 files (3 B), created 1 directory in 0.00s; 0 failed, 0 skipped; 3 verified; 1 mismatched; 4 excluded",
             "the suffix is the last"
         );
         assert_eq!(
             dry_run_summary_line(&r, 1),
-            "dry run: would copy 2 files (3 bytes), overwrite 0, skip 0, create 1 directories; 0 errors; 4 excluded"
+            "dry run: would copy 2 files (3 B), overwrite 0, skip 0, create 1 directory; 0 errors; 4 excluded"
         );
     }
 
@@ -1210,22 +1312,22 @@ mod tests {
         // The pre-verification literal, pinned: a zero report prints the line it always did.
         assert_eq!(
             summary_line(&r, 1),
-            "copied 2 files (3 bytes), created 1 directories; 0 failed, 0 skipped"
+            "copied 2 files (3 B), created 1 directory in 0.00s; 0 failed, 0 skipped"
         );
         r.files_verified = 3;
         assert_eq!(
             summary_line(&r, 1),
-            "copied 2 files (3 bytes), created 1 directories; 0 failed, 0 skipped; 3 verified"
+            "copied 2 files (3 B), created 1 directory in 0.00s; 0 failed, 0 skipped; 3 verified"
         );
         r.files_mismatched = 1;
         assert_eq!(
             summary_line(&r, 1),
-            "copied 2 files (3 bytes), created 1 directories; 0 failed, 0 skipped; 3 verified; 1 mismatched"
+            "copied 2 files (3 B), created 1 directory in 0.00s; 0 failed, 0 skipped; 3 verified; 1 mismatched"
         );
         r.files_verified = 0;
         assert_eq!(
             summary_line(&r, 1),
-            "copied 2 files (3 bytes), created 1 directories; 0 failed, 0 skipped; 1 mismatched"
+            "copied 2 files (3 B), created 1 directory in 0.00s; 0 failed, 0 skipped; 1 mismatched"
         );
     }
 
@@ -1440,7 +1542,7 @@ mod tests {
         let r = Report::tree(&TreeOutcome::default(), true, 0);
         assert_eq!(
             summary_line(&r, 0),
-            "copied 0 files (0 bytes), created 0 directories; 1 failed, 0 skipped"
+            "copied 0 files (0 B), created 0 directories in 0.00s; 1 failed, 0 skipped"
         );
     }
 
@@ -2297,12 +2399,12 @@ mod tests {
         r.files_overwritten = 1;
         assert_eq!(
             dry_run_summary_line(&r, 2),
-            "dry run: would copy 4 files (9 bytes), overwrite 1, skip 0, create 2 directories; 0 errors"
+            "dry run: would copy 4 files (9 B), overwrite 1, skip 0, create 2 directories; 0 errors"
         );
         r.files_hardlinked = 3;
         assert_eq!(
             dry_run_summary_line(&r, 2),
-            "dry run: would copy 4 files (9 bytes), overwrite 1, hardlink 3, skip 0, create 2 directories; 0 errors"
+            "dry run: would copy 4 files (9 B), overwrite 1, hardlink 3, skip 0, create 2 directories; 0 errors"
         );
     }
 
@@ -2493,14 +2595,14 @@ mod tests {
         r.bytes_copied = 3;
         assert_eq!(
             summary_line(&r, 1),
-            "copied 2 files (3 bytes), created 1 directories; 0 failed, 0 skipped"
+            "copied 2 files (3 B), created 1 directory in 0.00s; 0 failed, 0 skipped"
         );
         r.files_hardlinked = 1;
         r.hardlinks_degraded = 2;
         r.hardlinks_unchecked = 1;
         assert_eq!(
             summary_line(&r, 1),
-            "copied 2 files (3 bytes), created 1 directories; 0 failed, 0 skipped; 1 hardlinked; 2 hardlinks degraded; 1 hardlinks unchecked"
+            "copied 2 files (3 B), created 1 directory in 0.00s; 0 failed, 0 skipped; 1 hardlinked; 2 hardlinks degraded; 1 hardlinks unchecked"
         );
     }
 

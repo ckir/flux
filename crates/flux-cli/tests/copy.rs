@@ -155,7 +155,7 @@ fn a_folders_contents_are_copied_onto_a_fresh_destination() {
     assert_eq!(std::fs::read(dst.join("sub").join("b")).unwrap(), b"BB");
     assert!(!dst.join("src").exists(), "§4.1: the CONTENTS land on DEST");
     assert!(
-        stderr(&out).contains("copied 2 files (3 bytes), created 2 directories; 0 failed"),
+        stderr(&out).contains("copied 2 files (3 B), created 2 directories in "),
         "{}",
         stderr(&out)
     );

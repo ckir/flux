@@ -49,7 +49,7 @@ fn a_dry_tree_run_prints_one_line_per_entry_and_the_dry_summary_and_creates_noth
         "sub/b: object_type=file action=would_copy",
         UNPROBED,
         UNPROBED_LOCK,
-        "dry run: would copy 2 files (3 bytes), overwrite 0, skip 0, create 2 directories; 0 errors",
+        "dry run: would copy 2 files (3 B), overwrite 0, skip 0, create 2 directories; 0 errors",
     ] {
         assert!(e.contains(want), "missing {want:?} in {e}");
     }
@@ -98,7 +98,7 @@ fn a_dry_single_file_run_prints_its_line_and_only_the_lock_note() {
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let e = stderr(&out);
     assert!(e.contains(&format!("{}: object_type=file action=would_copy", b.display())), "{e}");
-    assert!(e.contains("dry run: would copy 1 files"), "{e}");
+    assert!(e.contains("dry run: would copy 1 file ("), "{e}");
     assert!(!e.contains(UNPROBED), "{e}");
     assert!(e.contains(UNPROBED_LOCK), "{e}");
     assert!(
@@ -106,7 +106,7 @@ fn a_dry_single_file_run_prints_its_line_and_only_the_lock_note() {
             && e.find(UNPROBED_LOCK).unwrap() < e.find("dry run: would").unwrap(),
         "{e}"
     );
-    assert!(!e.contains("copied 1 files"), "{e}");
+    assert!(!e.contains("copied 1 file"), "{e}");
     assert!(!b.exists());
 
     let out = flux().args(["copy", "--dry-run", "--json"]).arg(&a).arg(&b).output().unwrap();
@@ -586,7 +586,9 @@ fn a_dry_tree_run_counts_a_walk_failure_in_its_summary_and_exits_as_live_does() 
     assert_eq!(dry.status.code(), Some(1), "{e}");
     // `sub` fails to list before it is planned, so only DEST itself would be created.
     assert!(
-        e.contains("dry run: would copy 1 files (1 bytes), overwrite 0, skip 0, create 1 directories; 1 errors"),
+        e.contains(
+            "dry run: would copy 1 file (1 B), overwrite 0, skip 0, create 1 directory; 1 errors"
+        ),
         "{e}"
     );
     let counts = |v: &serde_json::Value| {

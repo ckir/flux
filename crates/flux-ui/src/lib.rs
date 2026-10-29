@@ -12,5 +12,5 @@ mod display;
 mod render;
 
 pub use display::Display;
-pub use indicatif::ProgressDrawTarget;
+pub use indicatif::{HumanBytes, ProgressDrawTarget};
 pub use render::render;
