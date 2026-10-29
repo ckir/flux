@@ -239,9 +239,13 @@ Each was measured, and each is deliberately NOT fixed in that PR.
 - [ ] **A symlink's own timestamps and permissions are not preserved**, even under `--preserve-times`/`--preserve-permissions` (cut 10a, decision D4; a deviation from §44.1's strictness, stated in `--help`): needs a no-follow times primitive (`utimensat(AT_SYMLINK_NOFOLLOW)` / a reparse-point handle) on every arm.
 - [ ] **`symlinkat` on a Linux vfat/exFAT mount is unmeasured.** The arm maps `EPERM` to `SYMLINK_CREATION_UNAVAILABLE` and leaves `EACCES` as `PermissionDenied` (cut 10a, decision D8); the owner's vfat probe was not run (R-L1). Re-check before relying on it. Also unmeasured on Windows: a directory link replaced BY a directory link, a junction replaced by a file, and ReFS/FAT/SMB behaviour of the POSIX-semantics rename (probe cases are in `crates/flux-platform/src/symlink_probe.rs`).
 - [ ] Hardlinked symlinks: every entry of a multiply-linked symlink inode becomes an independent symlink (the walker now has hardlink topology for regular files (cut 12); a hardlinked symlink is still N independent links; §12.1 prescribes this for `--hardlinks=copy`).
-- [ ] **No progress output during a long copy.** `flux copy` prints each record as it happens and one
-      summary at the end; a large tree runs silently in between. §52's progress UI (files, bytes, speed,
-      ETA, skipped, degraded, errors) is not built; it needs the walk to know the totals up front (cut 5).
+- [x] **No progress output during a long copy - RESOLVED by cut 20.** `flux copy` now shows a live display on
+      stderr on a terminal (files discovered and processed, bytes, speed; a percent bar with ETA for a single
+      file). Spec `docs/superpowers/specs/2026-10-28-progress-output-design.md`; plan `docs/superpowers/plans/2026-10-29-progress-output.md`.
+- [ ] **Progress counts only the bytes this run writes.** The re-read of `--verify=destination|full` and of `--resume-verify` moves no byte counter, so `Transferred` is still while a big file is verified (spec boundary B7); a verifying-phase counter is the follow-up.
+- [ ] **No percent or ETA for a folder.** It needs a pre-scan or a bounded background count (spec N2, section 52's known-total form).
+- [ ] **`flux verify` has no progress display, and the `Hardlinks`, `Degraded` and `Capacity wait` lines of section 52 are not shown** (spec N1, N4).
+- [ ] **Logging and `--quiet` (section 54) are not built.** The progress display has no off switch other than redirecting stderr (spec N3).
 
 ## Engine (walker cut 4) prerequisites
 

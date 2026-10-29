@@ -30,8 +30,8 @@ mod tests;
 pub use crate::checkpoint::ResumeVerify;
 use crate::checkpoint::{CheckpointOpenError, CheckpointPolicy, Checkpoints, Hook};
 use crate::copy::{
-    CopyError, CopyStep, FilePlan, copy_file_checkpointed, copy_file_guarded, no_before_create,
-    no_before_publish, no_heartbeat, plan_file, prepare_file, unguarded,
+    CopyError, CopyStep, FilePlan, copy_file_checkpointed, no_before_create, no_before_publish,
+    no_heartbeat, plan_file, prepare_file, unguarded,
 };
 use crate::dry_run::{
     DryPrior, DryRun, NullClaimStore, PlannedAction, PlannedEntry, PlannedObject,
@@ -99,6 +99,8 @@ pub struct RunConfig {
     /// Cut 11b: where a dry resume copies the prior's claim store; `None` means `std::env::temp_dir()`; tests pass a
     /// fake directory.
     pub dry_temp_root: Option<PathBuf>,
+    /// The live counters a display samples; `None` outside the CLI's terminal case.
+    pub progress: Option<std::sync::Arc<crate::progress::Progress>>,
 }
 
 /// §101's heartbeat interval: 5 s.
@@ -119,6 +121,7 @@ impl std::fmt::Debug for RunConfig {
             .field("resume_verify", &self.resume_verify)
             .field("dry_run", &self.dry_run)
             .field("dry_temp_root", &self.dry_temp_root)
+            .field("progress", &self.progress.is_some())
             .finish()
     }
 }
@@ -318,7 +321,7 @@ pub(crate) fn tree_with<F: DestinationRoot>(
     };
     let opts =
         CopyOptions { operation_id: OperationId::new(cfg.operation_id.as_str()), ..opts.clone() };
-    let mut out = TreeOutcome::default();
+    let mut out = TreeOutcome { progress: cfg.progress.clone(), ..TreeOutcome::default() };
     // B1: the source side, then DEST and the identity pre-flight, before anything is created.
     let mut source = match prepare_source(fs, src_root, dst_root, MountPolicy::of(&opts)) {
         Ok(s) => s,
@@ -804,6 +807,14 @@ pub(crate) fn file_with<F: DestinationRoot>(
     };
     run.resumed = locked.resumed.clone();
     let opts = CopyOptions { operation_id: OperationId::new(&locked.state.operation_id), ..opts };
+    // The one file's size is the expected total, unless a resume makes the figure unreliable or the file is empty.
+    if let Some(p) = &cfg.progress
+        && !cfg.resume
+        && let Ok(m) = fs.metadata(src)
+        && m.len > 0
+    {
+        p.set_expected_bytes(m.len);
+    }
     // Step 6, under §99.
     let copied = {
         let guard = || {
@@ -830,6 +841,7 @@ pub(crate) fn file_with<F: DestinationRoot>(
                 &no_before_create,
                 &no_before_publish,
                 Some(Hook::LogFree { min_len: policy.min_len }),
+                cfg.progress.as_deref(),
             )
             .map(|(outcome, reuse)| {
                 if reuse.reused > 0 || reuse.discard.is_some() {
@@ -842,7 +854,7 @@ pub(crate) fn file_with<F: DestinationRoot>(
                 outcome
             })
         } else {
-            copy_file_guarded(
+            copy_file_checkpointed(
                 fs,
                 src,
                 &parent,
@@ -852,7 +864,10 @@ pub(crate) fn file_with<F: DestinationRoot>(
                 &beat,
                 &no_before_create,
                 &no_before_publish,
+                None,
+                cfg.progress.as_deref(),
             )
+            .map(|(outcome, _)| outcome)
         }
     }
     .map_err(|mut e| {

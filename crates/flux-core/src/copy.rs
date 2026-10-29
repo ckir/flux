@@ -805,6 +805,7 @@ pub(crate) fn stage_file<F: DestinationRoot>(
     before_create: &BeforeCreate<'_>,
     sync: SyncAt,
     ckpt: Option<Hook<'_, '_, F::Dir>>,
+    progress: Option<&crate::progress::Progress>,
 ) -> std::result::Result<Stage<F::Writer>, CopyError> {
     let temp = temp_name(name, &opts.operation_id);
 
@@ -934,6 +935,9 @@ pub(crate) fn stage_file<F: DestinationRoot>(
                 break 'stream Err(StreamFail::Discard(CopyStep::Stream, copy_code(&e), e));
             }
             bytes_copied += carry.len() as u64;
+            if let Some(p) = progress {
+                p.add_bytes(carry.len() as u64);
+            }
             if let Some(s) = sink.as_mut()
                 && let Err(e) = s.wrote(&carry, beat)
             {
@@ -955,6 +959,9 @@ pub(crate) fn stage_file<F: DestinationRoot>(
                 break 'stream Err(StreamFail::Discard(CopyStep::Stream, copy_code(&e), e));
             }
             bytes_copied += n as u64;
+            if let Some(p) = progress {
+                p.add_bytes(n as u64);
+            }
             // Cut 9h (spec 3.4): only a buffer already written is handed over (I1); the sink returns one at full
             // length to read into next. Without a sink `buf` is never taken.
             if let Some(s) = sink.as_mut() {
@@ -1183,6 +1190,7 @@ pub fn copy_file_guarded<F: DestinationRoot>(
         before_create,
         before_publish,
         None,
+        None,
     )
     .map(|(outcome, _)| outcome)
 }
@@ -1201,6 +1209,7 @@ pub(crate) fn copy_file_checkpointed<F: DestinationRoot>(
     before_create: &BeforeCreate<'_>,
     before_publish: &BeforePublish<'_>,
     ckpt: Option<Hook<'_, '_, F::Dir>>,
+    progress: Option<&crate::progress::Progress>,
 ) -> std::result::Result<(Outcome, Reuse), CopyError> {
     let mut staged = match stage_file(
         fs,
@@ -1213,6 +1222,7 @@ pub(crate) fn copy_file_checkpointed<F: DestinationRoot>(
         before_create,
         SyncAt::Staging,
         ckpt,
+        progress,
     )? {
         Stage::Skipped(outcome) => return Ok((outcome, Reuse::default())),
         Stage::Staged(staged) => staged,
@@ -1471,11 +1481,70 @@ mod tests {
             &no_before_create,
             sync,
             None,
+            None,
         ) {
             Ok(Stage::Staged(s)) => s,
             Ok(Stage::Skipped(_)) => panic!("unexpectedly skipped"),
             Err(e) => panic!("stage_file failed: {e:?}"),
         }
+    }
+
+    fn stage_counting(
+        fs: &FaultFs,
+        root: &<FaultFs as DestinationRoot>::Dir,
+        p: &crate::progress::Progress,
+    ) -> std::result::Result<Stage<<FaultFs as FileSystem>::Writer>, CopyError> {
+        stage_file(
+            fs,
+            Path::new("/src"),
+            root,
+            OsStr::new("dst"),
+            &opts(),
+            &unguarded,
+            &no_heartbeat,
+            &no_before_create,
+            SyncAt::Staging,
+            None,
+            Some(p),
+        )
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_bytes_already_written_counted() {
+        const K: u32 = 3;
+        let len = MIB;
+        let fs = FaultFs::new();
+        fs.write_file("/src", &vec![7u8; len]);
+        let root = fs.destination_root(Path::new("/")).unwrap();
+        fs.fail_write_nth("flux-partial", K, std::io::ErrorKind::StorageFull);
+        let p = crate::progress::Progress::new();
+        assert!(
+            copy_buffer_len(len as u64) * K as usize <= len,
+            "the source holds at least K buffers"
+        );
+        let e = match stage_counting(&fs, &root, &p) {
+            Err(e) => e,
+            Ok(_) => panic!("the failed write stops the copy"),
+        };
+        assert_eq!(e.cause.source.kind(), std::io::ErrorKind::StorageFull);
+        let s = p.snapshot();
+        assert_eq!(s.bytes, (K - 1) as u64 * copy_buffer_len(len as u64) as u64);
+        assert_eq!(s.copied, 0);
+    }
+
+    #[test]
+    fn a_clean_stage_counts_every_byte() {
+        let len = MIB + 123;
+        let fs = FaultFs::new();
+        fs.write_file("/src", &vec![9u8; len]);
+        let root = fs.destination_root(Path::new("/")).unwrap();
+        let p = crate::progress::Progress::new();
+        match stage_counting(&fs, &root, &p) {
+            Ok(Stage::Staged(_)) => {}
+            Ok(Stage::Skipped(_)) => panic!("unexpectedly skipped"),
+            Err(e) => panic!("stage_file failed: {e:?}"),
+        }
+        assert_eq!(p.snapshot().bytes, len as u64);
     }
 
     #[test]
@@ -1591,6 +1660,7 @@ mod tests {
             &no_before_create,
             SyncAt::Staging,
             Some(Hook::Logged(&fc)),
+            None,
         )
     }
 
@@ -1805,6 +1875,7 @@ mod tests {
                 &claim,
                 SyncAt::Staging,
                 Some(Hook::Logged(&fc)),
+                None,
             );
             assert!(matches!(staged, Ok(Stage::Staged(_))), "{label}");
             run.abandon();
@@ -3907,6 +3978,7 @@ mod tests {
             before_create,
             SyncAt::Staging,
             Some(Hook::Logged(&fc)),
+            None,
         )
     }
 
@@ -4168,6 +4240,7 @@ mod tests {
             &no_before_create,
             &no_before_publish,
             Some(Hook::Logged(&fc)),
+            None,
         )
         .unwrap_or_else(|e| panic!("copy failed: {e:?}"));
         assert_eq!(out.bytes_copied, 0);
@@ -4440,6 +4513,7 @@ mod tests {
             &no_before_create,
             &no_before_publish,
             Some(Hook::Logged(&fc)),
+            None,
         )
         .unwrap_or_else(|e| panic!("copy failed: {e:?}"));
         assert_eq!(out.bytes_copied, 0);
@@ -4535,6 +4609,7 @@ mod tests {
             &no_before_create,
             SyncAt::Staging,
             Some(Hook::LogFree { min_len: MIB as u64 }),
+            None,
         )
     }
 
@@ -4601,6 +4676,7 @@ mod tests {
             &no_before_create,
             SyncAt::Staging,
             Some(Hook::LogFree { min_len: MIB as u64 }),
+            None,
         )
         .err()
         .expect("the lost lock stops the sweep");
@@ -5439,6 +5515,7 @@ mod tests {
             &no_before_create,
             SyncAt::Staging,
             Some(Hook::Logged(&fc)),
+            None,
         )
     }
 

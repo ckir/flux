@@ -44,6 +44,7 @@ fn cfg() -> RunConfig {
         resume_verify: ResumeVerify::Chunks,
         dry_run: false,
         dry_temp_root: None,
+        progress: None,
     }
 }
 
@@ -6301,6 +6302,26 @@ mod checkpointing {
         assert!(out.checkpoint_discards.is_empty(), "{:?}", out.checkpoint_discards);
     }
 
+    // Final review I1. Mutant: the carry write in `stage_file` does not tick `Progress.bytes`.
+    #[test]
+    fn a_resume_over_a_diverged_chunk_counts_the_carried_bytes() {
+        let fs = big_fs(5 * MIB);
+        crashed_run(&fs);
+        // The checkpoints name 3 MiB; flip one byte inside the third MiB so that chunk no longer proves, and
+        // `decide` hands its source bytes back as the carry.
+        let mut diverged = pattern(5 * MIB)[..3 * MIB].to_vec();
+        diverged[2 * MIB + 10] ^= 0xFF;
+        fs.write_file(partial(), &diverged);
+        let p = crate::progress::Progress::new();
+        let c = RunConfig { progress: Some(p.clone()), ..resuming() };
+        let (r, _) = run_with(&fs, &c, &opts(), lazy(Durability::Normal));
+        let out = ok(&r);
+        published(&fs, 5 * MIB);
+        assert!(out.bytes_copied > 0, "{out:?}");
+        assert!(out.bytes_reused < 3 * MIB as u64, "the diverged chunk is not reused: {out:?}");
+        assert_eq!(p.snapshot().bytes, out.bytes_copied);
+    }
+
     // Task 9. Mutant: `note_reuse` records no discard when `reused == 0` (or drops `discard` on the unbatched path).
     #[test]
     fn a_resume_that_cannot_trust_its_partial_names_the_file_and_why() {
@@ -11265,4 +11286,178 @@ fn a_directory_removed_by_both_counts_once() {
     assert!(got.is_empty(), "{got:?}");
     assert_eq!(out.excluded, 1);
     assert!(!fs.exists("/p/dest/sub"));
+}
+
+#[test]
+fn a_clean_tree_copy_ticks_the_counters_to_the_outcome() {
+    let fs = fake();
+    let p = crate::progress::Progress::new();
+    let c = RunConfig { progress: Some(p.clone()), ..cfg() };
+    let (r, got) = run_tree(&fs, &c);
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    let s = p.snapshot();
+    assert_eq!(s.discovered, out.files_total);
+    assert_eq!(s.copied, out.files_copied);
+    assert_eq!((s.resumed, s.errors), (0, 0));
+    assert!(s.discovered > 0 && s.copied > 0, "{s:?}");
+    assert_eq!(s.bytes, out.bytes_copied);
+}
+
+#[test]
+fn an_overwriting_tree_copy_ticks_bytes_for_replaced_files() {
+    let fs = dest_fake();
+    fs.write_file("/p/dest/a", b"old and different");
+    let p = crate::progress::Progress::new();
+    let c = RunConfig { progress: Some(p.clone()), ..cfg() };
+    let (r, got) = run_tree_with(&fs, &c, &with_policy(ExistingPolicy::Overwrite));
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert!(out.files_overwritten >= 1, "{out:?}");
+    assert!(out.bytes_copied > 0);
+    assert_eq!(p.snapshot().bytes, out.bytes_copied);
+}
+
+#[test]
+fn a_strict_tree_copy_ticks_bytes_through_the_batch_path() {
+    let fs = fake();
+    let p = crate::progress::Progress::new();
+    let c = RunConfig { progress: Some(p.clone()), ..cfg() };
+    let (r, got) = run_tree_with(&fs, &c, &strict());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    // The batch path: each directory's notes are written by one `prepare_many` (as the neighbouring Strict tests).
+    let calls = calls(&fs);
+    assert_eq!(count(&calls, "claim_prepare_many("), 2, "{calls:?}");
+    let s = p.snapshot();
+    assert!(out.bytes_copied > 0);
+    assert_eq!(s.bytes, out.bytes_copied);
+    assert_eq!(s.copied, out.files_copied);
+}
+
+#[test]
+fn a_keyless_tree_copy_ticks_bytes_to_the_outcome() {
+    // A weak destination root keys no claims, so `a` takes the keyless branch of `copy_one`.
+    let fs = dest_fake();
+    fs.set_identity("/p/dest", FileIdentity::Weak(ObjectId { volume: 9, index: 9 }));
+    let p = crate::progress::Progress::new();
+    let c = RunConfig { progress: Some(p.clone()), ..cfg() };
+    let (r, got) = run_tree(&fs, &c);
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(fs.claim_count(), 1, "only sub/b is claimed: a took the keyless branch");
+    assert!(out.bytes_copied > 0);
+    assert_eq!(p.snapshot().bytes, out.bytes_copied);
+}
+
+#[test]
+fn a_single_file_copy_ticks_bytes_and_sets_the_expected_size() {
+    let fs = fake();
+    fs.write_file("/src/a", &[5u8; 777]);
+    let p = crate::progress::Progress::new();
+    let r = run_file(&fs, &RunConfig { progress: Some(p.clone()), ..cfg() });
+    assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+    let s = p.snapshot();
+    assert_eq!(s.bytes, 777);
+    assert_eq!(s.expected_bytes, Some(777));
+    assert_eq!((s.discovered, s.copied, s.resumed), (0, 0, 0));
+}
+
+#[test]
+fn a_zero_length_single_file_has_no_expected_size() {
+    let fs = fake();
+    fs.write_file("/src/a", b"");
+    let p = crate::progress::Progress::new();
+    let r = run_file(&fs, &RunConfig { progress: Some(p.clone()), ..cfg() });
+    assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+    assert_eq!(p.snapshot().expected_bytes, None);
+}
+
+#[test]
+fn a_resumed_single_file_has_no_expected_size() {
+    let fs = fake();
+    file_prior3(&fs, 5, None);
+    let p = crate::progress::Progress::new();
+    let r = run_file(&fs, &RunConfig { progress: Some(p.clone()), ..resume() });
+    assert!(r.stop.is_none() && matches!(r.copy, Some(Ok(_))), "{:?} {:?}", r.stop, r.copy);
+    assert!(matches!(r.resumed, Some(ResumeNote::Adopted { .. })), "{:?}", r.resumed);
+    assert_eq!(p.snapshot().expected_bytes, None);
+}
+
+#[test]
+fn a_resume_ticks_resumed_not_copied() {
+    let fs = resumable(100, b"o", 101, ClaimStatus::Created);
+    let p = crate::progress::Progress::new();
+    let c = RunConfig { progress: Some(p.clone()), ..resume() };
+    let (r, got) = run_tree_with(&fs, &c, &opts());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    let s = p.snapshot();
+    assert_eq!(out.files_resumed, 1);
+    assert_eq!(s.resumed, out.files_resumed);
+    assert_eq!(s.copied, out.files_copied);
+}
+
+#[test]
+fn a_resumed_symlink_ticks_resumed() {
+    // Built here: `link_only_src` plus a prior 5 holding an equal destination link and a `Created` claim on it.
+    let fs = link_only_src();
+    prior3(&fs, 5, OpState::Transferring);
+    fs.add_symlink_to("/p/dest/l", "/p/keep", flux_fs::LinkKind::Unspecified);
+    claimed(&fs, 5, "l", ClaimStatus::Created, "l");
+    let p = crate::progress::Progress::new();
+    let c = RunConfig { progress: Some(p.clone()), ..resume() };
+    let (r, got) = run_tree_with(&fs, &c, &opts());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert!(out.files_resumed >= 1, "{out:?}");
+    assert_eq!(p.snapshot().resumed, out.files_resumed);
+}
+
+#[test]
+fn an_update_tree_copy_ticks_skipped_for_current_files() {
+    let fs = FaultFs::new();
+    for d in ["/src", "/src/sub", "/p", "/p/dest", "/p/dest/sub"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    put(&fs, "/src/a", b"new", 20);
+    put(&fs, "/p/dest/a", b"old", 10); // newer source: replaced
+    put(&fs, "/src/d", b"new", 5);
+    put(&fs, "/p/dest/d", b"old", 99); // older, same size: skipped
+    put(&fs, "/src/sub/b", b"new", 30);
+    put(&fs, "/p/dest/sub/b", b"old", 30); // same time, same size: skipped
+    let p = crate::progress::Progress::new();
+    let c = RunConfig { progress: Some(p.clone()), ..cfg() };
+    let (r, got) = run_tree_with(&fs, &c, &with_policy(ExistingPolicy::Update));
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert!(out.files_skipped >= 1, "{out:?}");
+    assert_eq!(p.snapshot().skipped, out.files_skipped);
+}
+
+#[test]
+fn a_skip_existing_link_ticks_skipped() {
+    // `link_only_src` holds one symlink; an existing destination entry of that name makes `link_one` skip it.
+    let fs = link_only_src();
+    fs.create_dir(Path::new("/p/dest")).unwrap();
+    fs.write_file("/p/dest/l", b"already here");
+    let p = crate::progress::Progress::new();
+    let c = RunConfig { progress: Some(p.clone()), ..cfg() };
+    let (r, got) = run_tree_with(&fs, &c, &with_policy(ExistingPolicy::SkipExisting));
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert!(out.files_skipped >= 1, "{out:?}");
+    assert_eq!(p.snapshot().skipped, out.files_skipped);
+}
+
+#[test]
+fn a_run_without_a_handle_counts_as_before() {
+    let (r, _) = run_tree(&fake(), &cfg());
+    let plain = ok(&r);
+    let p = crate::progress::Progress::new();
+    let (r2, _) = run_tree(&fake(), &RunConfig { progress: Some(p), ..cfg() });
+    let with = ok(&r2);
+    assert!(plain.progress.is_none());
+    assert_eq!((plain.files_total, plain.files_copied), (with.files_total, with.files_copied));
+    assert!(plain.files_total > 0);
 }

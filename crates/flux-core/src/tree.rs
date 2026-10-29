@@ -13,9 +13,9 @@ pub use crate::checkpoint::Discard;
 use crate::checkpoint::{Checkpoints, FileCkpt, Hook};
 use crate::copy::{
     BeforeCreate, BeforePublish, CopyError, CopyStep, FilePlan, Guard, Heartbeat, PublishIntent,
-    Reuse, Stage, Staged, SyncAt, copy_file_checkpointed, copy_file_guarded, discard,
-    identity_gate, no_before_create, no_before_publish, no_heartbeat, plan_file, publish_staged,
-    split_destination, stage_file, sync_staged_many, unguarded, weaker,
+    Reuse, Stage, Staged, SyncAt, copy_file_checkpointed, discard, identity_gate, no_before_create,
+    no_before_publish, no_heartbeat, plan_file, publish_staged, split_destination, stage_file,
+    sync_staged_many, unguarded, weaker,
 };
 use crate::dry_run::{PlannedAction, PlannedEntry, PlannedObject, SkipReason};
 use crate::hardlinks::{Candidacy, anchor_parent, candidacy, shown, strong};
@@ -112,6 +112,42 @@ pub struct TreeOutcome {
     pub hardlink_weak: WeakIdentityWarnings,
     /// Cut 12: the degradations that are NOT weak identity, one count and first example per cause.
     pub hardlinks_unlinked: BTreeMap<UnlinkedWhy, DegradedGroup>,
+    /// The live counters a display samples; `None` outside the CLI's terminal case.
+    pub progress: Option<std::sync::Arc<crate::progress::Progress>>,
+}
+
+impl TreeOutcome {
+    /// Count one more entry the walk yielded, and tick the live view with it.
+    pub(crate) fn note_discovered(&mut self) {
+        self.files_total += 1;
+        if let Some(p) = &self.progress {
+            p.add_discovered();
+        }
+    }
+
+    /// Count one more file copied, and tick the live view with it.
+    pub(crate) fn note_copied(&mut self) {
+        self.files_copied += 1;
+        if let Some(p) = &self.progress {
+            p.add_copied();
+        }
+    }
+
+    /// Count one more file skipped by the existing-file policy, and tick the live view with it.
+    pub(crate) fn note_skipped(&mut self) {
+        self.files_skipped += 1;
+        if let Some(p) = &self.progress {
+            p.add_skipped();
+        }
+    }
+
+    /// Count one more entry resumed, and tick the live view with it.
+    pub(crate) fn note_resumed(&mut self) {
+        self.files_resumed += 1;
+        if let Some(p) = &self.progress {
+            p.add_resumed();
+        }
+    }
 }
 
 /// Cut 12: why a hardlink group member was copied independently when its identity was fine.
@@ -973,7 +1009,7 @@ fn file_root<F: DestinationRoot>(
     let cx = base.for_root(src_parent, identity, None);
     let RootState { names, claim_parent, fresh } = state;
     let mut batch = Batch::default();
-    out.files_total += 1;
+    out.note_discovered();
     let path = PathBuf::from(name);
     let walked = if reserved_path(&path) {
         let conflict = CopyError::at(CopyStep::Gate, reserved_conflict());
@@ -1208,7 +1244,7 @@ fn walk_into<F: DestinationRoot>(
                 stack.push(frame);
             }
             WalkEvent::File { path } => {
-                out.files_total += 1;
+                out.note_discovered();
                 if dry_top_level_flux(cx, stack, &path) {
                     dry_flux_entry_failure(stack, path, out, on_report);
                     continue;
@@ -1252,7 +1288,7 @@ fn walk_into<F: DestinationRoot>(
                 }
             }
             WalkEvent::Symlink { path } => {
-                out.files_total += 1;
+                out.note_discovered();
                 if dry_top_level_flux(cx, stack, &path) && cx.opts.links != Links::Skip {
                     dry_flux_entry_failure(stack, path, out, on_report);
                     continue;
@@ -1275,7 +1311,7 @@ fn walk_into<F: DestinationRoot>(
                 }
             }
             WalkEvent::Other { path } => {
-                out.files_total += 1;
+                out.note_discovered();
                 if live {
                     report(out, on_report, path, TreeFailureCause::SpecialFileSkipped);
                 }
@@ -1756,6 +1792,8 @@ fn copy_one<F: DestinationRoot>(
     let name_owned = path.file_name().expect("a walk path ends in a name").to_os_string();
     let name = name_owned.as_os_str();
     let src = cx.src_root.join(&path);
+    // Taken once, before any closure that makes the copy call: the keyless branch and both copies below share it.
+    let progress = out.progress.clone();
     let (Some(parent_id), Some(claims)) = (claim_parent, cx.claims) else {
         // No claims for this directory (a lockless copy, or an identity that cannot key them): exactly the cut 4b
         // behaviour. An existing name is a collision.
@@ -1791,7 +1829,7 @@ fn copy_one<F: DestinationRoot>(
             publish: Publish::NoReplace,
             ..cx.opts.clone()
         };
-        let published = copy_file_guarded(
+        let published = copy_file_checkpointed(
             cx.fs,
             &src,
             parent,
@@ -1801,7 +1839,10 @@ fn copy_one<F: DestinationRoot>(
             cx.beat,
             &no_before_create,
             &no_before_publish,
-        );
+            None,
+            progress.as_deref(),
+        )
+        .map(|(outcome, _)| outcome);
         return finish_copy(cx.key_prefix, path, published, out, on_report);
     };
     let target = match FluxPathKey::from_relative(&cx.keyed(&path)) {
@@ -1915,7 +1956,7 @@ fn copy_one<F: DestinationRoot>(
                             && resumed_complete(src_meta, &meta, cx.opts.preserve_times)
                             && resume_keeps(cx, &group, &target, &meta, &path, out, on_report)
                         {
-                            out.files_resumed += 1;
+                            out.note_resumed();
                             out.bytes_resumed += src_meta.len;
                             names.record_publication(
                                 &target,
@@ -1966,7 +2007,7 @@ fn copy_one<F: DestinationRoot>(
                 }
             };
             if let Some(len) = skip {
-                out.files_skipped += 1;
+                out.note_skipped();
                 out.bytes_skipped += len;
                 if let Some(group) = &group {
                     skipped_member(cx, group, &target, &meta, &path, out);
@@ -2132,6 +2173,7 @@ fn copy_one<F: DestinationRoot>(
                 &no_before_create,
                 before_publish,
                 fc.as_ref().map(Hook::Logged),
+                progress.as_deref(),
             );
             let (result, reuse) = split_reuse(result);
             let result = discard_note_on_failure(
@@ -2279,6 +2321,7 @@ fn copy_one<F: DestinationRoot>(
                 &before_create,
                 before_publish,
                 fc.as_ref().map(Hook::Logged),
+                progress.as_deref(),
             );
             let (result, reuse) = split_reuse(result);
             let result = discard_note_on_failure(
@@ -3018,7 +3061,7 @@ fn link_one<F: DestinationRoot>(
                         // Resumed only when the claim says `Created` AND the destination is an equal link; anything
                         // else falls through to the policy and republishes.
                         if r.status == ClaimStatus::Created && same_link(parent, &stored, &link) {
-                            out.files_resumed += 1;
+                            out.note_resumed();
                             names.record_publication(
                                 &target,
                                 Some(&stored),
@@ -3066,7 +3109,7 @@ fn link_one<F: DestinationRoot>(
                 }
             };
             if let Some(reason) = skip {
-                out.files_skipped += 1;
+                out.note_skipped();
                 if cx.dry_run {
                     let skipped = PlannedEntry {
                         object: PlannedObject::Symlink,
@@ -3643,6 +3686,8 @@ fn stage_into_batch<F: DestinationRoot>(
     }
     let name = path.file_name().expect("a walk path ends in a name");
     let opts = CopyOptions { existing: ExistingPolicy::Overwrite, publish, ..cx.opts.clone() };
+    // Cloned before the closure: `stage` runs twice with `flush_batch(.., out, ..)` between the runs.
+    let progress = out.progress.clone();
     let stage = || {
         stage_file(
             cx.fs,
@@ -3661,6 +3706,7 @@ fn stage_into_batch<F: DestinationRoot>(
                 SyncAt::Staging
             },
             fc.map(Hook::Logged),
+            progress.as_deref(),
         )
     };
     let staged = match stage() {
@@ -4321,7 +4367,7 @@ fn finish_copy(
     match result {
         Ok(o) => {
             debug_assert!(!o.skipped, "the tree never lets the copy path skip");
-            out.files_copied += 1;
+            out.note_copied();
             if o.verified {
                 out.files_verified += 1;
             }

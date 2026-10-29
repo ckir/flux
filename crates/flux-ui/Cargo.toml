@@ -7,3 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
+
+[dependencies]
+flux-core = { path = "../flux-core" }
+indicatif = { workspace = true }
+
+[dev-dependencies]
+indicatif = { workspace = true, features = ["in_memory"] }
