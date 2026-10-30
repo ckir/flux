@@ -190,9 +190,10 @@ fn a_warning_is_the_same_text_with_and_without_quiet() {
     let nope = d.path().join("nope");
     let loud = flux().arg("verify").arg(&src).arg(&nope).output().unwrap();
     let quiet = flux().args(["verify", "-q"]).arg(&src).arg(&nope).output().unwrap();
-    let want = format!("destination does not exist: {}", nope.display());
-    assert!(stderr(&loud).contains(&want), "{}", stderr(&loud));
-    assert!(stderr(&quiet).contains(&want), "{}", stderr(&quiet));
+    // Not the path itself: macOS prints the canonical `/private/var/...` form of a temp directory.
+    let want = "destination does not exist: ";
+    assert!(stderr(&loud).contains(want), "{}", stderr(&loud));
+    assert!(stderr(&quiet).contains(want), "{}", stderr(&quiet));
     let warning = |out: &Output| -> Vec<String> {
         stderr(out)
             .lines()
