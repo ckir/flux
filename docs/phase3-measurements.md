@@ -244,10 +244,31 @@ Rules written before any measurement (`docs/superpowers/plans/2026-10-30-phase3-
 ### Outcome
 
 - **Cut 1 scope, provisional:** batch the Normal-mode claim writes and reduce the lock-ownership checks (`Held::still_owned`, three calls per file today), on the single-worker pipeline the AGY-FIRST consult proposed. Both items are ablation upper bounds, not attributed shares, and the lock item is not robust across the replicate. The owner decides whether to confirm them before a design spec is written.
-- **A confirmation measurement is cheap and should come first:** a frame-pointer build (`-C force-frame-pointers=yes`) so that `perf --call-graph fp` can attribute the two paths directly, replacing the upper bounds with shares.
+- **A confirmation measurement is cheap and should come first (done, see the next section):** a frame-pointer build (`-C force-frame-pointers=yes`) so that `perf --call-graph fp` can attribute the two paths directly, replacing the upper bounds with shares.
 - **Separate cut, owner to scope:** a bounded directory listing (Rule 4).
 - **Worker pool:** nothing in this cut contradicts the AGY-FIRST design (workers stage, the coordinator owns claims, hardlinks, heartbeat, rename and log), but the serial fraction is unmeasured, so no speed-up is promised.
 - **Strict:** 7.5-10.3 s for the same tree and a 27% spread between runs; nothing here attributes it.
+
+### Attributed profile (frame-pointer build, added after the decision)
+
+The binary was rebuilt with `RUSTFLAGS="-C force-frame-pointers=yes"`, symbols kept and line tables on, in a separate target directory (`CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`; the repository's profile is unchanged). Three recordings of the same 10,000 x 4 KiB tree, Normal durability: `perf record -e cpu-clock -F 999 -g --call-graph fp`, destination removed and `sync` between them, no other tool call during the runs; the one-minute load average at the start was 1.95, and background load was uncontrolled. The call chains survived: `main` is in 99.8-99.95% of the samples (it was 0% before). Samples: 1,684, 2,002 and 2,151.
+
+Inclusive (`--children`) share of on-CPU samples; the wall-scaled column multiplies by 0.86, the on-CPU fraction of the earlier warm runs (it was not re-measured for these recordings, so treat it as approximate):
+
+| Frame | Rec. 1 | Rec. 2 | Rec. 3 | Wall-scaled |
+|---|---|---|---|---|
+| `insert_if_absent` | 16.39% | 16.88% | 16.92% | 14.1-14.6% |
+| claim-store `flush` | 4.16% | 6.29% | 4.60% | 3.6-5.4% |
+| Rule 1 path (the two added) | 20.55% | 23.17% | 21.52% | 17.7-19.9% |
+| `still_owned` (Rule 2) | 22.51% | 20.03% | 18.64% | 16.0-19.4% |
+| `stage_file` (context) | 53.09% | 49.65% | 52.16% | |
+
+- **Rule 1 holds with an attributed share**, in all three recordings, at 17.7-19.9% of wall time against the 15% threshold. It is close to the line: `insert_if_absent` alone is 14.1-14.6% scaled, under 15%, so the outcome depends on counting `flush` as the rule's text says. The `flush` row used is the one equal to its `drop_glue<RefMut<dyn ClaimStore>>` parent (4.16, 6.29, 4.60%), which attributes it to the claim store; the second `flush` row (2.55, 5.14, 3.25%) is redb's internal one. I did not open the caller chains to prove this.
+- **Rule 2 holds with an attributed share**, in all three recordings, at 16.0-19.4% against 10%. The ablation had shown a replicate round at 6.2% and called the rule not robust; the profile does not reproduce that low value, so the "not robust" flag is withdrawn on this evidence. The 16-19% includes the checks made outside `stage_file` as well as inside it, and the symbol is inlined, so it covers its `fstat` and `pread` kernel time too.
+- The two shares are not additive: whether `insert_if_absent` and `still_owned` overlap in any recording was not checked.
+- `p` for Rule 3 is still not computed (the lock checks nested inside `stage_file` were not separated), which does not matter while Rules 1 and 2 both fire.
+- Not measured: the effect of the change (a profile share is an upper bound on the gain, `1 / (1 - s)`: about 1.2x for 17.7% and 1.24x for 19.9%), Strict, other filesystems.
+- Raw `perf.data` files are session scratch and are not kept in the repository.
 
 ### Plan defects found while executing (for the PR body)
 
