@@ -163,6 +163,7 @@ jobs:
         with:
           python-version: "3.14"
       - run: python -W error -m unittest discover -s benches/publish -p "test_*.py"
+      - run: python -W error -m unittest discover -s benches/phase3 -p "test_*.py"
 
   test:
     # Flux is a filesystem engine: hardlinks, symlinks, sparse files, reflinks and
