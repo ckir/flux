@@ -69,6 +69,8 @@ fn quiet_clean_copy_prints_nothing() {
     let out = flux().args(["copy", "-q"]).arg(src.join("a")).arg(&one).output().unwrap();
     assert_eq!(code(&out), 0);
     assert!(out.stdout.is_empty() && out.stderr.is_empty(), "{}", stderr(&out));
+    // Quiet silences the output, not the copy.
+    assert_eq!(std::fs::read(&one).unwrap(), b"A");
 }
 
 #[cfg(unix)]
@@ -162,6 +164,9 @@ fn quiet_help_states_the_rule() {
     let out = flux().args(["copy", "--help"]).output().unwrap();
     let help = stdout(&out);
     assert!(help.contains("cause of a non-zero exit"), "{help}");
+    // The whole rule: all four clauses, to the closing sentence.
+    let rule = "Print only the cause of a non-zero exit, warnings, the whole output of a `--dry-run`, and `--json` objects; a clean run prints nothing. Cannot be combined with -v";
+    assert!(help.contains(rule), "{help}");
     assert!(!help.contains("summary line and the dry-run notes"), "{help}");
 }
 
@@ -175,6 +180,27 @@ fn quiet_verify_of_an_absent_destination_keeps_the_notice() {
     let so = stdout(&out);
     assert!(so.lines().any(|l| l.starts_with("missing: a")), "{so}");
     assert!(!so.contains("matched,") && !stderr(&out).contains("matched,"), "no summary: {so}");
+}
+
+#[test]
+fn a_warning_is_the_same_text_with_and_without_quiet() {
+    // The absent-destination notice is a warning (design 5.3(b)); a process test cannot force the others cheaply.
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let nope = d.path().join("nope");
+    let loud = flux().arg("verify").arg(&src).arg(&nope).output().unwrap();
+    let quiet = flux().args(["verify", "-q"]).arg(&src).arg(&nope).output().unwrap();
+    let want = format!("destination does not exist: {}", nope.display());
+    assert!(stderr(&loud).contains(&want), "{}", stderr(&loud));
+    assert!(stderr(&quiet).contains(&want), "{}", stderr(&quiet));
+    let warning = |out: &Output| -> Vec<String> {
+        stderr(out)
+            .lines()
+            .filter(|l| l.contains("destination does not exist"))
+            .map(str::to_owned)
+            .collect()
+    };
+    assert_eq!(warning(&quiet), warning(&loud));
 }
 
 #[test]
@@ -325,7 +351,8 @@ fn quiet_cleanup_clean_prints_nothing() {
 fn every_nonzero_exit_prints_a_cause_under_quiet() {
     let d = TempDir::new().unwrap();
     let src = tree_in(d.path());
-    let mut runs: Vec<(&str, Output)> = Vec::new();
+    // (case, the first line of the cause starts with, whether it is on stdout (verify's records) or stderr)
+    let mut runs: Vec<(&str, &str, bool, Output)> = Vec::new();
     #[cfg(unix)]
     {
         let (f, to) = (d.path().join("locked"), d.path().join("locked-copy"));
@@ -333,6 +360,8 @@ fn every_nonzero_exit_prints_a_cause_under_quiet() {
         if make_unreadable(&f) {
             runs.push((
                 "unreadable file",
+                "PERMISSION_DENIED",
+                false,
                 flux().args(["copy", "-q"]).arg(&f).arg(&to).output().unwrap(),
             ));
         }
@@ -340,11 +369,15 @@ fn every_nonzero_exit_prints_a_cause_under_quiet() {
     // A containment refusal: a tree copied into itself.
     runs.push((
         "containment",
+        "SAFETY_REJECTED",
+        false,
         flux().args(["copy", "-q"]).arg(&src).arg(src.join("sub").join("inside")).output().unwrap(),
     ));
     // A usage error.
     runs.push((
         "usage",
+        "error:",
+        false,
         flux()
             .args(["copy", "-q", "--resume-verify=metadata"])
             .arg(&src)
@@ -357,22 +390,30 @@ fn every_nonzero_exit_prints_a_cause_under_quiet() {
     std::fs::write(vd.join("a"), b"Z").unwrap();
     runs.push((
         "verify mismatch",
+        "mismatched: a: VERIFY_MISMATCH",
+        true,
         flux().args(["verify", "-q"]).arg(&vs).arg(&vd).output().unwrap(),
     ));
     // A cleanup refusal: the destination's parent does not exist.
     runs.push((
         "cleanup refusal",
+        "IO_ERROR",
+        false,
         flux()
             .args(["cleanup", "-q"])
             .arg(d.path().join("no").join("such").join("dst"))
             .output()
             .unwrap(),
     ));
-    for (name, out) in &runs {
+    for (name, taxonomy, on_stdout, out) in &runs {
         let c = code(out);
         assert_ne!(c, 0, "{name}: stderr {} stdout {}", stderr(out), stdout(out));
-        let said = stderr(out).lines().chain(stdout(out).lines()).any(|l| !l.trim().is_empty());
-        assert!(said, "{name} (exit {c}) printed no cause");
+        let text = if *on_stdout { stdout(out) } else { stderr(out) };
+        let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        assert!(
+            first.starts_with(taxonomy),
+            "{name} (exit {c}): first line {first:?}, wanted {taxonomy}"
+        );
     }
 }
 

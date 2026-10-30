@@ -11696,10 +11696,14 @@ mod op_events {
         };
         let before = crate::oplog::built();
         let fs = build();
+        assert!(!crate::oplog::enabled(), "logging reports enabled with no subscriber");
         let (r, got) = run_tree(&fs, &cfg());
         assert_eq!(ok(&r).files_copied, 3);
         assert!(got.is_empty(), "{got:?}");
         assert_eq!(crate::oplog::built(), before, "an argument was built with no subscriber");
+        // Logging off changes nothing about the copy itself.
+        assert_eq!(fs.read_file("/p/dest/a").as_deref(), Some(&b"A"[..]));
+        assert_eq!(fs.read_file("/p/dest/sub/b").as_deref(), Some(&b"BB"[..]));
 
         // The SAME run with a subscriber builds them and emits the events.
         let fs = build();
@@ -11707,6 +11711,21 @@ mod op_events {
         assert_eq!(ok(&r).files_copied, 3);
         assert_eq!(events.len(), 4, "{events:?}");
         assert_eq!(crate::oplog::built(), before + 4);
+    }
+
+    #[test]
+    fn engine_diagnostics_are_debug_and_trace_and_only_the_op_events_are_info() {
+        let fs = fake();
+        let ((r, got), tagged) = crate::oplog::testing::capture_tagged(|| run_tree(&fs, &cfg()));
+        ok(&r);
+        assert!(got.is_empty(), "{got:?}");
+        let tags: Vec<&str> = tagged.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(tags.iter().any(|t| t.starts_with("DEBUG ")), "no DEBUG event: {tags:?}");
+        assert!(tags.iter().any(|t| t.starts_with("TRACE ")), "no TRACE event: {tags:?}");
+        for t in tags.iter().filter(|t| t.ends_with(" flux::op")) {
+            assert_eq!(*t, "INFO flux::op");
+        }
+        assert!(tags.contains(&"INFO flux::op"), "{tags:?}");
     }
 
     #[cfg(unix)]

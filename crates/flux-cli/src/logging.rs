@@ -508,6 +508,46 @@ mod tests {
     }
 
     #[test]
+    fn the_formatter_escapes_a_raw_control_character_in_an_op_path() {
+        // A hand-built event: its `path` is a plain string, not an `EscapedPath`, so only the formatter can escape it.
+        let mem = Mem::default();
+        tracing::subscriber::with_default(build(v(1, false), mem.clone()), || {
+            tracing::info!(target: "flux::op", action = "copied", path = "x\u{1b}[2Ky");
+        });
+        assert_eq!(mem.text(), "    Copied x\\u{1b}[2Ky\n");
+        assert!(!mem.text().contains('\x1b'));
+    }
+
+    #[test]
+    fn the_formatter_escapes_a_raw_control_character_in_an_op_link_target() {
+        let mem = Mem::default();
+        tracing::subscriber::with_default(build(v(1, false), mem.clone()), || {
+            tracing::info!(target: "flux::op", action = "linked", path = "l", to = "t\u{1b}x");
+        });
+        assert_eq!(mem.text(), "    Linked l -> t\\u{1b}x\n");
+        assert!(!mem.text().contains('\x1b'));
+    }
+
+    #[test]
+    fn a_write_with_several_lines_delivers_each_whole_line_once_in_order() {
+        let (got, sink) = collecting_sink();
+        set_display_sink(Some(sink));
+        let mut w = LineWriter::new().make_writer();
+        assert!(w.write_all(b"one\ntwo\nthree\n").is_ok());
+        assert_eq!(got.lock().map(|g| g.clone()).unwrap_or_default(), ["one", "two", "three"]);
+        // A line split across two writes goes out once, when its newline arrives.
+        assert!(w.write_all(b"par").is_ok());
+        assert_eq!(got.lock().map(|g| g.len()).unwrap_or_default(), 3);
+        assert!(w.write_all(b"tial\n").is_ok());
+        drop(w);
+        set_display_sink(None);
+        assert_eq!(
+            got.lock().map(|g| g.clone()).unwrap_or_default(),
+            ["one", "two", "three", "partial"]
+        );
+    }
+
+    #[test]
     fn install_twice_does_not_panic() {
         install(v(0, false));
         install(v(3, false));

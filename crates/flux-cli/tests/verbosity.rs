@@ -372,7 +372,33 @@ fn resume_with_different_verbosity_is_accepted() {
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     let e = stderr(&out);
     assert!(!e.contains("RESUMABLE") && !e.contains("INVALID"), "{e}");
+    // The resumed run still prints its verb lines.
+    assert!(e.lines().any(is_verb_line), "no verb line on a resumed -v run: {e}");
     let reference = flux().arg("copy").arg(&src).arg(d.path().join("ref")).output().unwrap();
     assert_eq!(code(&reference), 0);
     assert_eq!(tree(&dst), tree(&d.path().join("ref")));
+}
+
+/// The verb lines of `args` run on a copy of `src` into `dst`, with `dst` (if named) replaced by `DST`.
+fn verb_lines_of(args: &[&str], src: &Path, dst: &Path) -> Vec<String> {
+    let out = flux().args(args).arg(src).arg(dst).output().unwrap();
+    assert_eq!(code(&out), 0, "{args:?}: {}", stderr(&out));
+    let root = dst.display().to_string();
+    stderr(&out).lines().filter(|l| is_verb_line(l)).map(|l| l.replace(&root, "DST")).collect()
+}
+
+#[test]
+fn a_leading_v_equals_a_trailing_v() {
+    let d = TempDir::new().unwrap();
+    assert!(sample(d.path(), false));
+    let src = d.path().join("src");
+    for flag in ["-v", "-vv"] {
+        let (d1, d2) =
+            (d.path().join(format!("lead{flag}")), d.path().join(format!("trail{flag}")));
+        let lead = verb_lines_of(&[flag, "copy"], &src, &d1);
+        let trail = verb_lines_of(&["copy", flag], &src, &d2);
+        assert!(!lead.is_empty(), "a leading {flag} printed no verb line");
+        assert_eq!(lead, trail, "{flag} before and after the subcommand differ");
+        assert_eq!(tree(&d1), tree(&d2));
+    }
 }

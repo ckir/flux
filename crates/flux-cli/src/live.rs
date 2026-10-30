@@ -216,6 +216,17 @@ mod tests {
     }
 
     #[test]
+    fn finish_takes_the_log_route_back_from_the_display() {
+        // `has_display_sink` is the route `deliver` takes: a sink registered sends log lines to the bar, none to stderr.
+        let term = InMemoryTerm::new(20, 80);
+        let mut progress = None;
+        let live = Live::for_copy(false, false, false, target(&term), plain, &mut progress);
+        assert!(crate::logging::has_display_sink());
+        live.finish();
+        assert!(!crate::logging::has_display_sink());
+    }
+
+    #[test]
     fn a_disabled_live_writes_exactly_the_lines_it_is_given() {
         let term = InMemoryTerm::new(20, 80);
         let live = Live::start(false, target(&term), plain);
