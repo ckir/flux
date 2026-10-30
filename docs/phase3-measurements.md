@@ -149,3 +149,27 @@ The inferred part: nothing above is inferred from call patterns; every
 attribution is from a resolved stack. One caveat is that identical-code folding
 and inlining in an LTO build can attach a shared leaf to several callers, so the
 leaf names in a stack were read with their callers, not alone.
+
+## Peak memory against directory size
+
+Method. Binary: the symbol-carrying release build of commit 8f0e7c5 (Task 2), reused without rebuilding. Fixtures built by `benches/phase3/make_tree.py` on ext4 under `target/bench-data` (git-ignored): `flat` with 100,000 entries (`rss-flat-100k`) and 500,000 entries (`rss-flat-500k`), and `small` with 10,000 files of 4096 bytes in 100 directories (`rss-small-10k`). Inode headroom before building: 35,972,739 free of 37,506,560 (need about 1.1 million). Each fixture was run three times as a full copy and three times with `--dry-run`, the destination `rss-dst` absent before each run and removed after it.
+
+Commands: `/usr/bin/time -v flux copy SRC DST` and `/usr/bin/time -v flux copy --dry-run SRC DST`; the figure is `Maximum resident set size (kbytes)` (KiB).
+
+| Fixture | Mode | Run 1 | Run 2 | Run 3 | Median (KiB) |
+|---|---|---|---|---|---|
+| flat 100,000 | full copy | 56256 | 56216 | 56364 | 56256 |
+| flat 100,000 | --dry-run | 14004 | 14000 | 13896 | 14000 |
+| flat 500,000 | full copy | 282156 | 282356 | 282296 | 282296 |
+| flat 500,000 | --dry-run | 43712 | 43788 | 43684 | 43712 |
+| small 10,000 | full copy | 6472 | 6644 | 6416 | 6472 |
+| small 10,000 | --dry-run | 4980 | 4984 | 4968 | 4980 |
+
+Slope = (median RSS at 500k - median RSS at 100k) * 1024 / 400,000, in bytes per entry (denominator: 400,000 entries):
+
+- `--dry-run`: (43712 - 14000) * 1024 / 400,000 = 76.1 bytes per entry.
+- full copy: (282296 - 56256) * 1024 / 400,000 = 578.7 bytes per entry.
+
+Not interpreted here. `--dry-run` on a flat tree works: it prints one `action=would_copy` line per file on stderr and exits 0.
+
+Peak RSS is not a wall-clock figure; no timing is claimed in this section.
