@@ -82,15 +82,11 @@ impl NameIndex {
         }
     }
 
-    // Unused until the tree walker calls it (the next task of the plan).
-    #[allow(dead_code)]
     /// A directory this run created: empty listing, UNTRACKED (records nothing, is never read).
     pub(crate) fn for_created_dir() -> Self {
         Self { tracked: false, ..Self::for_new_dir() }
     }
 
-    // Unused until the tree walker calls it (the next task of the plan).
-    #[allow(dead_code)]
     /// The index for a destination directory frame.
     ///
     /// - `fresh`: `for_created_dir()`, no read (whatever `listed` is).
@@ -106,9 +102,8 @@ impl NameIndex {
         }
     }
 
-    // Unused until the tree walker calls it (the next task of the plan).
-    #[allow(dead_code)]
     /// Whether this index records publications (false for a directory this run created).
+    #[cfg(test)]
     pub(crate) fn is_tracked(&self) -> bool {
         self.tracked
     }
@@ -336,7 +331,7 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "an untracked index is never read")]
     fn a_created_dirs_index_is_never_resolved() {
         let fs = fs_with(&["x"]);
         let d = fs.destination_root(Path::new("/d")).unwrap();
@@ -345,7 +340,7 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "an untracked index is never read")]
     fn a_created_dirs_index_is_never_asked_for_an_owner() {
         let _ = NameIndex::for_created_dir().owner(OsStr::new("x"));
     }
