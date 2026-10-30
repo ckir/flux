@@ -173,3 +173,55 @@ Slope = (median RSS at 500k - median RSS at 100k) * 1024 / 400,000, in bytes per
 Not interpreted here. `--dry-run` on a flat tree works: it prints one `action=would_copy` line per file on stderr and exits 0.
 
 Peak RSS is not a wall-clock figure; no timing is claimed in this section.
+
+## Wall-time attribution of the small-file Normal copy
+
+Fixture: 10,000 files of 4096 bytes in 100 directories (`make_tree.py small`), `flux copy SRC DST --durability normal`, ext4, warm page cache, binary of commit 8f0e7c5 built with symbols. Timings are wall-clock figures taken on a machine that was NOT controlled: before the runs the machine read 6-8% busy at idle (the session's own `claude`, `agy`, `clavity-ls` and `Xorg` processes, plus services nobody here controls), and the idleness probe was shown to see load (the same probe read 20.2% with one `yes > /dev/null` running). No subagent was running. Every run used a fresh destination removed afterwards, with `sync` run outside the timed region.
+
+### Baseline wall time (Step 3)
+
+| run | durability | `duration_ms` | user (s) | sys (s) | user+sys / elapsed |
+|---|---|---|---|---|---|
+| 1 (cold, discarded) | normal | 2984 | 0.90 | 1.66 | 0.856 |
+| 2 (warm 1) | normal | 2902 | 0.89 | 1.61 | 0.862 |
+| 3 (warm 2) | normal | 2821 | 0.87 | 1.57 | 0.865 |
+| 1 (cold, discarded) | strict | 10275 | 1.86 | 12.05 | |
+| 2 (warm 1) | strict | 7507 | 1.35 | 7.28 | |
+| 3 (warm 2) | strict | 9803 | 1.63 | 10.77 | |
+
+Normal: warm figures 2902 and 2821 ms (range 2821-2902), about 0.28-0.29 ms per file, with roughly 86% of the elapsed time on CPU and about two thirds of the CPU time in the kernel. Strict varies by 27% between runs (7507-10275 ms), so no Strict figure is used by any rule.
+
+### `perf` attribution (Steps 4 and 5): UNRESOLVED
+
+Two recordings with the plan's command (`perf record -e cpu-clock -F 999 -g --call-graph dwarf`) and two more with a 64 KiB stack dump (`--call-graph dwarf,65528`) all lost their call chains:
+
+| recording | samples | `main` in chain | `copy_one`/`walk_into`/`run_tree` in chain | `stage_file` | `still_owned` | leaf frame `[unknown]` (kernel) |
+|---|---|---|---|---|---|---|
+| default stack, 1 | 2700 | 0 (0.0%) | 6 (0.2%) | 5 | 0 | |
+| 64 KiB stack, 1 | 2466 | 0 (0.0%) | 13 (0.5%) | 24 | 6 | |
+| 64 KiB stack, 2 | 2730 | 0 (0.0%) | 38 (1.4%) | 32 | 8 | 1952 of 2670 (73%) |
+
+Kernel symbols are restricted on this machine (`kptr_restrict`), user chains stop within 13-17 frames of the leaf, and the root-most frame is `[unknown]` in 1257 of 2670 samples. No inclusive share of `insert_if_absent`, `flush`, `still_owned`, `stage_file` or `getdents` can be read from these recordings, so by Rule 5 every perf row is UNRESOLVED, and no wall-scaled perf share is reported. No lock-check share nested under `stage_file` could be measured either (0 samples).
+
+Step 5 cross-check of the ablation against the Task 2 census: the lock check costs 3.2 `newfstatat` and 6.4 `pread64` per file (strace of the lock-ablated binary on 1,000 files: stat family 7425 -> 4222, `pread64`+`read` 8420 -> 2014, everything else unchanged), about 9.6 of the roughly 19 syscalls per file, which is consistent with a double-digit time share. The claim-store commit under Normal makes almost no per-file syscalls; the claims-ablated binary (stat and read counts unchanged) drops `pwrite64` from 1205 to 118, about 11 fewer per directory, which are the writes of the directory-end `flush`.
+
+### Ablation (Step 6)
+
+Two throwaway builds from scratch worktrees (never committed): `RedbClaimStore::insert_if_absent` returning `Ok(ClaimOutcome::Inserted)` right after `self.unsynced = after` (claims), and `Held::still_owned` returning `Ok(true)` as its first statement (lock; the type is `Held`, `crates/flux-core/src/lock/held.rs:99`). Timed in rounds, each round running claims, lock and an unmodified control one after the other. Rounds 1-3 are the plan's set (round 1 cold, discarded); rounds 4-6 are a replicate added after the control drifted. Shares below are against the control of the SAME round.
+
+| round | control (ms) | claims-ablated (ms) | claims share | lock-ablated (ms) | lock share |
+|---|---|---|---|---|---|
+| 1 (cold) | 2944 | 2231 | 24.2% | 2781 | 5.5% |
+| 2 | 2423 | 1982 | 18.2% | 1779 | 26.6% |
+| 3 | 2225 | 1530 | 31.2% | 1746 | 21.5% |
+| 4 | 2911 | 1861 | 36.1% | 2234 | 23.3% |
+| 5 | 2658 | 1776 | 33.2% | 2492 | 6.2% |
+| 6 | 2904 | 2313 | 20.4% | 2411 | 17.0% |
+
+Plan pairing (ablated warm runs 2 and 3 against the Step 3 baseline runs 2 and 3, 2902 and 2821 ms): claims 31.7% and 45.8%, lock 38.7% and 38.1%. These overstate the shares: the control itself moved from 2944 to 2225 ms inside rounds 1-3 and back to 2911 ms in round 4, so a baseline taken minutes earlier is not comparable. The same-round control is the figure to use.
+
+Warm rounds 2-6 against their controls: claims median 31.2% (range 18.2-36.1%), lock median 21.5% (range 6.2-26.6%). Two lock rounds (1 and 5) fall below 10%. The ablation removes correctness work as well (the claim record, the ownership check), so every figure is an UPPER bound on the real share. The run-to-run spread is far above 5 percentage points for both rows.
+
+### What this section does not establish
+
+Windows, macOS, spinning or networked storage, files larger than 4 KiB, a cold page cache (no root, `drop_caches` was not run), and any Strict attribution. The background load was uncontrolled and drifted visibly during the session. No decision rule is applied here; Task 5 does that.
