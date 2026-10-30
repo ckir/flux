@@ -52,7 +52,7 @@ the numbers below is a speed claim.
 | `mkdirat` | 0.0 | 0.0 | 0.0 | 0.0 | 104 |
 
 Rows group the calls named in the brief; in this trace the stat family was `statx` and `newfstatat`, the rename family was `renameat2` (plus 3 `renameat`), and `fchmod` (not `fchmodat`) was used. Other calls (`close`, `fstat`, `unlinkat`,
-`readlink`, `futex`, ...) are in the raw `strace-*.txt` files and are not part of
+`readlink`, `futex`, ...) are in the raw `strace-*.txt` files (kept only in the session scratchpad, not in the repository) and are not part of
 the requested column list.
 
 ### Raw counts (1,000 / 2,000 files)
@@ -152,7 +152,7 @@ leaf names in a stack were read with their callers, not alone.
 
 ## Peak memory against directory size
 
-Method. Binary: the symbol-carrying release build of commit 8f0e7c5 (Task 2), reused without rebuilding. Fixtures built by `benches/phase3/make_tree.py` on ext4 under `target/bench-data` (git-ignored): `flat` with 100,000 entries (`rss-flat-100k`) and 500,000 entries (`rss-flat-500k`), and `small` with 10,000 files of 4096 bytes in 100 directories (`rss-small-10k`). Inode headroom before building: 35,972,739 free of 37,506,560 (need about 1.1 million). Each fixture was run three times as a full copy and three times with `--dry-run`, the destination `rss-dst` absent before each run and removed after it.
+Method. Binary: the symbol-carrying release build of commit 8f0e7c5 (Task 2), reused without rebuilding. Fixtures built by `benches/phase3/make_tree.py` on ext4 under `target/bench-data` (git-ignored); the `flat` fixtures hold ZERO-BYTE files, and during the measured runs stderr (one `action=would_copy` line per file under `--dry-run`) went to a file: `flat` with 100,000 entries (`rss-flat-100k`) and 500,000 entries (`rss-flat-500k`), and `small` with 10,000 files of 4096 bytes in 100 directories (`rss-small-10k`). Inode headroom before building: 35,972,739 free of 37,506,560 (need about 1.1 million). Each fixture was run three times as a full copy and three times with `--dry-run`, the destination `rss-dst` absent before each run and removed after it.
 
 Commands: `/usr/bin/time -v flux copy SRC DST` and `/usr/bin/time -v flux copy --dry-run SRC DST`; the figure is `Maximum resident set size (kbytes)` (KiB).
 
@@ -189,7 +189,7 @@ Fixture: 10,000 files of 4096 bytes in 100 directories (`make_tree.py small`), `
 | 2 (warm 1) | strict | 7507 | 1.35 | 7.28 | |
 | 3 (warm 2) | strict | 9803 | 1.63 | 10.77 | |
 
-Normal: warm figures 2902 and 2821 ms (range 2821-2902), about 0.28-0.29 ms per file, with roughly 86% of the elapsed time on CPU and about two thirds of the CPU time in the kernel. Strict varies by 27% between runs (7507-10275 ms), so no Strict figure is used by any rule.
+Normal: warm figures 2902 and 2821 ms (range 2821-2902), about 0.28-0.29 ms per file, with roughly 86% of the elapsed time on CPU and about two thirds of the CPU time in the kernel. Strict varies by 27% across the three runs (7507-10275 ms; 23% between the two warm runs, 7507 and 9803 ms), so no Strict figure is used by any rule.
 
 ### `perf` attribution (Steps 4 and 5): UNRESOLVED
 
@@ -198,12 +198,13 @@ Two recordings with the plan's command (`perf record -e cpu-clock -F 999 -g --ca
 | recording | samples | `main` in chain | `copy_one`/`walk_into`/`run_tree` in chain | `stage_file` | `still_owned` | leaf frame `[unknown]` (kernel) |
 |---|---|---|---|---|---|---|
 | default stack, 1 | 2700 | 0 (0.0%) | 6 (0.2%) | 5 | 0 | |
+| default stack, 2 | 2342 | 0 (0.0%) | 6 (0.3%) | 10 | 6 | |
 | 64 KiB stack, 1 | 2466 | 0 (0.0%) | 13 (0.5%) | 24 | 6 | |
-| 64 KiB stack, 2 | 2730 | 0 (0.0%) | 38 (1.4%) | 32 | 8 | 1952 of 2670 (73%) |
+| 64 KiB stack, 2 | 2730 (2670 with a non-empty chain; the percentages use 2670) | 0 (0.0%) | 38 (1.4%) | 32 | 8 | 1758 kernel-address leaves of 2670 (66%); 1952 (73%) counting every `[unknown]` leaf |
 
 Kernel symbols are restricted on this machine (`kptr_restrict`), user chains stop within 13-17 frames of the leaf, and the root-most frame is `[unknown]` in 1257 of 2670 samples. No inclusive share of `insert_if_absent`, `flush`, `still_owned`, `stage_file` or `getdents` can be read from these recordings, so by Rule 5 every perf row is UNRESOLVED, and no wall-scaled perf share is reported. No lock-check share nested under `stage_file` could be measured either (0 samples).
 
-Step 5 cross-check of the ablation against the Task 2 census: the lock check costs 3.2 `newfstatat` and 6.4 `pread64` per file (strace of the lock-ablated binary on 1,000 files: stat family 7425 -> 4222, `pread64`+`read` 8420 -> 2014, everything else unchanged), about 9.6 of the roughly 19 syscalls per file, which is consistent with a double-digit time share. The claim-store commit under Normal makes almost no per-file syscalls; the claims-ablated binary (stat and read counts unchanged) drops `pwrite64` from 1205 to 118, about 11 fewer per directory, which are the writes of the directory-end `flush`.
+Step 5 cross-check of the ablation against the Task 2 census: the lock check costs 3.0 `newfstatat` and 6.0 `pread64` per file (the 100-file stack census and the per-file slope; the lock-ablated binary on 1,000 files drops 3,203 stat and 6,406 read calls, which also contains the per-directory checks: stat family 7425 -> 4222, `pread64`+`read` 8420 -> 2014, everything else unchanged). That is about 9.0 of the roughly 26 syscalls a small Normal file makes (26.0 per file by the 1,000 -> 2,000 slope of all calls, 25.0 without `futex`), a third by count. A count share is not a time share, so this does not contradict a double-digit time share but does not show one either. The claim-store commit under Normal makes almost no per-file syscalls; the claims-ablated binary (stat and read counts unchanged) drops `pwrite64` from 1205 to 118, about 11 fewer per directory, which is INFERRED to be the directory-end `flush` (no stack was taken of it), and about 1,000 `futex` calls (1106 to 106).
 
 ### Ablation (Step 6)
 
@@ -224,7 +225,7 @@ Warm rounds 2-6 against their controls: claims median 31.2% (range 18.2-36.1%), 
 
 ### What this section does not establish
 
-Windows, macOS, spinning or networked storage, files larger than 4 KiB, a cold page cache (no root, `drop_caches` was not run), and any Strict attribution. The background load was uncontrolled and drifted visibly during the session. No decision rule is applied here; Task 5 does that.
+Windows, macOS, spinning or networked storage, files larger than 4 KiB, a cold page cache (no root, `drop_caches` was not run), any Strict attribution (only its wall time was taken), any timing of the hard-link (`links`) tree, and any machine other than this one 8-core Linux box. The background load was uncontrolled and drifted visibly during the session. No decision rule is applied here; Task 5 does that.
 
 ## Decision
 
@@ -233,7 +234,7 @@ Rules written before any measurement (`docs/superpowers/plans/2026-10-30-phase3-
 | Rule | Input | Threshold | Outcome |
 |---|---|---|---|
 | 1 Batch Normal-mode claim writes | no `perf` share (UNRESOLVED); ablation upper bound against the same-round control: 18.2% and 31.2% (the plan's warm rounds 2 and 3); 18.2-36.1% over warm rounds 2-6 | >= 15% in both runs | FIRES PROVISIONALLY (ablation-only, owner confirms). Every warm round is above the threshold, but the figure is an upper bound and the spread is about 18 points |
-| 2 Coalesce lock checks | no `perf` share (UNRESOLVED); ablation against the same-round control: 26.6% and 21.5% (rounds 2 and 3); 6.2-26.6% over warm rounds 2-6 | >= 10% in both runs | FIRES PROVISIONALLY (ablation-only, owner confirms), NOT ROBUST: round 5 of the replicate is 6.2%, below the threshold. Independent of timing, the lock check is 9.6 of the roughly 19 syscalls each file makes (3.2 stat + 6.4 read, counted) |
+| 2 Coalesce lock checks | no `perf` share (UNRESOLVED); ablation against the same-round control: 26.6% and 21.5% (rounds 2 and 3); 6.2-26.6% over warm rounds 2-6 | >= 10% in both runs | FIRES PROVISIONALLY (ablation-only, owner confirms), NOT ROBUST: round 5 of the replicate is 6.2%, below the threshold. Independent of timing, the lock check is about 9.0 of the roughly 26 syscalls each file makes (3.0 stat + 6.0 read, counted), a third by count |
 | 3 No Cut 1 and the Amdahl ceiling | Rules 1 and 2 both fired provisionally | applies only if neither joins | NOT APPLICABLE. `p` (the parallelisable staging share) could not be measured: the `perf` call chains were lost. It stays unmeasured; the worker-pool spec must say so |
 | 4 Directory memory | `--dry-run` slope 76.1 bytes per entry (14,000 KiB at 100,000 and 43,712 KiB at 500,000 flat entries) | >= 64 B/entry | FIRES: recorded as a finding against spec section 9 for a bounded-listing cut; the owner scopes it. Context, not used by the rule: a full copy grows by 578.7 B/entry (56,256 KiB to 282,296 KiB) |
 | 5 Unresolved rows | every `perf` row: frames lost in all four recordings | | applied: the ablation ran for Rules 1 and 2 and stands alone as an upper bound; neither row was counted as below threshold |
@@ -256,4 +257,4 @@ Rules written before any measurement (`docs/superpowers/plans/2026-10-30-phase3-
 
 ### Not controlled and not measured
 
-Background load was uncontrolled and drifted (the control moved between 2,225 and 2,944 ms). The Windows and macOS engines, other storage, files larger than 4 KiB and a cold cache were not measured.
+Background load was uncontrolled and drifted (the control moved between 2,225 and 2,944 ms). The Windows and macOS engines, other storage, files larger than 4 KiB, a cold cache, Strict attribution (only its wall time), the hard-link tree's timing and any machine other than this one 8-core Linux box were not measured.
