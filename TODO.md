@@ -1242,3 +1242,10 @@ item was, not only in a commit message.
 - [ ] **A selection on a single-file source still enters the resume fingerprint** (a --resume without the flag is refused with exit 3 although the flag had no effect on a file operand; consistent with cross_filesystems): document it in --help or relax the fingerprint for file roots.
 - [ ] **Windows reparse points and junctions** as `Other` or `Symlink` in verify are CI evidence only; no local
       Windows run has shown how the walker classifies them.
+
+## Cut 22 open (Phase 3 measure-first; `docs/phase3-measurements.md`)
+
+- [ ] **Confirm the Cut 1 candidates with an attributed profile.** The `perf` call chains were lost on the LTO release binary, so the claim-commit path (ablation 18-36% of wall time) and the lock-ownership check (6-27%, one round below 10%) are upper bounds. Build with `-C force-frame-pointers=yes` and record with `--call-graph fp`.
+- [ ] **A bounded directory listing.** `flux copy --dry-run` of one directory grows by 76 bytes per entry (14,000 KiB at 100,000 entries, 43,712 KiB at 500,000); a full copy by 579 bytes per entry (276 MiB at 500,000 empty files). Spec section 9 forbids a list proportional to the file count.
+- [ ] **Strict small-file variance.** 10,000 files of 4 KiB took 7.5-10.3 s across three runs (27% spread); nothing attributes it, and strict shows 2 more stat calls per file than normal that the stack census could not explain.
+- [ ] **The machine drifts.** The same binary timed 2,225-2,944 ms inside one session; any future timing here needs a same-round control, not an earlier baseline.

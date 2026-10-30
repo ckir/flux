@@ -225,3 +225,35 @@ Warm rounds 2-6 against their controls: claims median 31.2% (range 18.2-36.1%), 
 ### What this section does not establish
 
 Windows, macOS, spinning or networked storage, files larger than 4 KiB, a cold page cache (no root, `drop_caches` was not run), and any Strict attribution. The background load was uncontrolled and drifted visibly during the session. No decision rule is applied here; Task 5 does that.
+
+## Decision
+
+Rules written before any measurement (`docs/superpowers/plans/2026-10-30-phase3-measure.md`, "Pre-registered decision rule") applied to the figures above. No threshold was edited after the data existed.
+
+| Rule | Input | Threshold | Outcome |
+|---|---|---|---|
+| 1 Batch Normal-mode claim writes | no `perf` share (UNRESOLVED); ablation upper bound against the same-round control: 18.2% and 31.2% (the plan's warm rounds 2 and 3); 18.2-36.1% over warm rounds 2-6 | >= 15% in both runs | FIRES PROVISIONALLY (ablation-only, owner confirms). Every warm round is above the threshold, but the figure is an upper bound and the spread is about 18 points |
+| 2 Coalesce lock checks | no `perf` share (UNRESOLVED); ablation against the same-round control: 26.6% and 21.5% (rounds 2 and 3); 6.2-26.6% over warm rounds 2-6 | >= 10% in both runs | FIRES PROVISIONALLY (ablation-only, owner confirms), NOT ROBUST: round 5 of the replicate is 6.2%, below the threshold. Independent of timing, the lock check is 9.6 of the roughly 19 syscalls each file makes (3.2 stat + 6.4 read, counted) |
+| 3 No Cut 1 and the Amdahl ceiling | Rules 1 and 2 both fired provisionally | applies only if neither joins | NOT APPLICABLE. `p` (the parallelisable staging share) could not be measured: the `perf` call chains were lost. It stays unmeasured; the worker-pool spec must say so |
+| 4 Directory memory | `--dry-run` slope 76.1 bytes per entry (14,000 KiB at 100,000 and 43,712 KiB at 500,000 flat entries) | >= 64 B/entry | FIRES: recorded as a finding against spec section 9 for a bounded-listing cut; the owner scopes it. Context, not used by the rule: a full copy grows by 578.7 B/entry (56,256 KiB to 282,296 KiB) |
+| 5 Unresolved rows | every `perf` row: frames lost in all four recordings | | applied: the ablation ran for Rules 1 and 2 and stands alone as an upper bound; neither row was counted as below threshold |
+
+### Outcome
+
+- **Cut 1 scope, provisional:** batch the Normal-mode claim writes and reduce the lock-ownership checks (`Held::still_owned`, three calls per file today), on the single-worker pipeline the AGY-FIRST consult proposed. Both items are ablation upper bounds, not attributed shares, and the lock item is not robust across the replicate. The owner decides whether to confirm them before a design spec is written.
+- **A confirmation measurement is cheap and should come first:** a frame-pointer build (`-C force-frame-pointers=yes`) so that `perf --call-graph fp` can attribute the two paths directly, replacing the upper bounds with shares.
+- **Separate cut, owner to scope:** a bounded directory listing (Rule 4).
+- **Worker pool:** nothing in this cut contradicts the AGY-FIRST design (workers stage, the coordinator owns claims, hardlinks, heartbeat, rename and log), but the serial fraction is unmeasured, so no speed-up is promised.
+- **Strict:** 7.5-10.3 s for the same tree and a 27% spread between runs; nothing here attributes it.
+
+### Plan defects found while executing (for the PR body)
+
+1. The plan names `LockHeld::still_owned`; the type is `Held` (`crates/flux-core/src/lock/held.rs:17`).
+2. Task 4 Step 3 pairs the ablated runs with a baseline taken minutes earlier. The machine drifted by about 25% inside the session, so the pairing overstated the shares (claims 31.7% and 45.8%, lock 38.7% and 38.1%); the same-round control is used above.
+3. `perf record --call-graph dwarf` (default or 64 KiB stack) cannot unwind this LTO release binary on this machine; a frame-pointer build is needed.
+4. The plan's commands say `python`; this machine has only `python3` (CI is unaffected).
+5. Task 3 did not state that the flat fixtures hold zero-byte files and that the dry-run output went to a file, which matters when reading the 578.7 B/entry full-copy slope.
+
+### Not controlled and not measured
+
+Background load was uncontrolled and drifted (the control moved between 2,225 and 2,944 ms). The Windows and macOS engines, other storage, files larger than 4 KiB and a cold cache were not measured.
