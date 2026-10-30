@@ -281,3 +281,30 @@ Inclusive (`--children`) share of on-CPU samples; the wall-scaled column multipl
 ### Not controlled and not measured
 
 Background load was uncontrolled and drifted (the control moved between 2,225 and 2,944 ms). The Windows and macOS engines, other storage, files larger than 4 KiB, a cold cache, Strict attribution (only its wall time), the hard-link tree's timing and any machine other than this one 8-core Linux box were not measured.
+
+## Cut A: no name bookkeeping for a directory the run created
+
+Change (`feat/fresh-dir-names`, commits e3662c2 and 4a69b0f): a directory this run created, or, dry, one that does not exist, gets a `NameIndex` that records nothing (`NameIndex::for_created_dir`); nothing reads it there (`tree.rs` resolves names only for a frame that is not fresh). Every other directory is built as before.
+
+Method. Peak RSS (`/usr/bin/time -v`, `Maximum resident set size`, KiB), `flux copy SRC DST --durability normal` onto an absent destination, destination removed and `sync` between runs, the baseline and the changed binary alternating, three runs each. Both binaries are release builds with `-C force-frame-pointers=yes` and symbols kept; the baseline is `main` before the change, the changed one is the branch tip. Fixtures from `benches/phase3/make_tree.py`: `flat` (every file in the root) and `small --bytes 0 --dirs 1` (every file in one created subdirectory `d00`, so one `enter_dir` frame holds them all; `--dirs 100` would drop each frame at its directory end and hide a leak). Peak memory is not a wall-clock figure; no timing is claimed. Each run copied every file (`find DST -type f`).
+
+| Fixture | Entries | Baseline median | Changed median | Baseline runs | Changed runs |
+|---|---|---|---|---|---|
+| flat, copy | 100,000 | 56364 | 16320 | 55956 56452 56364 | 16320 16228 16352 |
+| flat, copy | 500,000 | 281528 | 53596 | 281528 281756 281472 | 53644 53580 53596 |
+| one subdirectory, copy | 100,000 | 56640 | 16596 | 56824 56592 56640 | 16596 16504 17136 |
+| one subdirectory, copy | 500,000 | 281708 | 53580 | 281632 281888 281708 | 53580 53496 53728 |
+| flat, `--dry-run` | 100,000 | 13788 | 13876 | 13788 13716 13792 | 13748 13876 13932 |
+| flat, `--dry-run` | 500,000 | 43592 | 43540 | 43608 43592 43420 | 43552 43540 43508 |
+
+Slope = (median at 500,000 - median at 100,000) * 1024 / 400,000, bytes per entry:
+
+| Fixture | Baseline | Changed |
+|---|---|---|
+| flat, copy | 576.4 | 95.4 |
+| one subdirectory, copy | 576.2 | 94.7 |
+| flat, `--dry-run` | 76.3 | 75.9 |
+
+Acceptance (written in the plan before the data): the changed full-copy slope at most 120 B/entry on both fixtures, every run copied all files, the `--dry-run` slope within 5 B/entry of 76.1. **PASS** on all three. The full-copy slope falls by about 481 B/entry (83%), as the earlier ablation predicted (95.4); `--dry-run` is unchanged, as it should be, because a dry run never publishes.
+
+What this cut does NOT bound: a directory that already existed when the run started (an empty destination made with `mkdir`, or a `--resume` over an interrupted run) is not fresh and keeps its tracked index, about 577 B/entry. The source walk's listing (about 76 B/entry, in `walk.rs`) is cut B. Background load was uncontrolled; peak RSS varied by under 1% across the three runs of each cell except one outlier (17136 against 16504 and 16596).
