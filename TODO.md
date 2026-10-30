@@ -245,6 +245,7 @@ Each was measured, and each is deliberately NOT fixed in that PR.
 - [ ] **Progress counts only the bytes this run writes.** The re-read of `--verify=destination|full` and of `--resume-verify` moves no byte counter, so `Transferred` is still while a big file is verified (spec boundary B7); a verifying-phase counter is the follow-up.
 - [ ] **No percent or ETA for a folder.** It needs a pre-scan or a bounded background count (spec N2, section 52's known-total form).
 - [ ] **`flux verify` has no progress display, and the `Hardlinks`, `Degraded` and `Capacity wait` lines of section 52 are not shown** (spec N1, N4).
+- [ ] **`flux cleanup <missing parent>/dst` prints the code twice.** It prints `IO_ERROR: IO_ERROR: No such file or directory (os error 2)` and exits 3, because `cleanup_report::refused_line` (`cleanup_report.rs:83`) puts `code: detail` in front of a detail that already starts with the code. Found in cut 21; `refused_line` and its caller are the same on `main`, so it pre-dates `-q`.
 
 ## Engine (walker cut 4) prerequisites
 
