@@ -1165,13 +1165,10 @@ fn root_state<F: DestinationRoot>(
     };
     // A pre-existing root is listed once; a root this run made (or, dry, one that does not exist) is `fresh` and needs
     // no listing.
-    let names = match root {
-        Some(dir) if claim_parent.is_some() && !root_created => {
-            NameIndex::for_existing(dir).map_err(|e| CopyError::at(CopyStep::Resolve, e))?
-        }
-        _ => NameIndex::for_new_dir(),
-    };
-    Ok(RootState { names, claim_parent, fresh: root_created || root.is_none() })
+    let fresh = root_created || root.is_none();
+    let names = NameIndex::for_dir(fresh, root.filter(|_| claim_parent.is_some()))
+        .map_err(|e| CopyError::at(CopyStep::Resolve, e))?;
+    Ok(RootState { names, claim_parent, fresh })
 }
 
 /// How the drain behaves after a walk that ended as `walked`.
@@ -1227,7 +1224,7 @@ fn walk_into<F: DestinationRoot>(
                     Frame::Live {
                         dir: None,
                         created: HashSet::new(),
-                        names: NameIndex::for_new_dir(),
+                        names: NameIndex::for_created_dir(),
                         claim_parent,
                         fresh: true,
                         batch: Batch::default(),
@@ -1679,15 +1676,15 @@ fn enter_dir<D: DirHandle>(
         },
     };
     // A directory this run created is empty; a pre-existing one is listed once, here.
-    let names = match &child {
-        Some(dir) if pre_existing && claim_parent.is_some() => match NameIndex::for_existing(dir) {
-            Ok(names) => names,
-            Err(e) => {
-                report(out, on_report, path.to_path_buf(), TreeFailureCause::CreateDir(e));
-                return Ok(Frame::Skipped);
-            }
-        },
-        _ => NameIndex::for_new_dir(),
+    let names = match NameIndex::for_dir(
+        !pre_existing,
+        child.as_ref().filter(|_| claim_parent.is_some()),
+    ) {
+        Ok(names) => names,
+        Err(e) => {
+            report(out, on_report, path.to_path_buf(), TreeFailureCause::CreateDir(e));
+            return Ok(Frame::Skipped);
+        }
     };
     Ok(Frame::Live {
         dir: child,
@@ -5681,6 +5678,114 @@ mod tests {
         assert_eq!(objects, [OsString::from("A")], "exactly one object at the destination");
         assert!(!fs.called("create_symlink("));
         assert_eq!(out.files_copied, 1);
+    }
+
+    /// `/src/sub/{A,a}` (`A` is walked first, so `a` is the collision), `/dst` made, case-insensitive.
+    fn folded_pair_in_a_subdirectory() -> FaultFs {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/")).unwrap();
+        fs.create_dir(Path::new("/src")).unwrap();
+        fs.create_dir(Path::new("/src/sub")).unwrap();
+        fs.create_dir(Path::new("/dst")).unwrap();
+        fs.write_file("/src/sub/A", b"upper");
+        fs.write_file("/src/sub/a", b"lower");
+        fs
+    }
+
+    /// What T1 to T3 share once the run is over: `sub/a` refused at `step`, `sub/A` published, one object in `/dst/sub`.
+    fn assert_folded_name_refused(
+        fs: &FaultFs,
+        r: &std::result::Result<(), CopyError>,
+        out: &TreeOutcome,
+        got: &[TreeFailure],
+        step: CopyStep,
+    ) {
+        assert!(r.is_ok(), "{r:?}");
+        let e = only_copy_failure(got, "sub/a");
+        assert_eq!(e.code(), Code::DestinationNamespaceCollision);
+        assert_eq!(e.step, step);
+        assert_eq!(fs.read_file("/dst/sub/A").as_deref(), Some(&b"upper"[..]));
+        assert_eq!(out.files_copied, 1);
+        let objects: Vec<OsString> =
+            fs.read_dir(Path::new("/dst/sub")).unwrap().into_iter().map(|e| e.name).collect();
+        assert_eq!(objects, [OsString::from("A")], "exactly one object at the destination");
+    }
+
+    #[test]
+    fn a_folded_name_inside_a_directory_the_run_created_is_still_a_collision() {
+        let fs = folded_pair_in_a_subdirectory();
+        fs.set_case_insensitive(true);
+
+        let (r, out, got) = batched(&fs, policy(1), Durability::Normal);
+
+        assert_folded_name_refused(&fs, &r, &out, &got, CopyStep::Gate);
+    }
+
+    #[test]
+    fn a_folded_name_inside_a_created_directory_is_a_collision_under_a_strict_batch() {
+        let fs = folded_pair_in_a_subdirectory();
+        fs.set_case_insensitive(true);
+
+        let (r, out, got) = batched(&fs, policy(64), Durability::Strict);
+
+        assert_folded_name_refused(&fs, &r, &out, &got, CopyStep::Gate);
+    }
+
+    #[test]
+    fn a_folded_name_inside_a_pre_existing_subdirectory_is_refused_by_the_name_index() {
+        let fs = folded_pair_in_a_subdirectory();
+        fs.create_dir(Path::new("/dst/sub")).unwrap();
+        fs.set_case_insensitive(true);
+
+        let (r, out, got) = batched(&fs, policy(1), Durability::Normal);
+
+        assert_folded_name_refused(&fs, &r, &out, &got, CopyStep::Claim);
+    }
+
+    #[test]
+    fn enter_dir_builds_an_untracked_index_only_for_a_directory_the_run_creates() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/")).unwrap();
+        fs.create_dir(Path::new("/dst")).unwrap();
+        let enter = |fs: &FaultFs| {
+            let mut stack = vec![Frame::Live {
+                dir: Some(fs.destination_root(Path::new("/dst")).unwrap()),
+                created: HashSet::new(),
+                names: NameIndex::for_new_dir(),
+                claim_parent: None,
+                fresh: false,
+                batch: Batch::default(),
+            }];
+            let mut out = TreeOutcome::default();
+            enter_dir(
+                &mut stack,
+                Path::new("sub"),
+                FileIdentity::Unavailable,
+                RootIdentity::Existing(FileIdentity::Unavailable),
+                FileIdentity::Unavailable,
+                &opts(),
+                true,
+                false,
+                None,
+                &mut out,
+                &mut |_| {},
+            )
+            .unwrap()
+        };
+
+        let Frame::Live { fresh, names, .. } = enter(&fs) else { panic!("expected a live frame") };
+        assert!(fresh, "the first entry created /dst/sub");
+        assert!(!names.is_tracked(), "a directory the run created records nothing");
+        let reads = |fs: &FaultFs| fs.calls().iter().filter(|c| c.starts_with("read_dir(")).count();
+        assert_eq!(reads(&fs), 0, "a directory the run created is never listed");
+
+        let Frame::Live { fresh, names, claim_parent, .. } = enter(&fs) else {
+            panic!("expected a live frame")
+        };
+        assert!(!fresh, "the second entry found /dst/sub already there");
+        assert!(names.is_tracked(), "a pre-existing directory is tracked");
+        assert!(claim_parent.is_some(), "the directory keys claims, so its listing is read");
+        assert_eq!(reads(&fs), 1, "a pre-existing directory is listed exactly once");
     }
 
     #[test]

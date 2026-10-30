@@ -28,6 +28,9 @@ pub(crate) struct NameIndex {
     learned: HashMap<OsString, u64>,
     /// The next sequence number for `learned`.
     next_seq: u64,
+    /// An index for a directory this run created is not tracked: nothing reads it (`resolve` and `owner` are reached
+    /// only for a non-fresh frame), so `record_publication` records nothing.
+    tracked: bool,
 }
 
 struct Pending {
@@ -66,7 +69,7 @@ fn add_spellings(
 }
 
 impl NameIndex {
-    /// A directory this run created: empty listing; `resolve` is not used for it (decision 6).
+    /// A directory that is NOT fresh but has no listing to read: empty listing, tracked.
     pub(crate) fn for_new_dir() -> Self {
         Self {
             listing: BTreeSet::new(),
@@ -75,7 +78,34 @@ impl NameIndex {
             pending: Vec::new(),
             learned: HashMap::new(),
             next_seq: 0,
+            tracked: true,
         }
+    }
+
+    /// A directory this run created: empty listing, UNTRACKED (records nothing, is never read).
+    pub(crate) fn for_created_dir() -> Self {
+        Self { tracked: false, ..Self::for_new_dir() }
+    }
+
+    /// The index for a destination directory frame.
+    ///
+    /// - `fresh`: `for_created_dir()`, no read (whatever `listed` is).
+    /// - not fresh, `Some(dir)`: `for_existing(dir)` (reads the listing once).
+    /// - not fresh, `None`: `for_new_dir()`, no read.
+    pub(crate) fn for_dir<D: DirHandle>(fresh: bool, listed: Option<&D>) -> flux_fs::Result<Self> {
+        if fresh {
+            return Ok(Self::for_created_dir());
+        }
+        match listed {
+            Some(dir) => Self::for_existing(dir),
+            None => Ok(Self::for_new_dir()),
+        }
+    }
+
+    /// Whether this index records publications (false for a directory this run created).
+    #[cfg(test)]
+    pub(crate) fn is_tracked(&self) -> bool {
+        self.tracked
     }
 
     /// A pre-existing directory: reads `dir.read_dir()` once.
@@ -87,6 +117,7 @@ impl NameIndex {
 
     /// The target of this run that wrote `spelling`, if any.
     pub(crate) fn owner(&self, spelling: &OsStr) -> Option<&FluxPathKey> {
+        debug_assert!(self.tracked, "an untracked index is never read");
         self.owners.get(spelling)
     }
 
@@ -102,6 +133,7 @@ impl NameIndex {
         dir: &D,
         planned: &OsStr,
     ) -> Result<Result<Resolved, NameError>, FsError> {
+        debug_assert!(self.tracked, "an untracked index is never read");
         if self.listing.contains(planned) {
             let meta = dir.metadata(planned)?;
             return Ok(Ok(Resolved::Entry { stored: planned.to_os_string(), meta }));
@@ -183,6 +215,9 @@ impl NameIndex {
         replaced: Option<ObjectId>,
         published: FileIdentity,
     ) {
+        if !self.tracked {
+            return;
+        }
         let mut spellings = Vec::with_capacity(2);
         if let Some(s) = stored {
             if !self.learned.contains_key(s) {
@@ -246,6 +281,68 @@ mod tests {
             Resolved::Entry { stored, .. } => stored,
             Resolved::Absent => panic!("absent"),
         }
+    }
+
+    fn record_abc(idx: &mut NameIndex) {
+        for n in ["a", "b", "c"] {
+            idx.record_publication(&key(n), None, OsStr::new(n), None, FileIdentity::Unavailable);
+        }
+    }
+
+    #[test]
+    fn a_created_dirs_index_records_nothing() {
+        let mut idx = NameIndex::for_created_dir();
+        record_abc(&mut idx);
+        assert!(idx.listing.is_empty());
+        assert!(idx.owners.is_empty());
+        assert!(idx.pending.is_empty());
+        assert!(!idx.is_tracked());
+    }
+
+    #[test]
+    fn a_dirs_index_that_is_not_fresh_still_records() {
+        let mut idx = NameIndex::for_new_dir();
+        record_abc(&mut idx);
+        assert_eq!(idx.listing.len(), 3);
+        assert_eq!(idx.owner(OsStr::new("b")), Some(&key("b")));
+        assert_eq!(idx.pending.len(), 3);
+        assert!(idx.is_tracked());
+    }
+
+    // The production call sites pass `Some(&d).filter(..)`, which is what lets `D` be inferred.
+    #[allow(clippy::some_filter)]
+    #[test]
+    fn for_dir_decides_by_fresh_and_never_reads_for_a_fresh_or_unlisted_dir() {
+        let fs = fs_with(&["x", "y"]);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let fresh = NameIndex::for_dir(true, Some(&d)).unwrap();
+        assert!(!fresh.is_tracked());
+        assert!(fresh.listing.is_empty());
+        let unlisted = NameIndex::for_dir(false, Some(&d).filter(|_| false)).unwrap();
+        assert!(unlisted.is_tracked());
+        assert!(unlisted.listing.is_empty());
+        let listed = NameIndex::for_dir(false, Some(&d)).unwrap();
+        assert!(listed.is_tracked());
+        let want: BTreeSet<OsString> = ["x", "y"].iter().map(OsString::from).collect();
+        assert_eq!(listed.listing, want);
+        let reads = calls_norm(&fs).iter().filter(|c| c.starts_with("read_dir(")).count();
+        assert_eq!(reads, 1);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "an untracked index is never read")]
+    fn a_created_dirs_index_is_never_resolved() {
+        let fs = fs_with(&["x"]);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let _ = NameIndex::for_created_dir().resolve(&d, OsStr::new("x"));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "an untracked index is never read")]
+    fn a_created_dirs_index_is_never_asked_for_an_owner() {
+        let _ = NameIndex::for_created_dir().owner(OsStr::new("x"));
     }
 
     #[test]
