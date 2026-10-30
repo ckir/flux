@@ -88,17 +88,114 @@ fn quiet_failed_copy_prints_the_cause_not_the_summary() {
     assert!(out.stdout.is_empty());
 }
 
+/// `tree_in(d)` plus a symlink and, on unix, a FIFO: both are skip records under `--links=skip`.
+fn skippable_tree_in(d: &Path) -> PathBuf {
+    let src = tree_in(d);
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("a", src.join("lnk")).unwrap();
+        let fifo = std::ffi::CString::new(src.join("fifo").to_str().unwrap()).unwrap();
+        // SAFETY: `fifo` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    }
+    src
+}
+
 #[test]
 fn quiet_keeps_the_dry_run_output() {
     let d = TempDir::new().unwrap();
-    let src = tree_in(d.path());
+    let src = skippable_tree_in(d.path());
     let dst = d.path().join("dst");
-    let plain = flux().args(["copy", "--dry-run"]).arg(&src).arg(&dst).output().unwrap();
-    let quiet = flux().args(["copy", "--dry-run", "--quiet"]).arg(&src).arg(&dst).output().unwrap();
+    let run = |extra: &[&str]| {
+        flux()
+            .args(["copy", "--dry-run", "--links=skip"])
+            .args(extra)
+            .arg(&src)
+            .arg(&dst)
+            .output()
+            .unwrap()
+    };
+    let (plain, quiet) = (run(&[]), run(&["--quiet"]));
     assert_eq!(code(&plain), 0);
     assert!(!stderr(&plain).is_empty());
+    #[cfg(unix)]
+    assert!(
+        stderr(&plain).contains("symlink") && stderr(&plain).contains("special"),
+        "{}",
+        stderr(&plain)
+    );
     assert_eq!(stderr(&quiet), stderr(&plain));
+    assert_eq!(stdout(&quiet), stdout(&plain));
     assert!(!dst.exists(), "a dry run writes nothing");
+}
+
+#[test]
+fn quiet_dry_run_of_several_sources_equals_the_plain_dry_run() {
+    let d = TempDir::new().unwrap();
+    let one = skippable_tree_in(d.path());
+    let two = d.path().join("two");
+    std::fs::create_dir_all(&two).unwrap();
+    std::fs::write(two.join("x"), b"X").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("x", two.join("lnk2")).unwrap();
+    let dst = d.path().join("dst");
+    let run = |extra: &[&str]| {
+        flux()
+            .args(["copy", "--dry-run", "--links=skip"])
+            .args(extra)
+            .arg(&one)
+            .arg(&two)
+            .arg(&dst)
+            .output()
+            .unwrap()
+    };
+    let (plain, quiet) = (run(&[]), run(&["--quiet"]));
+    assert_eq!(code(&plain), 0, "{}", stderr(&plain));
+    assert!(!stderr(&plain).is_empty());
+    assert_eq!(stderr(&quiet), stderr(&plain));
+    assert_eq!(stdout(&quiet), stdout(&plain));
+    assert!(!dst.exists(), "a dry run writes nothing");
+}
+
+#[test]
+fn quiet_help_states_the_rule() {
+    let out = flux().args(["copy", "--help"]).output().unwrap();
+    let help = stdout(&out);
+    assert!(help.contains("cause of a non-zero exit"), "{help}");
+    assert!(!help.contains("summary line and the dry-run notes"), "{help}");
+}
+
+#[test]
+fn quiet_verify_of_an_absent_destination_keeps_the_notice() {
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let out = flux().args(["verify", "-q"]).arg(&src).arg(d.path().join("nope")).output().unwrap();
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert!(stderr(&out).contains("destination does not exist"), "{}", stderr(&out));
+    let so = stdout(&out);
+    assert!(so.lines().any(|l| l.starts_with("missing: a")), "{so}");
+    assert!(!so.contains("matched,") && !stderr(&out).contains("matched,"), "no summary: {so}");
+}
+
+#[test]
+fn quiet_verify_of_several_sources_into_an_absent_destination_keeps_the_notices() {
+    let d = TempDir::new().unwrap();
+    let one = tree_in(d.path());
+    let two = d.path().join("two");
+    std::fs::create_dir_all(&two).unwrap();
+    std::fs::write(two.join("x"), b"X").unwrap();
+    let out = flux()
+        .args(["verify", "-q"])
+        .arg(&one)
+        .arg(&two)
+        .arg(d.path().join("nope"))
+        .output()
+        .unwrap();
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    let e = stderr(&out);
+    assert_eq!(e.matches("destination does not exist").count(), 2, "{e}");
+    assert!(!e.contains("matched,"), "no per-root line: {e}");
+    assert!(stdout(&out).lines().any(|l| l.starts_with("missing:")), "{}", stdout(&out));
 }
 
 #[cfg(unix)]

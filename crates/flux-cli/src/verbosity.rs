@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 pub struct Verbosity {
     /// 0 to 3: how many `-v` were given, clamped.
     pub level: u8,
-    /// `--quiet`: print only errors, the summary line and the dry-run notes.
+    /// `--quiet`: print only the cause of a non-zero exit, warnings, the whole output of a `--dry-run`, and `--json` objects; a clean run prints nothing.
     pub quiet: bool,
 }
 

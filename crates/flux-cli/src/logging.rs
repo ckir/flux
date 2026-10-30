@@ -288,6 +288,8 @@ pub fn install(v: Verbosity) {
 
 #[cfg(test)]
 mod tests {
+    // The tests that touch the process-global display sink (and `install`) assume `cargo nextest`'s
+    // one-process-per-test isolation and would race under plain `cargo test` (the justfile and CI run nextest).
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -452,10 +454,7 @@ mod tests {
         tracing::subscriber::with_default(build(v(3, false), mem.clone()), || {
             tracing::trace!(target: "flux_core::tree", path = "c\n", status = "created");
         });
-        assert_eq!(
-            mem.text(),
-            "trace tree: path=c\\u{a} status=created\n".replace("tree:  ", "tree: ")
-        );
+        assert_eq!(mem.text(), "trace tree: path=c\\u{a} status=created\n");
         let mem = Mem::default();
         tracing::subscriber::with_default(build(v(1, false), mem.clone()), || {
             tracing::debug!(target: "flux_core::tree", path = "a");

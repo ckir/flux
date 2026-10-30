@@ -79,7 +79,7 @@ impl Live {
         progress: &mut Option<Arc<Progress>>,
     ) -> Live {
         let mut live = Live::start(display_wanted(dry_run, json, quiet), target, plain);
-        live.quiet = quiet;
+        live.quiet = quiet && !dry_run;
         if let Some(display) = &live.display {
             // The log lines (`-v`) go above the bar while it runs; `finish` takes the route back.
             let handle = display.handle();
@@ -145,6 +145,8 @@ impl Live {
 
 #[cfg(test)]
 mod tests {
+    // The tests that touch the process-global display sink (and `install`) assume `cargo nextest`'s
+    // one-process-per-test isolation and would race under plain `cargo test` (the justfile and CI run nextest).
     use super::*;
     use flux_core::TreeFailureCause as C;
     use flux_core::copy::{CopyError, CopyStep};
@@ -342,6 +344,21 @@ mod tests {
         let f = TreeFailure { path: "c".into(), cause: C::MountSkipped };
         live.record_failure(&f);
         assert_eq!(taken(), crate::report::record_lines(&f));
+    }
+
+    #[test]
+    fn quiet_dry_run_live_keeps_skip_records() {
+        let skipped = TreeFailure { path: "s".into(), cause: C::SymlinkSkipped };
+        let mut slot = None;
+        let live =
+            Live::for_copy(true, false, true, ProgressDrawTarget::hidden(), plain, &mut slot);
+        live.record_failure(&skipped);
+        assert_eq!(taken(), crate::report::record_lines(&skipped));
+        assert!(!crate::report::record_lines(&skipped).is_empty());
+        let live =
+            Live::for_copy(false, false, true, ProgressDrawTarget::hidden(), plain, &mut slot);
+        live.record_failure(&skipped);
+        assert!(taken().is_empty());
     }
 
     #[test]

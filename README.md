@@ -108,7 +108,7 @@ Limits: `Transferred` counts the bytes this run writes, so the re-read of `--ver
 
 ### Logging and `--quiet`
 
-`copy`, `verify` and `cleanup` share these flags, and they work before or after the subcommand. `-v` (also `--verbose`) prints one line per file, directory and link before the summary; `-vv` and `-vvv` add engine diagnostics, whose wording is not stable. `-q` (also `--quiet`) prints only the cause of a non-zero exit, warnings, the whole output of a `--dry-run`, and `--json` objects; a clean run prints nothing, and it turns the live display off. `-v` with `--quiet` is a usage error (exit 2).
+`copy`, `verify` and `cleanup` share these flags, and they work before or after the subcommand. `-v` (also `--verbose`) prints one line per file, directory and link before the summary; `-vv` and `-vvv` add engine diagnostics, whose wording is not stable; on `verify` they currently add nothing beyond `-v`. `-q` (also `--quiet`) prints only the cause of a non-zero exit, warnings, the whole output of a `--dry-run`, and `--json` objects; a clean run prints nothing, and it turns the live display off. `-v` with `--quiet` is a usage error (exit 2).
 
 ```
 $ flux copy -v src dst

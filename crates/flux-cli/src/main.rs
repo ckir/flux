@@ -28,11 +28,12 @@ use std::time::Instant;
 #[command(name = "flux", version)]
 struct Cli {
     /// More detail: on `flux verify` also print the `match` records on stdout; on `copy` and
-    /// `cleanup` add per-item lines on stderr. Repeat (`-vv`, `-vvv`) for more; above three is
-    /// the same as three. Cannot be combined with --quiet.
+    /// `cleanup` add per-item lines on stderr. Repeat (`-vv`, `-vvv`) for engine diagnostics on
+    /// `copy` and `cleanup` (on `verify` they add nothing beyond `-v`); above three is the same
+    /// as three. Cannot be combined with --quiet.
     #[arg(short = 'v', long = "verbose", action = ArgAction::Count, global = true)]
     verbose: u8,
-    /// Print only errors, the summary line and the dry-run notes. Cannot be combined with -v.
+    /// Print only the cause of a non-zero exit, warnings, the whole output of a `--dry-run`, and `--json` objects; a clean run prints nothing. Cannot be combined with -v.
     #[arg(short = 'q', long = "quiet", global = true)]
     quiet: bool,
     #[command(subcommand)]
@@ -909,9 +910,7 @@ fn verify_one(args: &VerifyArgs, source: &Path, dest: &Path) -> u8 {
         Job::Tree { src, dst } => {
             // The engine says so after the root check passed, so a refused run prints no such line.
             let mut on_absent = || {
-                if !hide_info(args.json) {
-                    err(&verify_report::dest_absent_line(&dst));
-                }
+                err(&verify_report::dest_absent_line(&dst));
             };
             let result = flux_core::verify::verify_tree_notifying(
                 &fs,
@@ -1007,9 +1006,7 @@ fn verify_several_cli(args: &VerifyArgs) -> u8 {
         lines(routed.stderr);
     };
     let mut on_absent = |name: &std::ffi::OsStr| {
-        if !hide_info(args.json) {
-            err(&verify_report::root_absent_line(&dst, name));
-        }
+        err(&verify_report::root_absent_line(&dst, name));
     };
     let mut on_root_done = |name: &std::ffi::OsStr, s: &flux_core::verify::Summary| {
         if !hide_info(args.json) {
@@ -1075,8 +1072,8 @@ fn stdout_or_exit(line: &str) {
     }
 }
 
-/// Whether `flux verify` leaves out its informational lines (the human summary, the per-root lines and the
-/// absent-destination notices): `--quiet` without `--json`.
+/// Whether `flux verify` leaves out its informational lines (the human summary and the per-root lines):
+/// `--quiet` without `--json`. The absent-destination notices are warnings and stay.
 fn hide_info(json: bool) -> bool {
     verbosity::get().quiet && !json
 }
