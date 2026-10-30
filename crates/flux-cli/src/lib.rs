@@ -11,6 +11,8 @@
 pub mod cleanup_report;
 pub mod exit_code;
 pub mod live;
+pub mod logging;
 pub mod report;
 pub mod resolve;
+pub mod verbosity;
 pub mod verify_report;

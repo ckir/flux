@@ -20,6 +20,7 @@ use crate::copy::{
 use crate::dry_run::{PlannedAction, PlannedEntry, PlannedObject, SkipReason};
 use crate::hardlinks::{Candidacy, anchor_parent, candidacy, shown, strong};
 use crate::names::{NameIndex, Resolved};
+use crate::oplog::{self, Verb};
 use crate::state::{FLUX_DIR, RESERVED_DIRS, identity_text, native_hex};
 use crate::walk::{DEFAULT_MAX_DEPTH, MountPolicy, Walk, WalkEvent, WalkOptions, walk_with};
 use flux_fs::{
@@ -114,9 +115,27 @@ pub struct TreeOutcome {
     pub hardlinks_unlinked: BTreeMap<UnlinkedWhy, DegradedGroup>,
     /// The live counters a display samples; `None` outside the CLI's terminal case.
     pub progress: Option<std::sync::Arc<crate::progress::Progress>>,
+    /// Engine-internal hint (public only so `..TreeOutcome::default()` works in other crates). What the NEXT successful `finish_copy` announces. `Copied` unless the path that is about to call it set another
+    /// verb (a link publication, a replacement); `finish_copy` takes it back to `Copied`.
+    #[doc(hidden)]
+    pub verb: Verb,
+    /// Set by a dry run's `dry_stop_*` just before it feeds `finish_copy` a PLANNED outcome: nothing was copied, so
+    /// nothing is announced. `finish_copy` takes it back to `false`.
+    #[doc(hidden)]
+    pub silent: bool,
+    /// With `Verb::Linked`: the symlink's target, which that event carries as `to`. Taken by `finish_copy`.
+    #[doc(hidden)]
+    pub link_to: Option<PathBuf>,
 }
 
 impl TreeOutcome {
+    /// Remember a symlink's target for the next `finish_copy`'s event; nothing is built when no one is listening.
+    pub(crate) fn link_hint(&mut self, payload: &OsStr) {
+        if crate::oplog::enabled() {
+            self.link_to = Some(PathBuf::from(payload));
+        }
+    }
+
     /// Count one more entry the walk yielded, and tick the live view with it.
     pub(crate) fn note_discovered(&mut self) {
         self.files_total += 1;
@@ -947,6 +966,8 @@ fn folder_root<F: DestinationRoot>(
     let (dir, created) = match dest.create_dir(name) {
         Ok(dir) => {
             out.directories_created += 1;
+            // A several-source root's folder lies below the destination root, so it is announced as any directory is.
+            oplog::emit_lazy(Verb::Created, || (PathBuf::from(name), None, None));
             (dir, true)
         }
         // A copy merges onto an existing folder, as a tree onto an existing DEST.
@@ -1237,6 +1258,7 @@ fn walk_into<F: DestinationRoot>(
                         cx.opts,
                         cx.claims.is_some(),
                         cx.dry_run,
+                        cx.key_prefix,
                         out,
                         on_report,
                     )?
@@ -1463,6 +1485,7 @@ fn enter_dir<D: DirHandle>(
     opts: &CopyOptions,
     claims_on: bool,
     dry_run: bool,
+    prefix: Option<&OsStr>,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<Frame<D>, CopyError> {
@@ -1541,6 +1564,7 @@ fn enter_dir<D: DirHandle>(
         match parent.create_dir(name) {
             Ok(child) => {
                 out.directories_created += 1;
+                oplog::emit_lazy(Verb::Created, || (keyed_under(prefix, path), None, None));
                 let child_identity = child.identity();
                 if let Ok(FileIdentity::Strong(id)) = child_identity {
                     created.insert(id);
@@ -1583,6 +1607,12 @@ fn enter_dir<D: DirHandle>(
             }
         }
     };
+
+    tracing::debug!(
+        target: "flux_core::tree",
+        path = %oplog::EscapedPath(path),
+        created = !pre_existing,
+    );
 
     // A destination directory about to be entered must not BE the source root (owner, cut 4b capstone round 1):
     // a bind mount inside the destination can present the source under a destination name, and `open_dir`
@@ -1958,6 +1988,11 @@ fn copy_one<F: DestinationRoot>(
                         {
                             out.note_resumed();
                             out.bytes_resumed += src_meta.len;
+                            if !cx.dry_run {
+                                oplog::emit_lazy(Verb::Resumed, || {
+                                    (cx.keyed(&path), Some(src_meta.len), None)
+                                });
+                            }
                             names.record_publication(
                                 &target,
                                 Some(&stored),
@@ -2009,6 +2044,9 @@ fn copy_one<F: DestinationRoot>(
             if let Some(len) = skip {
                 out.note_skipped();
                 out.bytes_skipped += len;
+                if !cx.dry_run {
+                    oplog::emit_lazy(Verb::Skipped, || (cx.keyed(&path), None, None));
+                }
                 if let Some(group) = &group {
                     skipped_member(cx, group, &target, &meta, &path, out);
                 }
@@ -2030,6 +2068,12 @@ fn copy_one<F: DestinationRoot>(
             Plan::Replace { stored, meta }
         }
     };
+
+    tracing::debug!(
+        target: "flux_core::tree",
+        path = %oplog::EscapedPath(&path),
+        plan = if matches!(plan, Plan::New) { "new" } else { "replace" },
+    );
 
     // Cut 12: a file that will be copied meets the degradations that need no index (a skipped one is untouched).
     if hardlink_degradation(cx, src_known.as_ref(), true, &path, out, on_report) {
@@ -2150,7 +2194,7 @@ fn copy_one<F: DestinationRoot>(
                             claims, &key, &target, strict, names, name, identity, &path, out,
                             on_report,
                         );
-                        count_linked(out, &o, &path);
+                        count_linked(out, &o, &path, cx.key_prefix, &anchor);
                         return Ok(());
                     }
                     Settled::Finished => return Ok(()),
@@ -2298,7 +2342,7 @@ fn copy_one<F: DestinationRoot>(
                             out,
                             on_report,
                         );
-                        count_linked(out, &o, &path);
+                        count_linked(out, &o, &path, cx.key_prefix, &anchor);
                         return Ok(());
                     }
                     Settled::Finished => return Ok(()),
@@ -2338,6 +2382,7 @@ fn copy_one<F: DestinationRoot>(
                 Ok(o) => Some(o.published_identity),
                 Err(_) => None,
             };
+            out.verb = Verb::Replaced;
             finish_copy(cx.key_prefix, path.clone(), result, out, on_report)?;
             if let Some((reuse, recopied)) = reuse {
                 note_reuse(out, &path, reuse, recopied);
@@ -2388,6 +2433,11 @@ fn record_new<C: ClaimStore + ?Sized>(
     if let Err(e) = recorded {
         report(out, on_report, path.to_path_buf(), TreeFailureCause::ClaimNotRecorded(e));
     }
+    tracing::trace!(
+        target: "flux_core::tree",
+        path = %oplog::EscapedPath(path),
+        status = if strict { "committed" } else { "created" },
+    );
     names.record_publication(target, None, name, None, identity);
 }
 
@@ -2430,8 +2480,16 @@ fn record_replace<C: ClaimStore + ?Sized>(
 
 /// A linked member is counted `files_hardlinked`, never copied; the weaker comparison its gate made is recorded as a
 /// copy's is.
-fn count_linked(out: &mut TreeOutcome, linked: &flux_fs::Outcome, path: &Path) {
+fn count_linked(
+    out: &mut TreeOutcome,
+    linked: &flux_fs::Outcome,
+    path: &Path,
+    prefix: Option<&OsStr>,
+    anchor: &FluxPathKey,
+) {
     out.files_hardlinked += 1;
+    // `anchor` is a claim key shown as a path: already relative to the destination root, so `path` is keyed to match.
+    oplog::emit_lazy(Verb::Hardlinked, || (keyed_under(prefix, path), None, Some(shown(anchor))));
     if let Some(weaker) = linked.identity_degraded {
         out.files_degraded += 1;
         out.warnings.record(weaker, path);
@@ -2971,6 +3029,8 @@ fn link_one<F: DestinationRoot>(
             &no_before_create,
             &no_before_publish,
         )?;
+        out.verb = Verb::Linked;
+        out.link_hint(&link.payload);
         return finish_copy(cx.key_prefix, path, published, out, on_report);
     };
     let target = match FluxPathKey::from_relative(&cx.keyed(&path)) {
@@ -3062,6 +3122,9 @@ fn link_one<F: DestinationRoot>(
                         // else falls through to the policy and republishes.
                         if r.status == ClaimStatus::Created && same_link(parent, &stored, &link) {
                             out.note_resumed();
+                            if !cx.dry_run {
+                                oplog::emit_lazy(Verb::Resumed, || (cx.keyed(&path), None, None));
+                            }
                             names.record_publication(
                                 &target,
                                 Some(&stored),
@@ -3110,6 +3173,9 @@ fn link_one<F: DestinationRoot>(
             };
             if let Some(reason) = skip {
                 out.note_skipped();
+                if !cx.dry_run {
+                    oplog::emit_lazy(Verb::Skipped, || (cx.keyed(&path), None, None));
+                }
                 if cx.dry_run {
                     let skipped = PlannedEntry {
                         object: PlannedObject::Symlink,
@@ -3171,6 +3237,8 @@ fn link_one<F: DestinationRoot>(
                 claims, &key, &wrote, cx.guard, &path, result, out, on_report,
             );
             let published = result.as_ref().ok().map(|o| o.published_identity);
+            out.verb = Verb::Linked;
+            out.link_hint(&link.payload);
             finish_copy(cx.key_prefix, path.clone(), result, out, on_report)?;
             if let Some(identity) = published {
                 let recorded = if strict {
@@ -3248,6 +3316,8 @@ fn link_one<F: DestinationRoot>(
                 on_report,
             );
             let published = result.as_ref().ok().map(|o| o.published_identity);
+            out.verb = Verb::Replaced;
+            out.link_hint(&link.payload);
             finish_copy(cx.key_prefix, path.clone(), result, out, on_report)?;
             if let Some(identity) = published {
                 out.files_overwritten += 1;
@@ -3390,6 +3460,7 @@ fn dry_stop_file<F: DestinationRoot>(
         skipped: false,
         verified: false,
     };
+    out.silent = true;
     finish_copy(cx.key_prefix, path.clone(), Ok(outcome), out, on_report)?;
     let partial = dry_partial_len(cx, parent, name);
     dry_planned(out, on_report, path, PlannedObject::File, replace, partial);
@@ -3449,6 +3520,7 @@ fn dry_stop_link<F: DestinationRoot>(
         skipped: false,
         verified: false,
     };
+    out.silent = true;
     finish_copy(cx.key_prefix, path.clone(), Ok(outcome), out, on_report)?;
     dry_planned(out, on_report, path, PlannedObject::Symlink, replace, None);
     Ok(())
@@ -3919,6 +3991,9 @@ fn flush_batch<F: DestinationRoot>(
                 let identity = o.published_identity;
                 let recopied = o.bytes_copied;
                 // Counted at the rename, before any later entry is tried (decision 4.6). Never `Err` for an `Ok`.
+                if replaced.is_some() {
+                    out.verb = Verb::Replaced;
+                }
                 finish_copy(cx.key_prefix, path.clone(), Ok(o), out, on_report)?;
                 note_reuse(out, &path, reuse, recopied);
                 match &replaced {
@@ -4364,6 +4439,10 @@ fn finish_copy(
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<(), CopyError> {
+    // Both hints are for THIS call only, whichever way it goes.
+    let verb = std::mem::take(&mut out.verb);
+    let silent = std::mem::take(&mut out.silent);
+    let link_to = out.link_to.take();
     match result {
         Ok(o) => {
             debug_assert!(!o.skipped, "the tree never lets the copy path skip");
@@ -4372,6 +4451,11 @@ fn finish_copy(
                 out.files_verified += 1;
             }
             out.bytes_copied += o.bytes_copied;
+            if !silent {
+                // A link carries its target, not a byte count.
+                let bytes = (verb != Verb::Linked && link_to.is_none()).then_some(o.bytes_copied);
+                oplog::emit_lazy(verb, || (keyed_under(prefix, &path), bytes, link_to));
+            }
             if let Some(weaker) = o.identity_degraded {
                 out.files_degraded += 1;
                 out.warnings.record(weaker, &path);

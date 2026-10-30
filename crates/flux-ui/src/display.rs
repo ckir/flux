@@ -30,7 +30,26 @@ fn draw(bar: &ProgressBar, progress: &Progress, started: Instant) {
     bar.force_draw();
 }
 
+/// A cheap, thread-safe handle that prints lines above the bar of a running [`Display`].
+#[derive(Clone)]
+pub struct DisplayHandle {
+    bar: ProgressBar,
+}
+
+impl DisplayHandle {
+    /// Print one line above the bar.
+    pub fn println(&self, line: &str) {
+        self.bar.println(line);
+    }
+}
+
 impl Display {
+    /// A handle that prints above this display's bar from any thread.
+    #[must_use]
+    pub fn handle(&self) -> DisplayHandle {
+        DisplayHandle { bar: self.bar.clone() }
+    }
+
     /// Start drawing; `None` when the target is hidden or the sampler thread
     /// cannot be spawned.
     #[must_use]

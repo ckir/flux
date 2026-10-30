@@ -113,3 +113,26 @@ fn json_and_dry_run_on_a_terminal_draw_no_frame() {
         }
     }
 }
+
+#[test]
+fn v_on_a_terminal_draws_the_bar_and_prints_the_verb_lines_above_it() {
+    let (ok, t) = copy_on_a_terminal(&["-v"], &["src"]);
+    assert!(ok, "{t:?}");
+    let verb = t.find("Copied a").unwrap_or_else(|| panic!("no verb line: {t:?}"));
+    let summary = t.find("copied 2 files").unwrap_or_else(|| panic!("no summary: {t:?}"));
+    assert!(verb < summary, "the verb line came after the summary: {t:?}");
+    // The bar is wiped before a verb line prints, so the line does not land on top of a frame.
+    let before = &t[verb.saturating_sub(40)..verb];
+    assert!(before.contains(CLEAR_LINE), "the line printed over a frame: {before:?}");
+    let frame = t[..summary].rfind("Discovered").unwrap_or_else(|| panic!("no frame: {t:?}"));
+    // The bar is cleared after its last frame and before the summary: the verb lines went above it.
+    assert!(t[frame..summary].contains(CLEAR_LINE), "the bar is still up at the summary: {t:?}");
+}
+
+#[test]
+fn quiet_on_a_terminal_draws_no_frame_and_prints_nothing_on_success() {
+    let (ok, t) = copy_on_a_terminal(&["--quiet"], &["src"]);
+    assert!(ok, "{t:?}");
+    assert!(!t.contains("Discovered") && !t.contains(CLEAR_LINE), "drew a frame: {t:?}");
+    assert!(t.is_empty(), "printed on success: {t:?}");
+}

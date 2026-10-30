@@ -1551,6 +1551,28 @@ mod trees_tests {
         decode_state(&bytes).unwrap()
     }
 
+    #[test]
+    fn several_roots_emit_paths_led_by_the_root_name() {
+        let fs = fake();
+        let ((r, got), events) = crate::oplog::testing::capture(|| go(&fs, &["a", "b"]));
+        ok(&r);
+        assert!(got.is_empty(), "{got:?}");
+        let seen: Vec<(&str, &str, Option<u64>)> =
+            events.iter().map(|e| (e.action.as_str(), e.path.as_str(), e.bytes)).collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("created", "a", None),
+                ("created", "a/sub", None),
+                ("copied", "a/sub/y", Some(2)),
+                // `a/x` is staged in the root's batch, which publishes when the root's walk ends (cut 9d).
+                ("copied", "a/x", Some(2)),
+                ("created", "b", None),
+                ("copied", "b/k", Some(2)),
+            ]
+        );
+    }
+
     fn copy_of(r: &MultiRun) -> &Result<TreeOutcome, TreeAbort> {
         r.run.copy.as_ref().expect("the copy ran")
     }

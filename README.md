@@ -104,11 +104,27 @@ With `--resume` the check covers the files this run copies or resumes; files a p
 
 On a terminal, `flux copy` shows a live display on stderr while it runs. For a folder or several sources it shows `Discovered` and `Processed` files, `Transferred` bytes and `Speed`, plus a `Resumed` line when a `--resume` skipped files, a `Skipped` line when `--update` or `--skip-existing` skipped files, and an `Errors` line when a file failed; for a single file it shows a percent bar with speed and ETA (a resumed single file shows the counters form). Record lines (failures and skip records) print above the display, and the display is cleared before the summary prints. It is never shown when stderr is not a terminal, with `--json`, or with `--dry-run`; those runs print exactly what they printed before.
 
-Limits: `Transferred` counts the bytes this run writes, so the re-read of `--verify=destination|full` and of `--resume-verify` does not move it (the elapsed time and speed keep updating). `Processed` can finish below `Discovered` when the tree holds hardlinked members, links skipped by `--links=skip`, special files or mount roots, or when files failed; entries excluded by `--exclude` never count as `Discovered`. There is no percent or ETA for a folder, because that would need a pre-scan. There is no flag to turn it off: `--json` or `TERM=dumb` turn off just the display; redirecting stderr turns it off too but also hides the record lines and the summary.
+Limits: `Transferred` counts the bytes this run writes, so the re-read of `--verify=destination|full` and of `--resume-verify` does not move it (the elapsed time and speed keep updating). `Processed` can finish below `Discovered` when the tree holds hardlinked members, links skipped by `--links=skip`, special files or mount roots, or when files failed; entries excluded by `--exclude` never count as `Discovered`. There is no percent or ETA for a folder, because that would need a pre-scan. `--quiet` turns it off (see Logging and `--quiet`); `--json` or `TERM=dumb` turn off just the display; redirecting stderr turns it off too but also hides the record lines and the summary.
+
+### Logging and `--quiet`
+
+`copy`, `verify` and `cleanup` share these flags, and they work before or after the subcommand. `-v` (also `--verbose`) prints one line per file, directory and link before the summary; `-vv` and `-vvv` add engine diagnostics, whose wording is not stable; on `verify` they currently add nothing beyond `-v`. `-q` (also `--quiet`) prints only the cause of a non-zero exit, warnings, the whole output of a `--dry-run`, and `--json` objects; a clean run prints nothing, and it turns the live display off. `-v` with `--quiet` is a usage error (exit 2).
+
+```
+$ flux copy -v src dst
+    Copied a (2 B)
+    Linked lnk -> a
+   Created sub
+    Copied sub/b (3 B)
+    Copied sub/c (2 B)
+copied 4 files (7 B), created 2 directories in 0.01s; 0 failed, 0 skipped
+```
+
+On `flux verify`, `-v` also prints the `match` records. On `verify` and `cleanup`, `--quiet` leaves results on stdout and a clean run prints nothing.
 
 ### Verify
 
-`flux verify SOURCE... DEST [--links=copy|skip] [--exclude PATTERN]... [--recursive|--no-recursive] [--cross-filesystems] [--hash=blake3] [--json] [--verbose]` compares one
+`flux verify SOURCE... DEST [--links=copy|skip] [--exclude PATTERN]... [--recursive|--no-recursive] [--cross-filesystems] [--hash=blake3] [--json] [-v|--verbose]` compares one
 source (a file or a folder, mapped onto DEST as `flux copy` maps it) with DEST by content and writes nothing. With
 several sources each is compared with `DEST/<name>`, as `flux copy` places it; what else DEST holds is not examined.
 Both sides are walked together in path order and every file is read in full on both sides and hashed. Flux's own control
@@ -117,7 +133,7 @@ itself, while inside each `DEST/<name>` only `*.flux-partial.<id>` temporaries a
 `.flux-root.lock` there is compared as user data (a one-source copy's own residue inside such a root therefore shows as
 `extra`). Each path is reported as one of:
 
-- `match`: the same on both sides (printed only with `--verbose`).
+- `match`: the same on both sides (printed only with `-v`/`--verbose`).
 - `missing`: in the source, absent at the destination.
 - `mismatched`: content, symlink payload or object type differs (`VERIFY_MISMATCH`).
 - `extra`: at the destination, not in the source.

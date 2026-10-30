@@ -478,12 +478,46 @@ fn weak_line(scope: &str, count: u64, example: &str) -> String {
     )
 }
 
+/// `n` and its noun: `1 file`, `0 files`, `2 files`.
+pub fn count_noun(n: u64, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// A byte count on the scale of the progress display (`7 B`, `42.50 KiB`).
+pub fn human_bytes(n: u64) -> String {
+    flux_ui::HumanBytes(n).to_string()
+}
+
+/// A wall-clock duration: two decimals under 10 s, one decimal under a minute, then `2m 03s` and `1h 02m 03s`.
+pub fn elapsed_text(ms: u64) -> String {
+    if ms < 9_995 {
+        // Two decimals; the bound keeps a value that rounds up to 10.00 s on the one-decimal branch.
+        let h = (ms + 5) / 10;
+        return format!("{}.{:02}s", h / 100, h % 100);
+    }
+    if ms < 59_950 {
+        let t = (ms + 50) / 100;
+        return format!("{}.{}s", t / 10, t % 10);
+    }
+    let secs = ms / 1000 + u64::from(ms % 1000 >= 500);
+    if secs < 3600 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {:02}m {:02}s", secs / 3600, secs % 3600 / 60, secs % 60)
+    }
+}
+
 /// The last stderr line of a run that reached the engine. Its failure figure is the
 /// JSON `errors` value, so an abort counts and a non-zero exit never reads as clean.
 pub fn summary_line(r: &Report, directories_created: u64) -> String {
     let mut s = format!(
-        "copied {} files ({} bytes), created {directories_created} directories; {} failed, {} skipped",
-        r.files_copied, r.bytes_copied, r.errors, r.files_skipped
+        "copied {} ({}), created {} in {}; {} failed, {} skipped",
+        count_noun(r.files_copied, "file", "files"),
+        human_bytes(r.bytes_copied),
+        count_noun(directories_created, "directory", "directories"),
+        elapsed_text(r.duration_ms),
+        r.errors,
+        r.files_skipped
     );
     // Cut 12: each suffix only when non-zero, so a copy without hardlinks prints the line it always did.
     for (n, what) in [
@@ -513,8 +547,13 @@ pub fn dry_run_summary_line(r: &Report, directories_created: u64) -> String {
     let excluded =
         if r.excluded > 0 { format!("; {} excluded", r.excluded) } else { String::new() };
     format!(
-        "dry run: would copy {} files ({} bytes), overwrite {}{links}, skip {}, create {directories_created} directories; {} errors{excluded}",
-        r.files_copied, r.bytes_copied, r.files_overwritten, r.files_skipped, r.errors
+        "dry run: would copy {} ({}), overwrite {}{links}, skip {}, create {}; {} errors{excluded}",
+        count_noun(r.files_copied, "file", "files"),
+        human_bytes(r.bytes_copied),
+        r.files_overwritten,
+        r.files_skipped,
+        count_noun(directories_created, "directory", "directories"),
+        r.errors
     )
 }
 
@@ -868,31 +907,63 @@ const ADVISORY_NOTE: &str = "note: --durability=normal checkpoints are advisory;
 /// The level line text of `--resume-verify=full`.
 const FULL_LEVEL_LINE: &str = "resume verification: full (source and partial re-read and hashed)";
 
+/// The `checkpoints discarded` lines of a tree run: a warning, kept under `--quiet`.
+pub fn checkpoint_warning_lines(outcome: &TreeOutcome) -> Vec<String> {
+    outcome
+        .checkpoint_discards
+        .iter()
+        .map(|d| format!("checkpoints discarded for {}: {}", rel(&d.path), discard_why(&d.reason)))
+        .collect()
+}
+
+/// The notes of a tree run's checkpoints: one `resumed` line per partially resumed file and, under Normal durability
+/// and only when something was reused or discarded, a closing note. Hidden under `--quiet`.
+pub fn checkpoint_note_lines(outcome: &TreeOutcome, normal_durability: bool) -> Vec<String> {
+    let mut v: Vec<String> = outcome
+        .partial_resumes
+        .iter()
+        .map(|r| {
+            format!(
+                "resumed {}: reused {} bytes, recopied {} bytes",
+                rel(&r.path),
+                r.reused,
+                r.recopied
+            )
+        })
+        .collect();
+    if normal_durability && (!v.is_empty() || !outcome.checkpoint_discards.is_empty()) {
+        v.push(ADVISORY_NOTE.to_string());
+    }
+    v
+}
+
 /// Cut 9f-1 (spec decision 12): what a checkpointed run reused and discarded. One `resumed` line per partially resumed
 /// file, one `checkpoints discarded` line per file whose checkpoints were discarded, and, under Normal durability and
 /// only when something was reused or discarded, a closing note. An uncheckpointed run prints nothing.
 pub fn checkpoint_lines(outcome: &TreeOutcome, normal_durability: bool) -> Vec<String> {
-    let mut v = Vec::new();
-    for r in &outcome.partial_resumes {
-        v.push(format!(
-            "resumed {}: reused {} bytes, recopied {} bytes",
-            rel(&r.path),
-            r.reused,
-            r.recopied
-        ));
-    }
-    for d in &outcome.checkpoint_discards {
-        let why = discard_why(&d.reason);
-        v.push(format!("checkpoints discarded for {}: {why}", rel(&d.path)));
-    }
+    let mut v = checkpoint_note_lines(outcome, false);
+    v.extend(checkpoint_warning_lines(outcome));
     if normal_durability && !v.is_empty() {
         v.push(ADVISORY_NOTE.to_string());
     }
     v
 }
 
-/// Cut 9g: `checkpoint_lines` for a single file's resume; `target` is the path as the user gave it.
-pub fn file_checkpoint_lines(
+/// A single file's `checkpoints discarded` line: a warning, kept under `--quiet`.
+pub fn file_checkpoint_warning_lines(
+    run: &Run<Result<Outcome, CopyError>>,
+    target: &str,
+) -> Vec<String> {
+    run.file_resume
+        .as_ref()
+        .and_then(|fr| fr.discard.as_ref())
+        .map(|d| format!("checkpoints discarded for {target}: {}", discard_why(d)))
+        .into_iter()
+        .collect()
+}
+
+/// A single file's `resumed` line and the advisory note; hidden under `--quiet`.
+pub fn file_checkpoint_note_lines(
     run: &Run<Result<Outcome, CopyError>>,
     target: &str,
     normal_durability: bool,
@@ -905,10 +976,21 @@ pub fn file_checkpoint_lines(
                 fr.reused, fr.recopied
             ));
         }
-        if let Some(d) = &fr.discard {
-            v.push(format!("checkpoints discarded for {target}: {}", discard_why(d)));
+        if normal_durability && (fr.reused > 0 || fr.discard.is_some()) {
+            v.push(ADVISORY_NOTE.to_string());
         }
     }
+    v
+}
+
+/// Cut 9g: `checkpoint_lines` for a single file's resume; `target` is the path as the user gave it.
+pub fn file_checkpoint_lines(
+    run: &Run<Result<Outcome, CopyError>>,
+    target: &str,
+    normal_durability: bool,
+) -> Vec<String> {
+    let mut v = file_checkpoint_note_lines(run, target, false);
+    v.extend(file_checkpoint_warning_lines(run, target));
     if normal_durability && !v.is_empty() {
         v.push(ADVISORY_NOTE.to_string());
     }
@@ -1084,6 +1166,79 @@ mod tests {
     }
 
     #[test]
+    fn count_noun_is_singular_only_for_one() {
+        assert_eq!(count_noun(1, "file", "files"), "1 file");
+        assert_eq!(count_noun(0, "file", "files"), "0 files");
+        assert_eq!(count_noun(2, "file", "files"), "2 files");
+    }
+
+    #[test]
+    fn human_bytes_matches_the_progress_display() {
+        assert_eq!(human_bytes(15), "15 B");
+        assert_eq!(human_bytes(1_500), "1.46 KiB");
+        for n in [0, 4 << 30] {
+            assert_eq!(human_bytes(n), flux_ui::HumanBytes(n).to_string());
+        }
+    }
+
+    #[test]
+    fn elapsed_text_formats() {
+        for (ms, want) in [
+            (0, "0.00s"),
+            (350, "0.35s"),
+            (9_994, "9.99s"),
+            (9_995, "10.0s"),
+            (9_999, "10.0s"),
+            (10_000, "10.0s"),
+            (12_300, "12.3s"),
+            (59_949, "59.9s"),
+            (59_950, "1m 00s"),
+            (60_000, "1m 00s"),
+            (123_000, "2m 03s"),
+            (3_599_500, "1h 00m 00s"),
+            (3_723_000, "1h 02m 03s"),
+        ] {
+            assert_eq!(elapsed_text(ms), want, "{ms} ms");
+        }
+    }
+
+    #[test]
+    fn elapsed_text_survives_the_largest_value() {
+        // u64::MAX ms is 18_446_744_073_709_552 s after rounding; no overflow, no wrap to a tiny time.
+        assert_eq!(elapsed_text(u64::MAX), "5124095576030h 25m 52s");
+    }
+
+    #[test]
+    fn summary_line_reads_correctly_for_one_file_and_one_directory() {
+        let mut r = Report::pre_engine(false);
+        r.errors = 0;
+        r.files_copied = 1;
+        r.bytes_copied = 2;
+        r.duration_ms = 10;
+        assert_eq!(
+            summary_line(&r, 1),
+            "copied 1 file (2 B), created 1 directory in 0.01s; 0 failed, 0 skipped"
+        );
+    }
+
+    #[test]
+    fn summary_line_with_failures_and_suffixes_keeps_the_order() {
+        let mut r = Report::pre_engine(false);
+        r.errors = 2;
+        r.files_copied = 3;
+        r.bytes_copied = 1_500;
+        r.files_skipped = 1;
+        r.duration_ms = 350;
+        r.files_hardlinked = 1;
+        r.files_verified = 3;
+        r.excluded = 4;
+        assert_eq!(
+            summary_line(&r, 2),
+            "copied 3 files (1.46 KiB), created 2 directories in 0.35s; 2 failed, 1 skipped; 1 hardlinked; 3 verified; 4 excluded"
+        );
+    }
+
+    #[test]
     fn the_summary_and_dry_run_lines_end_with_an_excluded_suffix_only_when_non_zero() {
         let mut r = Report::pre_engine(false);
         r.errors = 0;
@@ -1092,18 +1247,18 @@ mod tests {
         r.excluded = 4;
         assert_eq!(
             summary_line(&r, 1),
-            "copied 2 files (3 bytes), created 1 directories; 0 failed, 0 skipped; 4 excluded"
+            "copied 2 files (3 B), created 1 directory in 0.00s; 0 failed, 0 skipped; 4 excluded"
         );
         r.files_verified = 3;
         r.files_mismatched = 1;
         assert_eq!(
             summary_line(&r, 1),
-            "copied 2 files (3 bytes), created 1 directories; 0 failed, 0 skipped; 3 verified; 1 mismatched; 4 excluded",
+            "copied 2 files (3 B), created 1 directory in 0.00s; 0 failed, 0 skipped; 3 verified; 1 mismatched; 4 excluded",
             "the suffix is the last"
         );
         assert_eq!(
             dry_run_summary_line(&r, 1),
-            "dry run: would copy 2 files (3 bytes), overwrite 0, skip 0, create 1 directories; 0 errors; 4 excluded"
+            "dry run: would copy 2 files (3 B), overwrite 0, skip 0, create 1 directory; 0 errors; 4 excluded"
         );
     }
 
@@ -1210,22 +1365,22 @@ mod tests {
         // The pre-verification literal, pinned: a zero report prints the line it always did.
         assert_eq!(
             summary_line(&r, 1),
-            "copied 2 files (3 bytes), created 1 directories; 0 failed, 0 skipped"
+            "copied 2 files (3 B), created 1 directory in 0.00s; 0 failed, 0 skipped"
         );
         r.files_verified = 3;
         assert_eq!(
             summary_line(&r, 1),
-            "copied 2 files (3 bytes), created 1 directories; 0 failed, 0 skipped; 3 verified"
+            "copied 2 files (3 B), created 1 directory in 0.00s; 0 failed, 0 skipped; 3 verified"
         );
         r.files_mismatched = 1;
         assert_eq!(
             summary_line(&r, 1),
-            "copied 2 files (3 bytes), created 1 directories; 0 failed, 0 skipped; 3 verified; 1 mismatched"
+            "copied 2 files (3 B), created 1 directory in 0.00s; 0 failed, 0 skipped; 3 verified; 1 mismatched"
         );
         r.files_verified = 0;
         assert_eq!(
             summary_line(&r, 1),
-            "copied 2 files (3 bytes), created 1 directories; 0 failed, 0 skipped; 1 mismatched"
+            "copied 2 files (3 B), created 1 directory in 0.00s; 0 failed, 0 skipped; 1 mismatched"
         );
     }
 
@@ -1440,7 +1595,7 @@ mod tests {
         let r = Report::tree(&TreeOutcome::default(), true, 0);
         assert_eq!(
             summary_line(&r, 0),
-            "copied 0 files (0 bytes), created 0 directories; 1 failed, 0 skipped"
+            "copied 0 files (0 B), created 0 directories in 0.00s; 1 failed, 0 skipped"
         );
     }
 
@@ -1807,6 +1962,65 @@ mod tests {
         let none = file_run_with(None);
         assert!(file_resume_verify_lines(&none).is_empty());
         assert_eq!(Report::file_run(&none, false, 1).resume_verify, None);
+    }
+
+    #[test]
+    fn checkpoint_warning_and_note_lines_split_the_old_output() {
+        use flux_core::{CheckpointDiscard, PartialResume};
+        let out = TreeOutcome {
+            partial_resumes: vec![PartialResume {
+                path: PathBuf::from("sub/big"),
+                reused: 3,
+                recopied: 2,
+            }],
+            checkpoint_discards: vec![CheckpointDiscard {
+                path: PathBuf::from("a"),
+                reason: Discard::PartialMissing,
+            }],
+            ..TreeOutcome::default()
+        };
+        assert_eq!(
+            checkpoint_warning_lines(&out),
+            vec!["checkpoints discarded for a: partial missing"]
+        );
+        assert_eq!(
+            checkpoint_note_lines(&out, true),
+            vec!["resumed sub/big: reused 3 bytes, recopied 2 bytes", ADVISORY_NOTE]
+        );
+        assert_eq!(
+            checkpoint_note_lines(&out, false),
+            vec!["resumed sub/big: reused 3 bytes, recopied 2 bytes"]
+        );
+        let discard_only = TreeOutcome { partial_resumes: Vec::new(), ..out };
+        assert_eq!(checkpoint_note_lines(&discard_only, true), vec![ADVISORY_NOTE]);
+        assert!(checkpoint_note_lines(&discard_only, false).is_empty());
+        assert!(checkpoint_warning_lines(&TreeOutcome::default()).is_empty());
+    }
+
+    #[test]
+    fn file_checkpoint_warning_and_note_lines_split_the_old_output() {
+        use flux_core::run::FileResume;
+        let run = file_run_with(Some(FileResume {
+            reused: 5,
+            recopied: 4,
+            discard: Some(Discard::MismatchAt(7)),
+        }));
+        assert_eq!(
+            file_checkpoint_warning_lines(&run, "t"),
+            vec!["checkpoints discarded for t: mismatch at offset 7"]
+        );
+        assert_eq!(
+            file_checkpoint_note_lines(&run, "t", true),
+            vec!["resumed t: reused 5 bytes, recopied 4 bytes", ADVISORY_NOTE]
+        );
+        let discard_only = file_run_with(Some(FileResume {
+            reused: 0,
+            recopied: 9,
+            discard: Some(Discard::MismatchAt(7)),
+        }));
+        assert_eq!(file_checkpoint_note_lines(&discard_only, "t", true), vec![ADVISORY_NOTE]);
+        assert!(file_checkpoint_note_lines(&discard_only, "t", false).is_empty());
+        assert!(file_checkpoint_warning_lines(&file_run_with(None), "t").is_empty());
     }
 
     #[test]
@@ -2297,12 +2511,12 @@ mod tests {
         r.files_overwritten = 1;
         assert_eq!(
             dry_run_summary_line(&r, 2),
-            "dry run: would copy 4 files (9 bytes), overwrite 1, skip 0, create 2 directories; 0 errors"
+            "dry run: would copy 4 files (9 B), overwrite 1, skip 0, create 2 directories; 0 errors"
         );
         r.files_hardlinked = 3;
         assert_eq!(
             dry_run_summary_line(&r, 2),
-            "dry run: would copy 4 files (9 bytes), overwrite 1, hardlink 3, skip 0, create 2 directories; 0 errors"
+            "dry run: would copy 4 files (9 B), overwrite 1, hardlink 3, skip 0, create 2 directories; 0 errors"
         );
     }
 
@@ -2493,14 +2707,14 @@ mod tests {
         r.bytes_copied = 3;
         assert_eq!(
             summary_line(&r, 1),
-            "copied 2 files (3 bytes), created 1 directories; 0 failed, 0 skipped"
+            "copied 2 files (3 B), created 1 directory in 0.00s; 0 failed, 0 skipped"
         );
         r.files_hardlinked = 1;
         r.hardlinks_degraded = 2;
         r.hardlinks_unchecked = 1;
         assert_eq!(
             summary_line(&r, 1),
-            "copied 2 files (3 bytes), created 1 directories; 0 failed, 0 skipped; 1 hardlinked; 2 hardlinks degraded; 1 hardlinks unchecked"
+            "copied 2 files (3 B), created 1 directory in 0.00s; 0 failed, 0 skipped; 1 hardlinked; 2 hardlinks degraded; 1 hardlinks unchecked"
         );
     }
 

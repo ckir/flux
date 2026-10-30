@@ -20,7 +20,7 @@ A long `flux copy` runs silently today: per-record failure lines as they happen 
 
 - N1. `flux verify` has no progress display.
 - N2. No pre-scan of the sources, so no percent or ETA for a folder (a single file has both, section 3.4).
-- N3. No `--progress` flag and no `--quiet` flag. The spec names neither `--progress` anywhere, and `--quiet` belongs to the logging section (spec section 54, lines 2860-2871; also line 750 and 5833), which is a separate unbuilt cut. The display follows one automatic rule (section 3.5).
+- N3. No `--progress` flag and no `--quiet` flag. The spec names neither `--progress` anywhere, and `--quiet` belongs to the logging section (spec section 54, lines 2860-2871; also line 750 and 5833), which is a separate unbuilt cut. The display follows one automatic rule (section 3.5). Built in cut 21: docs/superpowers/specs/2026-10-29-logging-quiet-design.md.
 - N4. The `Hardlinks`, `Degraded` and `Capacity wait` lines of spec section 52 are not shown. Capacity planning is not built (`ROADMAP.md` phase 9). `Hardlinks` and `Degraded` are counted at `tree.rs:2391`, `2393` and `4330`, and a live copy of those would be three more sites for lines that are zero in almost every run.
 - N5. No smoothed or windowed speed; no parallel-worker handling (the engine is sequential; the counters are atomics so a later parallel engine needs no redesign).
 - N6. No `tracing` setup, no log levels.

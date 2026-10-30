@@ -249,7 +249,7 @@ impl<F: DestinationRoot> Pass<'_, F> {
         check()?;
         let shown = self.holder_shown.join(name);
         match self.holder.remove_file(name) {
-            Ok(()) => actions.push(Action::Removed(shown)),
+            Ok(()) => push_removed(actions, shown),
             Err(e) if e.source.kind() == ErrorKind::NotFound => {
                 actions.push(skipped(entry, CHANGED))
             }
@@ -321,7 +321,7 @@ pub(crate) fn run_pass<F: DestinationRoot>(
     // An orphan the acquisition reclaimed is the `root-lock` row's action; it came first, since nothing else can
     // be deleted without the lock.
     if reclaimed.is_some() {
-        report.actions.push(Action::Removed(lock_shown.clone()));
+        push_removed(&mut report.actions, lock_shown.clone());
     }
     if let Some(name) = leftover_broken {
         let error = FsError::new(
@@ -500,7 +500,7 @@ pub(crate) fn finish_completed<D: DirHandle>(
             // `AlreadyGone` converges a re-run after a kill (artifact rule 4).
             Ok(_) => {
                 removed += 1;
-                actions.push(Action::Removed(dest_shown.join(&rel)));
+                push_removed(actions, dest_shown.join(&rel));
             }
             Err(error) => {
                 actions.push(Action::Kept { path: dest_shown.join(&rel), error });
@@ -512,7 +512,7 @@ pub(crate) fn finish_completed<D: DirHandle>(
     let id = state.operation_id.as_str();
     match retire_workspace(operations, id) {
         Ok(()) => {
-            actions.push(Action::Removed(operations_shown.join(id)));
+            push_removed(actions, operations_shown.join(id));
             Ok(Some(removed))
         }
         Err(error) => {
@@ -533,7 +533,7 @@ pub(crate) fn remove_debris<D: DirHandle>(
     check()?;
     let shown = operations_shown.join(name);
     match finish_retire(operations, name) {
-        Ok(()) => actions.push(Action::Removed(shown)),
+        Ok(()) => push_removed(actions, shown),
         // A stranger inside makes the directory not empty: kept, never emptied.
         Err(error) => actions.push(Action::Kept { path: shown, error }),
     }
@@ -575,7 +575,7 @@ pub(crate) fn abandon_and_sweep<F: DestinationRoot>(
         &ids,
         &|i| operations_shown.join(i),
         check,
-        &mut |path| actions.push(Action::Removed(path)),
+        &mut |path| push_removed(actions, path),
         &mut warnings,
     );
     for warning in warnings {
@@ -587,11 +587,17 @@ pub(crate) fn abandon_and_sweep<F: DestinationRoot>(
     if gone.iter().any(|g| g == id) {
         check()?;
         match retire_workspace(operations, id) {
-            Ok(()) => actions.push(Action::Removed(operations_shown.join(id))),
+            Ok(()) => push_removed(actions, operations_shown.join(id)),
             Err(error) => actions.push(Action::Kept { path: operations_shown.join(id), error }),
         }
     }
     Ok(())
+}
+
+/// Record that `shown` was removed, and announce it (a dry run never gets here: it returns before any removal).
+fn push_removed(actions: &mut Vec<Action>, shown: PathBuf) {
+    crate::oplog::emit(crate::oplog::Verb::Removed, &shown, None, None);
+    actions.push(Action::Removed(shown));
 }
 
 #[cfg(test)]
@@ -1452,5 +1458,33 @@ mod tests {
         assert!(r.entries.iter().all(|e| e.eligible));
         assert_eq!(r.summary().eligible, 2);
         assert!(r.actions.is_empty() && !r.failed());
+    }
+
+    #[test]
+    fn cleanup_emits_removed_per_entry_and_none_on_dry_run() {
+        let fs = completed_with_two_leftovers();
+        let (r, events) = crate::oplog::testing::capture(|| run(&fs, &cfg()));
+        let a = format!("/p/dest/{}", partial("a", 1));
+        let b = format!("/p/dest/sub/{}", partial("b", 1));
+        let ws = format!("{OPS}/{}", id(1));
+        assert_eq!(
+            events.iter().map(|e| (e.action.as_str(), e.path.as_str())).collect::<Vec<_>>(),
+            vec![("removed", a.as_str()), ("removed", b.as_str()), ("removed", ws.as_str())]
+        );
+        assert!(events.iter().all(|e| e.bytes.is_none() && e.to.is_none()), "{events:?}");
+        let removed: Vec<String> = r
+            .actions
+            .iter()
+            .filter_map(|x| match x {
+                Action::Removed(p) => Some(norm(p)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(removed, events.iter().map(|e| e.path.clone()).collect::<Vec<_>>());
+
+        let fs = completed_with_two_leftovers();
+        let (_, events) =
+            crate::oplog::testing::capture(|| run(&fs, &CleanupConfig { dry_run: true, ..cfg() }));
+        assert!(events.is_empty(), "{events:?}");
     }
 }

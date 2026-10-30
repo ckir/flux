@@ -11461,3 +11461,296 @@ fn a_run_without_a_handle_counts_as_before() {
     assert_eq!((plain.files_total, plain.files_copied), (with.files_total, with.files_copied));
     assert!(plain.files_total > 0);
 }
+
+// ---- Logging: the engine's `flux::op` events (logging design 5.2) ----
+
+mod op_events {
+    use super::*;
+    use crate::oplog::testing::{OpEvent, capture};
+
+    fn ev(action: &str, path: &str, bytes: Option<u64>, to: Option<&str>) -> OpEvent {
+        OpEvent {
+            action: action.to_string(),
+            path: path.to_string(),
+            bytes,
+            to: to.map(str::to_string),
+        }
+    }
+
+    fn actions(events: &[OpEvent]) -> Vec<(&str, &str)> {
+        events.iter().map(|e| (e.action.as_str(), e.path.as_str())).collect()
+    }
+
+    #[test]
+    fn tree_copy_emits_created_then_copied_in_walk_order() {
+        let fs = fake();
+        fs.add_symlink_to("/src/lnk", "/p/keep", flux_fs::LinkKind::Unspecified);
+        let ((r, got), events) = capture(|| run_tree(&fs, &cfg()));
+        ok(&r);
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(
+            events,
+            vec![
+                ev("copied", "a", Some(1), None),
+                ev("linked", "lnk", None, Some("/p/keep")),
+                ev("created", "sub", None, None),
+                ev("copied", "sub/b", Some(2), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_symlink_emits_linked_with_its_target() {
+        let fs = link_only_src();
+        let ((r, got), events) = capture(|| run_tree(&fs, &cfg()));
+        ok(&r);
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(events, vec![ev("linked", "l", None, Some("/p/keep"))]);
+    }
+
+    #[test]
+    fn a_replaced_file_emits_replaced_not_copied() {
+        let fs = dest_fake();
+        fs.write_file("/p/dest/a", b"old");
+        let ((r, got), events) = capture(|| run_tree(&fs, &cfg()));
+        ok(&r);
+        assert!(got.is_empty(), "{got:?}");
+        let for_a: Vec<_> = events.iter().filter(|e| e.path == "a").collect();
+        assert_eq!(for_a, vec![&ev("replaced", "a", Some(1), None)], "{events:?}");
+        // The next plain copy is not tainted by the hint.
+        assert!(events.contains(&ev("copied", "sub/b", Some(2), None)), "{events:?}");
+    }
+
+    #[test]
+    fn a_replaced_symlink_emits_replaced() {
+        let fs = link_only_src();
+        fs.create_dir(Path::new("/p/dest")).unwrap();
+        fs.write_file("/p/dest/l", b"already here");
+        let ((r, got), events) = capture(|| run_tree(&fs, &cfg()));
+        ok(&r);
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(events, vec![ev("replaced", "l", None, Some("/p/keep"))]);
+    }
+
+    #[test]
+    fn a_hardlink_member_emits_hardlinked_with_the_anchor() {
+        let (r, events) = {
+            let fs = tree_of(&["a1"]);
+            link_names(&fs, "/src", "a1", &["a2"]);
+            let o = CopyOptions { hardlinks: flux_fs::Hardlinks::Preserve, ..opts() };
+            let ((r, got), events) = capture(|| run_tree_with(&fs, &cfg(), &o));
+            assert!(got.is_empty(), "{got:?}");
+            (r, events)
+        };
+        assert_eq!(ok(&r).files_hardlinked, 1);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].action, "copied");
+        assert_eq!((events[0].path.as_str(), events[0].to.as_deref()), ("a1", None));
+        assert_eq!(
+            (events[1].action.as_str(), events[1].path.as_str(), events[1].to.as_deref()),
+            ("hardlinked", "a2", Some("a1"))
+        );
+    }
+
+    #[test]
+    fn a_resume_emits_resumed_for_a_file_and_a_symlink() {
+        let fs = resumable(100, b"o", 101, ClaimStatus::Created);
+        let ((r, got), events) = capture(|| run_tree_with(&fs, &resume(), &opts()));
+        ok(&r);
+        assert!(got.is_empty(), "{got:?}");
+        assert!(events.contains(&ev("resumed", "a", Some(1), None)), "{events:?}");
+
+        let fs = link_only_src();
+        prior3(&fs, 5, OpState::Transferring);
+        fs.add_symlink_to("/p/dest/l", "/p/keep", flux_fs::LinkKind::Unspecified);
+        claimed(&fs, 5, "l", ClaimStatus::Created, "l");
+        let ((r, got), events) = capture(|| run_tree_with(&fs, &resume(), &opts()));
+        ok(&r);
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(actions(&events), vec![("resumed", "l")], "{events:?}");
+    }
+
+    #[test]
+    fn an_update_skip_emits_skipped() {
+        let fs = FaultFs::new();
+        for d in ["/src", "/p", "/p/dest"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        put(&fs, "/src/d", b"new", 5);
+        put(&fs, "/p/dest/d", b"old", 99); // older, same size: skipped
+        let ((r, got), events) =
+            capture(|| run_tree_with(&fs, &cfg(), &with_policy(ExistingPolicy::Update)));
+        ok(&r);
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(events, vec![ev("skipped", "d", None, None)]);
+
+        // A skipped symlink (`link_one`'s site).
+        let fs = link_only_src();
+        fs.create_dir(Path::new("/p/dest")).unwrap();
+        fs.write_file("/p/dest/l", b"already here");
+        let ((r, _), events) =
+            capture(|| run_tree_with(&fs, &cfg(), &with_policy(ExistingPolicy::SkipExisting)));
+        ok(&r);
+        assert_eq!(events, vec![ev("skipped", "l", None, None)]);
+    }
+
+    #[test]
+    fn a_dry_run_emits_no_op_events() {
+        let (_, events) = capture(|| run_tree(&fake(), &dry()));
+        assert!(events.is_empty(), "a fresh dry run: {events:?}");
+
+        let fs = link_only_src();
+        fs.create_dir(Path::new("/p/dest")).unwrap();
+        fs.write_file("/p/dest/l", b"already here");
+        let (_, events) = capture(|| run_tree_with(&fs, &dry(), &opts()));
+        assert!(events.is_empty(), "a dry replaced link: {events:?}");
+        let (_, events) =
+            capture(|| run_tree_with(&fs, &dry(), &with_policy(ExistingPolicy::SkipExisting)));
+        assert!(events.is_empty(), "a dry skipped link: {events:?}");
+
+        let fs = dest_fake();
+        fs.write_file("/p/dest/a", b"old");
+        let (_, events) = capture(|| run_tree(&fs, &dry()));
+        assert!(events.is_empty(), "a dry replace: {events:?}");
+
+        let fs = resumable(100, b"o", 101, ClaimStatus::Created);
+        let (_, events) =
+            capture(|| run_tree_with(&fs, &RunConfig { resume: true, ..dry() }, &opts()));
+        assert!(events.is_empty(), "a dry resume: {events:?}");
+
+        let fs = tree_of(&["a1"]);
+        link_names(&fs, "/src", "a1", &["a2"]);
+        let o = CopyOptions { hardlinks: flux_fs::Hardlinks::Preserve, ..opts() };
+        let (_, events) = capture(|| run_tree_with(&fs, &dry(), &o));
+        assert!(events.is_empty(), "a dry hardlink pair: {events:?}");
+    }
+
+    #[test]
+    fn a_single_file_copy_emits_copied_with_the_destination_path() {
+        let fs = fake();
+        let (r, events) = capture(|| run_file(&fs, &cfg()));
+        assert!(matches!(r.copy, Some(Ok(_))), "{:?}", r.copy);
+        assert_eq!(events, vec![ev("copied", "/p/t", Some(1), None)]);
+
+        // A skipped single file.
+        let fs = fake();
+        fs.write_file("/p/t", b"old");
+        let o = CopyOptions { existing: flux_fs::ExistingPolicy::SkipExisting, ..opts() };
+        let (r, events) = capture(|| file(&fs, Path::new("/src/a"), Path::new("/p/t"), &o, &cfg()));
+        assert!(matches!(&r.copy, Some(Ok(out)) if out.skipped), "{:?}", r.copy);
+        assert_eq!(events, vec![ev("skipped", "/p/t", None, None)]);
+
+        // A dry run announces nothing.
+        let (_, events) = capture(|| run_file(&fake(), &dry()));
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    #[test]
+    fn a_failed_file_emits_no_copied_event() {
+        let fs = fake();
+        // The tree's `rename_no_replace` calls: the probe, the workspace publish, then `a` (3rd) and `sub/b`.
+        fs.fail_nth("rename_no_replace", 3, Code::IoError, std::io::ErrorKind::Other);
+        let ((r, got), events) = capture(|| run_tree(&fs, &cfg()));
+        ok(&r);
+        assert!(!got.is_empty(), "the publish was made to fail");
+        for failure in &got {
+            let shown = failure.path.to_string_lossy().replace('\\', "/");
+            assert!(
+                !events.iter().any(|e| e.action == "copied" && e.path == shown),
+                "{shown} failed yet was announced: {events:?}"
+            );
+        }
+        assert!(
+            events.contains(&ev("copied", "sub/b", Some(2), None)),
+            "the other file: {events:?}"
+        );
+
+        // The single-file path (`rename_replace` calls: two state writes, then the publish).
+        let fs = fake();
+        fs.fail_nth("rename_replace", 3, Code::IoError, std::io::ErrorKind::Other);
+        let (r, events) = capture(|| run_file(&fs, &cfg()));
+        assert!(matches!(r.copy, Some(Err(_))), "{:?}", r.copy);
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    #[test]
+    fn a_failed_publish_does_not_leak_its_verb_hint_to_the_next_file() {
+        // `dest/a` exists, so `a` is a replace; its publish fails; `sub/b` is a new file and must read `copied`.
+        let fs = dest_fake();
+        fs.write_file("/p/dest/a", b"old");
+        // The `rename_replace` calls: two manifest writes, then `a` (3rd).
+        fs.fail_nth("rename_replace", 3, Code::IoError, std::io::ErrorKind::Other);
+        let ((r, got), events) = capture(|| run_tree(&fs, &cfg()));
+        ok(&r);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(!events.iter().any(|e| e.path == "a"), "{events:?}");
+        assert!(events.contains(&ev("copied", "sub/b", Some(2), None)), "{events:?}");
+    }
+
+    #[test]
+    fn logging_off_builds_no_event_arguments() {
+        let build = || {
+            let fs = fake();
+            fs.add_symlink_to("/src/lnk", "/p/keep", flux_fs::LinkKind::Unspecified);
+            fs
+        };
+        let before = crate::oplog::built();
+        let fs = build();
+        assert!(!crate::oplog::enabled(), "logging reports enabled with no subscriber");
+        let (r, got) = run_tree(&fs, &cfg());
+        assert_eq!(ok(&r).files_copied, 3);
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(crate::oplog::built(), before, "an argument was built with no subscriber");
+        // Logging off changes nothing about the copy itself.
+        assert_eq!(fs.read_file("/p/dest/a").as_deref(), Some(&b"A"[..]));
+        assert_eq!(fs.read_file("/p/dest/sub/b").as_deref(), Some(&b"BB"[..]));
+
+        // The SAME run with a subscriber builds them and emits the events.
+        let fs = build();
+        let ((r, _), events) = capture(|| run_tree(&fs, &cfg()));
+        assert_eq!(ok(&r).files_copied, 3);
+        assert_eq!(events.len(), 4, "{events:?}");
+        assert_eq!(crate::oplog::built(), before + 4);
+    }
+
+    #[test]
+    fn engine_diagnostics_are_debug_and_trace_and_only_the_op_events_are_info() {
+        let fs = fake();
+        let ((r, got), tagged) = crate::oplog::testing::capture_tagged(|| run_tree(&fs, &cfg()));
+        ok(&r);
+        assert!(got.is_empty(), "{got:?}");
+        let tags: Vec<&str> = tagged.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(tags.iter().any(|t| t.starts_with("DEBUG ")), "no DEBUG event: {tags:?}");
+        assert!(tags.iter().any(|t| t.starts_with("TRACE ")), "no TRACE event: {tags:?}");
+        for t in tags.iter().filter(|t| t.ends_with(" flux::op")) {
+            assert_eq!(*t, "INFO flux::op");
+        }
+        assert!(tags.contains(&"INFO flux::op"), "{tags:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_control_character_in_a_name_reaches_the_event_escaped() {
+        let fs = fake();
+        fs.write_file("/src/x\u{1b}[2Ky", b"Z");
+        let ((r, got), events) = capture(|| run_tree(&fs, &cfg()));
+        ok(&r);
+        assert!(got.is_empty(), "{got:?}");
+        let e = events.iter().find(|e| e.path.starts_with('x')).expect("the file is announced");
+        assert_eq!(e.path, "x\\u{1b}[2Ky");
+        assert!(!e.path.contains('\x1b'), "{:?}", e.path);
+    }
+
+    #[test]
+    fn a_batched_replace_emits_one_replaced_and_no_copied() {
+        let fs = dest_fake();
+        fs.write_file("/p/dest/a", b"old");
+        let ((r, got), events) = capture(|| run_tree_with(&fs, &cfg(), &strict()));
+        ok(&r);
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(count(&calls(&fs), "claim_prepare_many("), 2, "the batch path ran");
+        let for_a: Vec<_> = events.iter().filter(|e| e.path == "a").collect();
+        assert_eq!(for_a, vec![&ev("replaced", "a", Some(1), None)], "{events:?}");
+        assert!(events.contains(&ev("copied", "sub/b", Some(2), None)), "{events:?}");
+    }
+}
