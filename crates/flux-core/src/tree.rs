@@ -5776,10 +5776,16 @@ mod tests {
         let Frame::Live { fresh, names, .. } = enter(&fs) else { panic!("expected a live frame") };
         assert!(fresh, "the first entry created /dst/sub");
         assert!(!names.is_tracked(), "a directory the run created records nothing");
+        let reads = |fs: &FaultFs| fs.calls().iter().filter(|c| c.starts_with("read_dir(")).count();
+        assert_eq!(reads(&fs), 0, "a directory the run created is never listed");
 
-        let Frame::Live { fresh, names, .. } = enter(&fs) else { panic!("expected a live frame") };
+        let Frame::Live { fresh, names, claim_parent, .. } = enter(&fs) else {
+            panic!("expected a live frame")
+        };
         assert!(!fresh, "the second entry found /dst/sub already there");
         assert!(names.is_tracked(), "a pre-existing directory is tracked");
+        assert!(claim_parent.is_some(), "the directory keys claims, so its listing is read");
+        assert_eq!(reads(&fs), 1, "a pre-existing directory is listed exactly once");
     }
 
     #[test]
