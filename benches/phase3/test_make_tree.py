@@ -86,6 +86,39 @@ class MakeTreeTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 make_tree.build("bogus", Path(t) / "tree", 1, 1, 1)
 
+    def test_negative_files_is_refused(self):
+        with tempfile.TemporaryDirectory() as t:
+            d = Path(t) / "tree"
+            with self.assertRaises(ValueError):
+                make_tree.build("small", d, -1, 4096, 2)
+            self.assertFalse(d.exists())
+
+    def test_negative_size_is_refused_for_small_and_links_only(self):
+        with tempfile.TemporaryDirectory() as t:
+            for kind in ("small", "links"):
+                d = Path(t) / kind
+                with self.assertRaises(ValueError):
+                    make_tree.build(kind, d, 4, -1, 2)
+                self.assertFalse(d.exists())
+            self.assertEqual(make_tree.build("flat", Path(t) / "flat", 3, -1, 1), 3)
+
+    def test_zero_dirs_is_refused_for_small_and_links_only(self):
+        with tempfile.TemporaryDirectory() as t:
+            for kind in ("small", "links"):
+                d = Path(t) / kind
+                with self.assertRaises(ValueError):
+                    make_tree.build(kind, d, 4, 4096, 0)
+                self.assertFalse(d.exists())
+            self.assertEqual(make_tree.build("flat", Path(t) / "flat", 3, 0, 0), 3)
+
+    def test_a_regular_file_as_destination_is_refused(self):
+        with tempfile.TemporaryDirectory() as t:
+            f = Path(t) / "afile"
+            f.write_bytes(b"keep")
+            with self.assertRaises(FileExistsError):
+                make_tree.build("small", f, 1, 1, 1)
+            self.assertEqual(f.read_bytes(), b"keep")
+
 
 if __name__ == "__main__":
     unittest.main()

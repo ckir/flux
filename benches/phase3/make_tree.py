@@ -22,9 +22,18 @@ def build(kind, dest, files, size, dirs):
     """Create a tree of `kind` under `dest` and return the number of files made."""
     if kind not in KINDS:
         raise ValueError(f"unknown kind: {kind!r}")
+    if files < 0:
+        raise ValueError("files must not be negative")
+    if kind in ("small", "links"):
+        if size < 0:
+            raise ValueError("size must not be negative")
+        if dirs < 1:
+            raise ValueError("dirs must be at least 1")
     if kind == "links" and files % 2 != 0:
         raise ValueError("links needs an even number of files")
     dest = Path(dest)
+    if dest.exists() and not dest.is_dir():
+        raise FileExistsError(f"destination is not a directory: {dest}")
     if dest.exists() and any(dest.iterdir()):
         raise FileExistsError(f"destination is not empty: {dest}")
     dest.mkdir(parents=True, exist_ok=True)
