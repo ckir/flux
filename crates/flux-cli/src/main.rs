@@ -841,6 +841,7 @@ fn verify_options(args: &VerifyArgs) -> flux_core::verify::VerifyOptions {
         },
         selection: selection_of(&args.exclude, args.no_recursive)
             .expect("validated at the top of copy/verify"),
+        scratch_dir: None,
     }
 }
 
@@ -932,7 +933,7 @@ fn verify_one(args: &VerifyArgs, source: &Path, dest: &Path) -> u8 {
         Ok(summary) => summary,
         Err(e) => {
             err(&refusal_line(&e, &dst));
-            return exit_code::USAGE;
+            return verify_error_code(&e);
         }
     };
     let code = exit_code::for_verify(&summary);
@@ -1027,7 +1028,7 @@ fn verify_several_cli(args: &VerifyArgs) -> u8 {
         Ok(total) => total,
         Err(e) => {
             err(&refusal_line(&e, &dst));
-            return exit_code::USAGE;
+            return verify_error_code(&e);
         }
     };
     let code = exit_code::for_verify(&total);
@@ -1048,7 +1049,15 @@ fn verify_several_cli(args: &VerifyArgs) -> u8 {
     code
 }
 
-/// The one error line for a verify that did not run (exit 2); `dst` is the canonical destination.
+/// The exit code of a verify that ended in `e`: a failed walk is an operation failure (1), a refusal is exit 2.
+fn verify_error_code(e: &VerifyError) -> u8 {
+    match e {
+        VerifyError::Failed { .. } => exit_code::FAILED,
+        _ => exit_code::USAGE,
+    }
+}
+
+/// The one error line for a verify that did not run (exit 2) or failed (exit 1); `dst` is the canonical destination.
 fn refusal_line(e: &VerifyError, dst: &Path) -> String {
     match e {
         VerifyError::RefusedRoots { reason } | VerifyError::RefusedNames { reason } => {
@@ -1058,6 +1067,7 @@ fn refusal_line(e: &VerifyError, dst: &Path) -> String {
             verify_report::refused_root_line(name, dst, reason)
         }
         VerifyError::RefusedAlias { a, b } => verify_report::refused_alias_line(a, b),
+        VerifyError::Failed { error } => format!("error: verify stopped: {}", error.source),
     }
 }
 

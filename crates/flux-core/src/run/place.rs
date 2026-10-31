@@ -542,6 +542,7 @@ impl<F: DestinationRoot> Place<F::Dir> for TreePlace<'_, F> {
             &|id| self.shown(id),
             &mut || checked(locked),
             &mut |_| {},
+            scratch,
             warnings,
         )
     }

@@ -1075,9 +1075,18 @@ fn dry_trees<'h, F: DestinationRoot>(
         (place.tree.dest_shown.clone(), place.tree.operations_shown(), place.tree.dest.is_none());
     let mut restart_preview = |priors: &[PriorOp], warnings: &mut Vec<RunWarning>| {
         if absent {
-            DryPrior::Restart { superseded: Vec::new(), partials_found: Vec::new(), states: 0 }
+            Ok(DryPrior::Restart { superseded: Vec::new(), partials_found: Vec::new(), states: 0 })
         } else {
-            dry_restart(fs, &dest_shown, &operations_shown, priors, warnings, &mut *on_report)
+            dry_restart(
+                fs,
+                &dest_shown,
+                &operations_shown,
+                priors,
+                Some(scratch),
+                warnings,
+                &mut *on_report,
+            )
+            .map_err(|e| failed(RunStep::State, &operations_shown, e))
         }
     };
     // Spec 4.6: a dry `--resume` walks against a repaired copy of the prior's store; the copy and the directory holding

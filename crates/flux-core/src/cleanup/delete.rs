@@ -576,6 +576,7 @@ pub(crate) fn abandon_and_sweep<F: DestinationRoot>(
         &|i| operations_shown.join(i),
         check,
         &mut |path| push_removed(actions, path),
+        None,
         &mut warnings,
     );
     for warning in warnings {

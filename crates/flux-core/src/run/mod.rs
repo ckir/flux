@@ -1373,6 +1373,11 @@ fn dry_prior_notes(scan: &crate::prior::Scan, warnings: &mut Vec<RunWarning>) ->
 type ResumePreview<'a> = dyn FnMut(&crate::prior::PriorOp, &mut DryRun, &mut Vec<RunWarning>) -> Result<DryPrior, RunError>
     + 'a;
 
+/// Spec 3.5: the dry `--restart` preview of the superseded priors: its `DryPrior`, or the failure of the sweep's walk
+/// (a fatal scratch error), which ends the preview.
+type RestartPreview<'a> =
+    dyn FnMut(&[crate::prior::PriorOp], &mut Vec<RunWarning>) -> Result<DryPrior, RunError> + 'a;
+
 /// Cut 18: what a place with more to create than the workspace previews where the real run creates it.
 type CreatePreview<'a> = dyn FnMut(&mut DryRun, &mut Vec<RunWarning>) -> Result<(), RunError> + 'a;
 
@@ -1396,7 +1401,7 @@ fn dry_start<D: DirHandle, P: Place<D>>(
     capability: LockCapability,
     place: &P,
     cfg: &RunConfig,
-    restart_preview: &mut dyn FnMut(&[crate::prior::PriorOp], &mut Vec<RunWarning>) -> DryPrior,
+    restart_preview: &mut RestartPreview<'_>,
     resume_preview: &mut ResumePreview<'_>,
     create_preview: &mut CreatePreview<'_>,
     warnings: &mut Vec<RunWarning>,
@@ -1437,7 +1442,11 @@ fn dry_start<D: DirHandle, P: Place<D>>(
         if let Err(e) = create_preview(&mut dry, warnings) {
             return DryStart::Stop(e, dry);
         }
-        dry.prior = Some(restart_preview(&scan.resumable, warnings));
+        match restart_preview(&scan.resumable, warnings) {
+            Ok(p) => dry.prior = Some(p),
+            // A fatal walk error in the preview: the listing is incomplete, so nothing is reported as superseded.
+            Err(e) => return DryStart::Stop(e, dry),
+        }
     } else if scan.resumable.is_empty() {
         if let Err(e) = create_preview(&mut dry, warnings) {
             return DryStart::Stop(e, dry);
@@ -1514,9 +1523,18 @@ fn dry_tree<'h, F: DestinationRoot>(
     let place_fs = place.fs;
     let mut restart_preview = |priors: &[crate::prior::PriorOp], warnings: &mut Vec<RunWarning>| {
         if absent_dest {
-            DryPrior::Restart { superseded: Vec::new(), partials_found: Vec::new(), states: 0 }
+            Ok(DryPrior::Restart { superseded: Vec::new(), partials_found: Vec::new(), states: 0 })
         } else {
-            dry_restart(place_fs, &dest_shown, &operations_shown, priors, warnings, &mut *on_report)
+            dry_restart(
+                place_fs,
+                &dest_shown,
+                &operations_shown,
+                priors,
+                Some(scratch),
+                warnings,
+                &mut *on_report,
+            )
+            .map_err(|e| session::failed(RunStep::State, &operations_shown, e))
         }
     };
     // Spec 3.4: a dry `--resume` of one resumable prior walks against a repaired copy of its store; the copy and the
@@ -1669,14 +1687,14 @@ fn dry_file<F: DestinationRoot>(
                 partials_found.push(PathBuf::from(name));
             }
         }
-        DryPrior::Restart {
+        Ok(DryPrior::Restart {
             superseded: priors
                 .iter()
                 .map(|p| (p.state.operation_id.clone(), p.state.state))
                 .collect(),
             partials_found,
             states: priors.len() as u64,
-        }
+        })
     };
     let mut prior_id: Option<String> = None;
     let mut resume_preview =

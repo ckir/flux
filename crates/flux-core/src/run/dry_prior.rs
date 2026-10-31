@@ -20,6 +20,7 @@ use crate::lock::{
     uncertain_refusal, untrusted_refusal,
 };
 use crate::prior::PriorOp;
+use crate::scratch::ScratchSpace;
 use crate::state::{FLUX_DIR, OPERATIONS_DIR, OpState, Root, STATE_DB};
 use crate::tree::{TreeFailure, TreeFailureCause};
 #[cfg(test)]
@@ -185,9 +186,10 @@ pub(crate) fn dry_restart<F: DestinationRoot>(
     dest_shown: &Path,
     operations_shown: &Path,
     priors: &[PriorOp],
+    scratch: Option<&ScratchSpace<'_>>,
     warnings: &mut Vec<RunWarning>,
     on_report: &mut dyn FnMut(TreeFailure),
-) -> DryPrior {
+) -> Result<DryPrior, FsError> {
     for prior in priors {
         let path = PathBuf::from(".flux/operations").join(&prior.state.operation_id);
         on_report(discard(path, PlannedObject::State));
@@ -197,18 +199,19 @@ pub(crate) fn dry_restart<F: DestinationRoot>(
     let (found, _) = if ids.is_empty() {
         (Vec::new(), false)
     } else {
-        partials_under(fs, dest_shown, operations_shown, &ids, warnings)
+        // No liveness check: a dry run holds no lock. A fatal walk error ends the preview.
+        partials_under(fs, dest_shown, operations_shown, &ids, scratch, &mut || Ok(()), warnings)?
     };
     let mut partials_found = Vec::with_capacity(found.len());
     for (path, _) in found {
         on_report(discard(path.clone(), PlannedObject::Partial));
         partials_found.push(path);
     }
-    DryPrior::Restart {
+    Ok(DryPrior::Restart {
         superseded: priors.iter().map(|p| (p.state.operation_id.clone(), p.state.state)).collect(),
         partials_found,
         states: priors.len() as u64,
-    }
+    })
 }
 
 /// Cut 11b, spec 3.4 step 2: the private directory `<temp root>/flux-dry-<operation id>` a dry `--resume` copies the

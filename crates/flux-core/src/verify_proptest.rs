@@ -658,7 +658,7 @@ fn fixture_snippet(case: &Case) -> String {
     }
     let _ = writeln!(
         out,
-        "let o = VerifyOptions {{ links: Links::{:?}, mounts: MountPolicy::{:?}, hash: HashAlgorithm::Blake3, selection: Default::default() }};",
+        "let o = VerifyOptions {{ links: Links::{:?}, mounts: MountPolicy::{:?}, hash: HashAlgorithm::Blake3, selection: Default::default(), scratch_dir: None }};",
         case.links, case.mounts
     );
     out
@@ -906,6 +906,7 @@ mod tests {
             mounts: case.mounts,
             hash: HashAlgorithm::Blake3,
             selection: Default::default(),
+            scratch_dir: None,
         };
         let mut records = Vec::new();
         let summary =
@@ -940,7 +941,7 @@ mod tests {
             "fs.add_special(\"/s/o\");",
             "fs.set_mount_root(\"/s/d\", MountRoot::Yes);",
             "fs.fail_read_dir_of(\"/s/d\", Code::IoError, std::io::ErrorKind::Other);",
-            "let o = VerifyOptions { links: Links::Skip, mounts: MountPolicy::Stay, hash: HashAlgorithm::Blake3, selection: Default::default() };",
+            "let o = VerifyOptions { links: Links::Skip, mounts: MountPolicy::Stay, hash: HashAlgorithm::Blake3, selection: Default::default(), scratch_dir: None };",
         ] {
             assert!(text.contains(want), "missing {want:?} in:\n{text}");
         }
@@ -977,6 +978,7 @@ mod tests {
                 mounts: case.mounts,
                 hash: HashAlgorithm::Blake3,
                 selection: Default::default(),
+                scratch_dir: None,
             };
             let mut rows = Vec::new();
             verify_tree(&fs, Path::new("/s"), Path::new("/d"), &opts, &mut |r| rows.push(row(&r)))
@@ -1317,6 +1319,7 @@ mod tests {
                 mounts: case.mounts,
                 hash: HashAlgorithm::Blake3,
                 selection: Default::default(),
+                scratch_dir: None,
             };
             let mut rows = Vec::new();
             let result =

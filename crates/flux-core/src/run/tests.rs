@@ -11877,7 +11877,8 @@ fn a_failed_heartbeat_during_a_spilled_listing_stops_the_copy() {
 
 /// Pins that a `--restart` over a spilling source completes, spilling into the NEW operation's workspace and never the
 /// superseded one. It does NOT pin the placement inside `TreePlace::sweep`: `drive` places the same workspace right
-/// after `open_operation`, so the test passes without it. Task 6 (the sweep walks with the scratch) pins that.
+/// after `open_operation`, so the test passes without it. `a_restart_sweep_over_a_spilling_dest_uses_the_new_workspace`
+/// (the sweep walks with the scratch) pins that.
 #[test]
 fn a_restart_over_a_spilling_source_completes_into_the_new_workspace() {
     let fs = flat_source(20);
@@ -11989,4 +11990,60 @@ fn a_dry_run_that_never_spills_creates_nothing_even_when_the_temporary_directory
         calls(&fs)[base..].iter().filter(|c| c.starts_with("create_dir(")).cloned().collect();
     assert!(made.is_empty(), "a run that never spills makes nothing: {made:?}");
     assert!(scratch_homes(&fs).is_empty());
+}
+
+/// A prior operation's state, its partial and `n` other files in DEST, and a small source: only the `--restart` sweep
+/// lists DEST's root, so only it can spill there.
+fn restart_dest_fs(n: usize) -> FaultFs {
+    let fs = fake();
+    prior(&fs, 5, OpState::Transferring);
+    fs.write_file(format!("/p/dest/a.flux-partial.{}", id(5)), b"half");
+    for i in 0..n {
+        fs.write_file(format!("/p/dest/old{i:02}"), b"x");
+    }
+    fs
+}
+
+/// Pins the placement at the top of `TreePlace::sweep`: the sweep runs inside `open_operation`, before `drive` places
+/// the scratch, so without it the sweep's own spill meets an unplaced space (a fatal scratch error).
+#[test]
+fn a_restart_sweep_over_a_spilling_dest_uses_the_new_workspace() {
+    let fs = restart_dest_fs(20);
+    let (r, got) = run_tree_small(&fs, &restart(), spilling());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(ok(&r).files_copied, 2);
+    assert_eq!(
+        scratch_homes(&fs),
+        [format!("/p/dest/.flux/operations/{ID}")],
+        "the sweep's spill, on the NEW operation's workspace: {:?}",
+        calls(&fs)
+    );
+    assert!(!fs.exists(format!("/p/dest/a.flux-partial.{}", id(5))), "the partial was swept");
+}
+
+#[test]
+fn a_dry_restart_whose_sweep_walk_fails_fatally_stops_the_preview() {
+    let fs = restart_dest_fs(20);
+    fs.create_dir(Path::new("/t")).unwrap();
+    fs.fail("create_scratch", Code::DiskFull);
+    let c = RunConfig { restart: true, ..dry_in_t() };
+    let (r, got) = run_tree_small(&fs, &c, spilling());
+    let Some(RunError::Failed { step, error, .. }) = &r.stop else {
+        panic!("the preview must stop: {:?}", r.stop);
+    };
+    assert_eq!((*step, error.code), (RunStep::State, Code::DiskFull));
+    let reported_restart = r
+        .dry
+        .as_ref()
+        .is_some_and(|d| matches!(d.prior, Some(crate::dry_run::DryPrior::Restart { .. })));
+    assert!(!reported_restart, "nothing is reported as a restart: {:?}", r.dry);
+    assert!(r.copy.is_none(), "{:?}", r.copy);
+    assert!(
+        !got.iter().any(|f| matches!(
+            &f.cause,
+            TreeFailureCause::Planned(PlannedEntry { object: PlannedObject::Partial, .. })
+        )),
+        "no partial is planned for discard: {got:?}"
+    );
 }
