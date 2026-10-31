@@ -123,13 +123,15 @@ pub fn scan_file<D: DirHandle>(
     parent_shown: &Path,
     own_id: &str,
 ) -> LockResult<Scan> {
-    let mut ids: Vec<String> = parent
-        .read_dir()?
-        .iter()
-        .filter_map(|e| id_after(&e.name, RECORD_INFIX))
-        .filter(|id| *id != own_id)
-        .map(str::to_string)
-        .collect();
+    let mut ids: Vec<String> = Vec::new();
+    parent.read_dir_each(&mut |e| {
+        if let Some(id) = id_after(&e.name, RECORD_INFIX)
+            && id != own_id
+        {
+            ids.push(id.to_string());
+        }
+        Ok(std::ops::ControlFlow::Continue(()))
+    })?;
     ids.sort();
     ids.dedup();
     let mut scan = Scan::default();
@@ -469,6 +471,41 @@ mod tests {
         workspace(&fs, 1, Some(&state(1, Kind::Tree, OpState::Created).encode()));
         workspace(&fs, 2, Some(b"garbage"));
         assert_eq!(refusal(scan(&d, 0)).code, LockCode::StateCorrupt);
+    }
+
+    #[test]
+    fn scan_file_keeps_only_the_records_among_many_names() {
+        let rec = |n: u8| record_name(OsStr::new("t"), &id(n)).into_string().unwrap();
+        let fill = |fs: &FaultFs| {
+            fs.write_file(
+                format!("/p/dest/{}", rec(1)),
+                &state(1, Kind::File, OpState::Created).encode(),
+            );
+            fs.write_file(
+                format!("/p/dest/{}", rec(2)),
+                &state(2, Kind::File, OpState::Completed).encode(),
+            );
+            // The own id is never a prior operation.
+            fs.write_file(
+                format!("/p/dest/{}", rec(6)),
+                &state(6, Kind::File, OpState::Created).encode(),
+            );
+        };
+        let (few_fs, few) = dest();
+        fill(&few_fs);
+        let want = scan_file(&few, OsStr::new("t"), Path::new("P"), &id(6)).unwrap();
+        assert_eq!(want.resumable.len() + want.completed.len(), 2);
+
+        let (fs, d) = dest();
+        for i in 0..5_000 {
+            fs.write_file(format!("/p/dest/unrelated{i:05}"), b"");
+        }
+        fill(&fs);
+        let base = fs.calls().len();
+        let got = scan_file(&d, OsStr::new("t"), Path::new("P"), &id(6)).unwrap();
+        assert_eq!(got, want);
+        let reads = fs.calls()[base..].iter().filter(|c| c.starts_with("read_dir(")).count();
+        assert_eq!(reads, 1, "{:?}", &fs.calls()[base..]);
     }
 
     #[test]

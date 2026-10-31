@@ -322,16 +322,22 @@ pub(crate) fn discover<F: DestinationRoot>(
     // Every `<lock>.broken.<id>` beside the lock, by name, classified by its own record.
     let mut prefix = lock_name;
     prefix.push(".broken.");
-    match located.holder.read_dir() {
+    let mut matches: Vec<OsString> = Vec::new();
+    let streamed = located.holder.read_dir_each(&mut |item| {
+        let bytes = item.name.as_encoded_bytes();
+        if item.file_type == FileType::File
+            && bytes.len() > prefix.len()
+            && bytes.starts_with(prefix.as_encoded_bytes())
+        {
+            matches.push(item.name);
+        }
+        Ok(std::ops::ControlFlow::Continue(()))
+    });
+    match streamed {
         Err(e) => listing_failed = listing_failed.or(Some((located.holder_shown.clone(), e))),
-        Ok(mut listing) => {
-            listing.sort_by(|a, b| a.name.cmp(&b.name));
-            for item in listing.iter().filter(|i| i.file_type == FileType::File) {
-                let bytes = item.name.as_encoded_bytes();
-                if bytes.len() <= prefix.len() || !bytes.starts_with(prefix.as_encoded_bytes()) {
-                    continue;
-                }
-                let broken: OsString = item.name.clone();
+        Ok(()) => {
+            matches.sort();
+            for broken in matches {
                 let probe = match probe_lock(&located.holder, &broken, &site, cfg.now) {
                     Ok(LockProbe::Absent) => continue,
                     Ok(p) => p,
@@ -754,6 +760,63 @@ mod tests {
         );
         assert!(found.entries[0].0.eligible);
         assert!(!found.entries[1].0.eligible);
+    }
+
+    #[test]
+    fn lock_discovery_keeps_only_the_broken_files_of_the_lock() {
+        let build = |unrelated: usize| {
+            let (fs, d) = setup();
+            for i in 0..unrelated {
+                fs.write_file(format!("/p/unrelated{i:05}"), b"");
+            }
+            let (a, b) = (5u8, 6u8);
+            put_lock(
+                &d,
+                &format!("dest.flux-lock.broken.{}", id(a)),
+                a,
+                &format!("operations/{}", id(a)),
+                NOW - 60 * SEC,
+            );
+            put_lock(
+                &d,
+                &format!("dest.flux-lock.broken.{}", id(b)),
+                b,
+                &format!("operations/{}", id(b)),
+                NOW - 5 * SEC,
+            );
+            fs.create_dir(Path::new("/p/dest.flux-lock.broken.dir")).unwrap();
+            (fs, d)
+        };
+        let (few_fs, _few) = build(0);
+        let want = summary(&run(&few_fs, &cfg()).unwrap());
+        assert_eq!(want.len(), 2, "{want:?}");
+
+        let (fs, _d) = build(5_000);
+        let base = calls(&fs).len();
+        let got = summary(&run(&fs, &cfg()).unwrap());
+        assert_eq!(got, want);
+        let reads = calls(&fs)[base..].iter().filter(|c| *c == "read_dir(/p)").count();
+        assert_eq!(reads, 1, "{:?}", &calls(&fs)[base..]);
+    }
+
+    #[test]
+    fn broken_files_are_discovered_in_name_order_whatever_the_listing_order() {
+        let (fs, d) = setup();
+        // The fake lists files in hash order, so twelve names are out of order with near certainty.
+        let want: Vec<String> =
+            (1u8..=12).map(|n| format!("dest.flux-lock.broken.{}", id(n))).collect();
+        for n in 1u8..=12 {
+            put_lock(
+                &d,
+                &want[n as usize - 1],
+                n,
+                &format!("operations/{}", id(n)),
+                NOW - 60 * SEC,
+            );
+        }
+        let found = run(&fs, &cfg()).unwrap();
+        let got: Vec<String> = summary(&found).into_iter().map(|(_, name, _)| name).collect();
+        assert_eq!(got, want);
     }
 
     #[test]

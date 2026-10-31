@@ -22,9 +22,11 @@ use crate::lock::{
 use crate::prior::PriorOp;
 use crate::state::{FLUX_DIR, OPERATIONS_DIR, OpState, Root, STATE_DB};
 use crate::tree::{TreeFailure, TreeFailureCause};
+#[cfg(test)]
+use flux_fs::DirEntry;
 use flux_fs::{
-    ClaimStore, Code, CopyOptions, DestinationRoot, DirEntry, DirHandle, FileHandle, FileIdentity,
-    FsError, LockCapability,
+    ClaimStore, Code, CopyOptions, DestinationRoot, DirHandle, FileHandle, FileIdentity, FsError,
+    LockCapability,
 };
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
@@ -108,15 +110,40 @@ pub(crate) fn dry_lock_record<D: DirHandle>(
     (preview, true)
 }
 
+/// The bytes every `.broken.` leftover of the lock `lock_name` starts with.
+pub(crate) fn broken_prefix(lock_name: &OsStr) -> Vec<u8> {
+    let mut prefix = lock_name.as_encoded_bytes().to_vec();
+    prefix.extend_from_slice(b".broken.");
+    prefix
+}
+
+/// `broken_leftovers` over a streamed pass of `dir`: the same warnings in stream order, none kept but the matches. A
+/// listing error is ignored (best-effort, as `dry_lock`'s).
+pub(crate) fn broken_leftovers_in<D: DirHandle>(
+    dir: &D,
+    lock_name: &OsStr,
+    warnings: &mut Vec<RunWarning>,
+) {
+    let prefix = broken_prefix(lock_name);
+    let _ = dir.read_dir_each(&mut |entry| {
+        if entry.name.as_encoded_bytes().starts_with(&prefix) {
+            warnings.push(RunWarning::DryRunBrokenLeftover {
+                name: entry.name.to_string_lossy().into_owned(),
+            });
+        }
+        Ok(std::ops::ControlFlow::Continue(()))
+    });
+}
+
 /// The `.broken.` leftovers of one lock that a real run would reclaim, noted from an already-read listing so
 /// several locks can share one directory read.
+#[cfg(test)]
 pub(crate) fn broken_leftovers(
     entries: &[DirEntry],
     lock_name: &OsStr,
     warnings: &mut Vec<RunWarning>,
 ) {
-    let mut prefix = lock_name.as_encoded_bytes().to_vec();
-    prefix.extend_from_slice(b".broken.");
+    let prefix = broken_prefix(lock_name);
     for entry in entries {
         if entry.name.as_encoded_bytes().starts_with(&prefix) {
             warnings.push(RunWarning::DryRunBrokenLeftover {
@@ -136,8 +163,8 @@ pub(crate) fn dry_lock<D: DirHandle>(
     warnings: &mut Vec<RunWarning>,
 ) -> LockPreview {
     let (preview, scan) = dry_lock_record(site, break_lock, capability, now_ns, warnings);
-    if scan && let Ok(entries) = site.dir().read_dir() {
-        broken_leftovers(&entries, site.lock_name(), warnings);
+    if scan {
+        broken_leftovers_in(site.dir(), site.lock_name(), warnings);
     }
     preview
 }

@@ -8395,6 +8395,25 @@ fn broken_leftovers_notes_exactly_the_entries_of_one_lock() {
 }
 
 #[test]
+fn broken_leftovers_in_agrees_with_the_slice_version() {
+    use super::dry_prior::{broken_leftovers, broken_leftovers_in};
+    let fs = fake();
+    for n in ["a.flux-lock.broken.1", "a.flux-lock", "b.flux-lock.broken.2", "a.flux-lock.broken"] {
+        fs.write_file(format!("/p/{n}"), b"");
+    }
+    for i in 0..1_000 {
+        fs.write_file(format!("/p/unrelated{i:04}"), b"");
+    }
+    let dir = fs.destination_root(Path::new("/p")).unwrap();
+    let mut want = Vec::new();
+    broken_leftovers(&dir.read_dir().unwrap(), OsStr::new("a.flux-lock"), &mut want);
+    let mut got = Vec::new();
+    broken_leftovers_in(&dir, OsStr::new("a.flux-lock"), &mut got);
+    assert_eq!(want.len(), 1, "{want:?}");
+    assert_eq!(format!("{got:?}"), format!("{want:?}"));
+}
+
+#[test]
 fn dry_lock_never_opens_or_locks() {
     use super::dry_prior::dry_lock;
     let dest = OsStr::new("dest");
