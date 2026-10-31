@@ -410,7 +410,7 @@ mod tests {
     use super::*;
     use crate::fault_fs::FaultFs;
     use crate::scratch::Thresholds;
-    use flux_fs::{DestinationRoot, FileSystem};
+    use flux_fs::{Code, DestinationRoot, FileSystem};
     use proptest::prelude::*;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
@@ -608,5 +608,110 @@ mod tests {
         assert!(items.last().unwrap().is_err(), "the error ends the sequence");
         assert!(reader.next().is_none());
         assert!(reader.next().is_none());
+    }
+
+    /// Sorts, writes, cascades and merges `runs`, each one run of the file; the merged entries.
+    fn spill_and_merge(t: Thresholds, runs: Vec<Vec<DirEntry>>) -> Vec<DirEntry> {
+        let fs = FaultFs::new();
+        let space = placed(&fs, t);
+        let region = space.begin(space.next_owner()).unwrap();
+        let mut spans = Vec::new();
+        for mut run in runs {
+            sort_entries(&mut run);
+            spans.push(write_run(&space, &run).unwrap());
+        }
+        let spans = cascade(&space, spans, &mut |_| Ok(())).unwrap();
+        assert!(spans.len() <= t.merge_fan_in);
+        MergeReader::new(&space, spans, region).unwrap().collect::<Result<_, _>>().unwrap()
+    }
+
+    fn by_bytes(mut v: Vec<DirEntry>) -> Vec<DirEntry> {
+        v.sort_by(|a, b| a.name.as_encoded_bytes().cmp(b.name.as_encoded_bytes()));
+        v
+    }
+
+    #[test]
+    fn names_sharing_an_eight_byte_prefix_merge_in_byte_order() {
+        let mut names: Vec<String> = vec![String::from("commonprefix_")];
+        for len in 1..=3 {
+            for bits in 0..(1u32 << len) {
+                let suffix: String =
+                    (0..len).map(|i| if bits >> i & 1 == 0 { 'a' } else { 'b' }).collect();
+                names.push(format!("commonprefix_{suffix}"));
+            }
+        }
+        // The zero-padding boundary: "a" pads to the same u64 as "a\0" and "a\0\0\0\0\0\0\0".
+        for zeros in [0usize, 1, 2, 7, 8] {
+            names.push(format!("a{}", "\0".repeat(zeros)));
+        }
+        let n = names.len();
+        assert_eq!(n, 20);
+        // 7 is coprime with 20: a deterministic scramble, so ties meet inside a run and across runs.
+        let entries: Vec<DirEntry> =
+            (0..n).map(|i| entry(OsString::from(&names[i * 7 % n]), TYPES[i % 4])).collect();
+        let want = by_bytes(entries.clone());
+        let t = Thresholds::new(4, 8, 2, 16, 3).unwrap();
+        let runs: Vec<Vec<DirEntry>> = entries.chunks(8).map(<[DirEntry]>::to_vec).collect();
+        assert_eq!(runs.len(), 3);
+        assert_eq!(spill_and_merge(t, runs), want);
+    }
+
+    #[test]
+    fn records_larger_than_the_merge_buffer_survive_the_merge() {
+        let t = Thresholds::new(4, 8, 2, 16, 3).unwrap();
+        let lens = [40usize, 255, 65_535];
+        let runs: Vec<Vec<DirEntry>> = (0..3)
+            .map(|r| {
+                lens.iter()
+                    .enumerate()
+                    .map(|(k, &len)| {
+                        let fill = char::from(b'a' + (k * 3 + r) as u8);
+                        entry(OsString::from(fill.to_string().repeat(len)), TYPES[(k + r) % 4])
+                    })
+                    .collect()
+            })
+            .collect();
+        let want = by_bytes(runs.concat());
+        assert_eq!(want.len(), 9);
+        assert_eq!(spill_and_merge(t, runs), want);
+    }
+
+    #[test]
+    fn a_truncated_wtf8_sequence_decodes_to_one_replacement_per_byte() {
+        assert_eq!(wtf8_to_wide(&[0xE2, 0x82]), [0xFFFD, 0xFFFD]);
+        assert_eq!(wtf8_to_wide(&[0xF0, 0x9F, 0x98]), [0xFFFD, 0xFFFD, 0xFFFD]);
+        assert_eq!(wtf8_to_wide(&[0xED]), [0xFFFD]);
+        assert_eq!(wtf8_to_wide(&[0x61, 0xE2, 0x82]), [0x61, 0xFFFD, 0xFFFD]);
+    }
+
+    #[test]
+    fn a_failing_tick_ends_the_cascade_and_the_region_truncates_the_runs() {
+        let t = Thresholds::new(4, 4, 2, 16, 3).unwrap();
+        let fs = FaultFs::new();
+        let space = placed(&fs, t);
+        let owner = space.next_owner();
+        let outer = space.begin(owner).unwrap();
+        space.write_at(outer.start(), &[7u8; 10]).unwrap();
+        let region = space.begin(owner).unwrap();
+        let start = region.start();
+        let runs: Vec<RunSpan> = (0..3)
+            .map(|r| {
+                let c: Vec<DirEntry> = (0..4).map(|i| named(i * 3 + r)).collect();
+                write_run(&space, &c).unwrap()
+            })
+            .collect();
+        let mut calls = 0;
+        let err = cascade(&space, runs, &mut |_| {
+            calls += 1;
+            Err(FsError::new(Code::IoError, std::io::Error::other("stop")))
+        })
+        .unwrap_err();
+        assert_eq!(err.code, Code::IoError);
+        assert_eq!(calls, 1, "the error stops the cascade at the first tick");
+        assert!(space.len() > start, "the partial pass is still in the file");
+        drop(region);
+        assert_eq!(space.len(), start);
+        drop(outer);
+        assert_eq!(space.len(), 0);
     }
 }
