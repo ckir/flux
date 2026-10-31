@@ -172,14 +172,16 @@ fn listed_variants<D: DirHandle>(dir: &D, scan: &DirScan) -> flux_fs::Result<Has
     Ok(found)
 }
 
-#[cfg(test)]
 /// The slice implementation `folds_ascii_case` replaced, kept as the test oracle (the old function is the definition
-/// of correct). Whether `dir`, whose listing is `entries`, folds ASCII case. Read-only. It asks about at most
+/// of correct).
+///
+/// Spec 4.2 step 2 (vi): whether `dir`, whose listing is `entries`, folds ASCII case. Read-only. It asks about at most
 /// `FOLD_CANDIDATES` entries, the smallest usable names bytewise (a listing's order is arbitrary, so it must not decide
 /// which): the variant swaps the case of the first ASCII letter. A variant that is itself an entry means two names
 /// differing by case coexist (`Some(false)`); both names resolving to one `Strong` identity is `Some(true)`; a variant
 /// that is not found is `Some(false)`; anything else (an error, a `Weak` or `Unavailable` identity) tries the next
 /// candidate, and with none left the answer is `None`: undecided, never a refusal.
+#[cfg(test)]
 fn folds_ascii_case_of_slice<D: DirHandle>(dir: &D, entries: &[DirEntry]) -> Option<bool> {
     // A bounded max-heap keeps the smallest names without sorting the listing.
     let mut heap: BinaryHeap<&str> = BinaryHeap::with_capacity(FOLD_CANDIDATES + 1);
@@ -4474,6 +4476,36 @@ mod trees_tests {
         let scan = scan_dir(&dir, &[]).unwrap();
         assert_eq!(folds_ascii_case(&dir, &scan), None);
         assert_eq!(read_dir_calls(&fs) - base, 2, "{:?}", fs.calls());
+    }
+
+    #[test]
+    fn a_failed_second_read_leaves_the_fold_undecided() {
+        // `a` and `A` coexist on a case-sensitive directory but share one `Strong` identity (hard links): the metadata
+        // part alone says `Some(true)`, and only the listed variant turns it into `Some(false)`. An empty set from a
+        // failed read 2 would give the false `Some(true)`.
+        let names: Vec<String> = ["a", "A"].map(String::from).to_vec();
+        let fixture = || {
+            let fs = scan_fixture(&names, false, 0);
+            let same = FileIdentity::Strong(ObjectId { volume: 3, index: 4_242 });
+            fs.set_identity("/p/dest/a", same);
+            fs.set_identity("/p/dest/A", same);
+            fs
+        };
+        let fs = fixture();
+        let dir = fs.destination_root(Path::new("/p/dest")).unwrap();
+        let oracle = folds_ascii_case_of_slice(&dir, &dir.read_dir().unwrap());
+        assert_eq!(oracle, Some(false));
+        let base = read_dir_calls(&fs);
+        let scan = scan_dir(&dir, &[]).unwrap();
+        assert_eq!(folds_ascii_case(&dir, &scan), oracle);
+        assert_eq!(read_dir_calls(&fs) - base, 2, "read 2 is reached: {:?}", fs.calls());
+
+        let fs = fixture();
+        let dir = fs.destination_root(Path::new("/p/dest")).unwrap();
+        // The first `read_dir` is the scan; the second is the lazy read.
+        fs.fail_nth("read_dir", 2, Code::IoError, ErrorKind::PermissionDenied);
+        let scan = scan_dir(&dir, &[]).expect("read 1 succeeds");
+        assert_eq!(folds_ascii_case(&dir, &scan), None);
     }
 
     #[test]
