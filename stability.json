@@ -1,51 +1,51 @@
 {
  "pairs": {
   "linux/large/cp": {
-   "calibrated": "2026-10-31T13:21:35Z",
-   "cv": 0.0826,
+   "calibrated": "2026-10-31T13:35:50Z",
+   "cv": 0.0493,
    "image": "20261026.180.1",
    "source": "calibration",
    "stable": false
   },
   "linux/large/rsync": {
-   "calibrated": "2026-10-31T13:21:35Z",
-   "cv": 0.0566,
+   "calibrated": "2026-10-31T13:35:50Z",
+   "cv": 0.0256,
    "image": "20261026.180.1",
    "source": "calibration",
-   "stable": false
+   "stable": true
   },
   "linux/mixed/cp": {
-   "calibrated": "2026-10-31T13:21:35Z",
-   "cv": 0.1382,
+   "calibrated": "2026-10-31T13:35:50Z",
+   "cv": 0.0229,
    "image": "20261026.180.1",
    "source": "calibration",
-   "stable": false
+   "stable": true
   },
   "linux/mixed/rsync": {
-   "calibrated": "2026-10-31T13:21:35Z",
-   "cv": 0.1175,
+   "calibrated": "2026-10-31T13:35:50Z",
+   "cv": 0.0568,
    "image": "20261026.180.1",
    "source": "calibration",
    "stable": false
   },
   "linux/small/cp": {
-   "calibrated": "2026-10-31T13:21:35Z",
-   "cv": 0.0679,
+   "calibrated": "2026-10-31T13:35:50Z",
+   "cv": 0.0552,
    "image": "20261026.180.1",
    "source": "calibration",
    "stable": false
   },
   "linux/small/rsync": {
-   "calibrated": "2026-10-31T13:21:35Z",
-   "cv": 0.0942,
+   "calibrated": "2026-10-31T13:35:50Z",
+   "cv": 0.0732,
    "image": "20261026.180.1",
    "source": "calibration",
    "stable": false
   },
   "macos/large/cp": {
-   "calibrated": "2026-10-22T21:12:49Z",
-   "cv": 0.1646,
-   "image": "20261013.0424.1",
+   "calibrated": "2026-10-31T13:35:50Z",
+   "cv": 0.1594,
+   "image": "20261026.0455.2",
    "source": "calibration",
    "stable": false
   },
@@ -57,30 +57,30 @@
    "stable": false
   },
   "macos/mixed/cp": {
-   "calibrated": "2026-10-22T21:12:49Z",
-   "cv": 0.1483,
-   "image": "20261013.0424.1",
+   "calibrated": "2026-10-31T13:35:50Z",
+   "cv": 0.1427,
+   "image": "20261026.0455.2",
    "source": "calibration",
    "stable": false
   },
   "macos/mixed/rsync": {
-   "calibrated": "2026-10-22T21:12:49Z",
-   "cv": 0.1915,
-   "image": "20261013.0424.1",
+   "calibrated": "2026-10-31T13:35:50Z",
+   "cv": 0.1481,
+   "image": "20261026.0455.2",
    "source": "calibration",
    "stable": false
   },
   "macos/small/cp": {
-   "calibrated": "2026-10-22T21:12:49Z",
-   "cv": 0.1308,
-   "image": "20261013.0424.1",
+   "calibrated": "2026-10-31T13:35:50Z",
+   "cv": 0.1091,
+   "image": "20261026.0455.2",
    "source": "calibration",
    "stable": false
   },
   "macos/small/rsync": {
-   "calibrated": "2026-10-22T21:12:49Z",
-   "cv": 0.0983,
-   "image": "20261013.0424.1",
+   "calibrated": "2026-10-31T13:35:50Z",
+   "cv": 0.1102,
+   "image": "20261026.0455.2",
    "source": "calibration",
    "stable": false
   },

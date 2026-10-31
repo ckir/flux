@@ -3,10 +3,10 @@
 <text x="12" y="20" fill="#111111" font-weight="bold" xml:space="preserve">Flux benchmark - Latest benchmark of main</text>
 <text x="12" y="40" fill="#555555" font-weight="normal" xml:space="preserve">Flux time / comparator time. Below 1.0, Flux is faster.</text>
 <text x="12" y="80" fill="#111111" font-weight="bold" xml:space="preserve">Linux - cold cache - e5e3a86 2026-10-31</text>
-<text x="12" y="100" fill="#555555" font-weight="normal" xml:space="preserve">Not shown:</text>
-<text x="12" y="120" fill="#555555" font-weight="normal" xml:space="preserve">  large vs cp: too noisy</text>
-<text x="12" y="140" fill="#555555" font-weight="normal" xml:space="preserve">  large vs rsync: too noisy</text>
-<text x="12" y="160" fill="#555555" font-weight="normal" xml:space="preserve">  mixed vs cp: too noisy</text>
+<text x="12" y="100" fill="#111111" font-weight="normal" xml:space="preserve">large  vs rsync      0.98</text>
+<text x="12" y="120" fill="#111111" font-weight="normal" xml:space="preserve">mixed  vs cp         1.00</text>
+<text x="12" y="140" fill="#555555" font-weight="normal" xml:space="preserve">Not shown:</text>
+<text x="12" y="160" fill="#555555" font-weight="normal" xml:space="preserve">  large vs cp: too noisy</text>
 <text x="12" y="180" fill="#555555" font-weight="normal" xml:space="preserve">  mixed vs rsync: too noisy</text>
 <text x="12" y="200" fill="#555555" font-weight="normal" xml:space="preserve">  small vs cp: too noisy</text>
 <text x="12" y="220" fill="#555555" font-weight="normal" xml:space="preserve">  small vs rsync: too noisy</text>
