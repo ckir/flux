@@ -464,11 +464,12 @@ pub trait DirHandle: Sized {
     /// is per-run scratch: its commits are never synced.
     fn create_hardlink_index(&self, name: &std::ffi::OsStr) -> Result<Self::Index>;
 
-    /// A new regular file inside this directory, opened for reading and writing, that has NO name by the time the call
-    /// returns (bounded-listing cut). Linux uses `O_TMPFILE` where the filesystem supports it, else an exclusive
-    /// create of `.flux-scratch-<random hex>` followed at once by `unlinkat`; macOS takes the create-then-unlink path;
-    /// Windows opens with `FILE_DELETE_ON_CLOSE` and no sharing for delete, so the name disappears when the last handle
-    /// closes, including at process death. Never follows a link. The bytes are the caller's to position and read.
+    /// A new regular file inside this directory, opened for reading and writing (bounded-listing cut). On Unix it
+    /// never has a name visible once the call returns: Linux uses `O_TMPFILE` where the filesystem supports it, else
+    /// an exclusive create of `.flux-scratch-<random hex>` followed at once by `unlinkat`; macOS takes the
+    /// create-then-unlink path. On Windows it is opened with `FILE_DELETE_ON_CLOSE` and no sharing for delete, so the
+    /// name is visible while the handle is open and vanishes when the last handle closes, including at process death.
+    /// Never follows a link. The bytes are the caller's to position and read.
     fn create_scratch(&self) -> Result<std::fs::File>;
 
     /// Whether this directory lives on a memory-backed filesystem (Linux `tmpfs` or `ramfs`). `Ok(None)` is "cannot

@@ -345,7 +345,15 @@ fn create_scratch_leaves_no_name_in_the_directory() {
     let f = d.create_scratch().expect("create a scratch file");
     write_at(&f, 0, b"abc");
     assert_eq!(read_at(&f, 0, 3), b"abc");
+    // Unix: the file never has a name once the call returns, so the listing is unchanged while it is open.
+    #[cfg(unix)]
     assert_eq!(listing(&d), before, "the scratch file has no name in the directory");
+    // Windows: `FILE_DELETE_ON_CLOSE` keeps the name visible until the last handle closes.
+    #[cfg(windows)]
+    {
+        drop(f);
+        assert_eq!(listing(&d), before, "the name is gone after the last handle closes");
+    }
 }
 
 #[test]
