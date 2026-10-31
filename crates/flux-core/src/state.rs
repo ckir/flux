@@ -1633,6 +1633,28 @@ mod tests {
     }
 
     #[test]
+    fn retire_keeps_a_symlink_and_a_directory_named_like_a_scratch_leftover() {
+        let (fs, d) = dest();
+        let ops = operations_dir(&d, Path::new("D")).unwrap();
+        let path = format!("/p/dest/.flux/operations/{}.removing", id(1));
+        fs.create_dir(Path::new(&path)).unwrap();
+        fs.write_file(format!("{path}/{MANIFEST}"), b"x");
+        fs.write_file(format!("{path}/.flux-scratch-link"), b"target");
+        fs.set_type(format!("{path}/.flux-scratch-link"), FileType::Symlink);
+        fs.create_dir(Path::new(&format!("{path}/.flux-scratch-dir"))).unwrap();
+        let removing = OsString::from(format!("{}.removing", id(1)));
+        let e = finish_retire(&ops, &removing).unwrap_err();
+        assert_eq!(e.source.kind(), ErrorKind::DirectoryNotEmpty);
+        for kept in [".flux-scratch-link", ".flux-scratch-dir"] {
+            assert!(
+                fs.exists(format!("{path}/{kept}")),
+                "{kept} is not a regular file: a stranger"
+            );
+        }
+        assert!(fs.exists(&path), "so the workspace stays");
+    }
+
+    #[test]
     fn retire_workspace_removes_a_workspace_with_a_wal() {
         let (fs, d) = dest();
         let ops = operations_dir(&d, Path::new("D")).unwrap();

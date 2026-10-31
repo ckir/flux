@@ -67,8 +67,13 @@ impl Thresholds {
 /// How the home creates its file, erased: `DirHandle` has associated types and cannot be a trait object.
 type Create<'h> = Box<dyn Fn() -> flux_fs::Result<File> + 'h>;
 
+/// Finds the home when the first directory spills, not before: a run that never spills touches nothing (spec 6.1).
+type Deferred<'h> = Box<dyn FnOnce() -> Result<(Create<'h>, PathBuf), FsError> + 'h>;
+
 enum Home<'h> {
     Unplaced,
+    /// Placed, but the location is not looked at (let alone made) until the first `begin`.
+    Deferred(Deferred<'h>),
     Placed {
         create: Create<'h>,
         shown: PathBuf,
@@ -158,25 +163,32 @@ impl<'h> ScratchSpace<'h> {
         n
     }
 
-    /// `Ok` is [`place`](Self::place); `Err` is remembered and returned by the first `begin`, so a run that never
-    /// spills never fails on a location it did not need.
-    pub fn place_or_remember<D: DirHandle + 'h>(&self, home: Result<(D, PathBuf), FsError>) {
-        match home {
-            Ok((dir, shown)) => self.place(dir, shown),
-            Err(e) => {
-                let mut slot = self.home.borrow_mut();
-                if matches!(*slot, Home::Unplaced) {
-                    *slot = Home::Failed { code: e.code, message: e.source.to_string() };
-                }
-            }
+    /// Places the home lazily: `make` runs once, at the first `begin`, so nothing is looked at or created for a run
+    /// that never spills. Its `Err` is remembered and returned by every `begin`. A second placement is ignored.
+    pub fn place_deferred<D, G>(&self, make: G)
+    where
+        D: DirHandle + 'h,
+        G: FnOnce() -> Result<(D, PathBuf), FsError> + 'h,
+    {
+        let mut slot = self.home.borrow_mut();
+        if matches!(*slot, Home::Unplaced) {
+            *slot = Home::Deferred(Box::new(move || {
+                let (dir, shown) = make()?;
+                let create: Create<'h> = Box::new(move || dir.create_scratch());
+                Ok((create, shown))
+            }));
         }
     }
 
     /// Sets the home once (a second call is ignored). Nothing is created until the first write.
     pub fn place<D: DirHandle + 'h>(&self, home: D, shown: PathBuf) {
+        self.place_with(Box::new(move || home.create_scratch()), shown);
+    }
+
+    fn place_with(&self, create: Create<'h>, shown: PathBuf) {
         let mut slot = self.home.borrow_mut();
         if matches!(*slot, Home::Unplaced) {
-            *slot = Home::Placed { create: Box::new(move || home.create_scratch()), shown };
+            *slot = Home::Placed { create, shown };
         }
     }
 
@@ -250,6 +262,13 @@ impl<'h> ScratchSpace<'h> {
     /// later `begin` is a fatal error.
     pub fn close(&self) {
         *self.backing.borrow_mut() = Backing::Closed;
+        // The home holds the workspace's directory handle (inside the create closure): release it too, or the
+        // workspace cannot be removed while the space lives. Placed after the old home is dropped.
+        let old = std::mem::replace(
+            &mut *self.home.borrow_mut(),
+            Home::Failed { code: Code::IoError, message: String::from("scratch space is closed") },
+        );
+        drop(old);
     }
 
     /// The file's real length, as the operating system reports it (not the logical end).
@@ -314,8 +333,11 @@ impl<'h> ScratchSpace<'h> {
     fn ensure_open(&self) -> Result<(), FsError> {
         let mut backing = self.backing.borrow_mut();
         if matches!(*backing, Backing::NotCreated) {
+            self.resolve_home();
             *backing = match &*self.home.borrow() {
-                Home::Unplaced => return Err(fatal("scratch space used before it was placed")),
+                Home::Deferred(_) | Home::Unplaced => {
+                    return Err(fatal("scratch space used before it was placed"));
+                }
                 Home::Failed { code, message } => {
                     return Err(FsError::new(*code, std::io::Error::other(message.clone())));
                 }
@@ -332,6 +354,23 @@ impl<'h> ScratchSpace<'h> {
             Backing::Open(_) => Ok(()),
             other => Err(self.not_open(other)),
         }
+    }
+
+    /// Runs a deferred home's producer (once); a failure becomes the remembered `Home::Failed`.
+    fn resolve_home(&self) {
+        let deferred = {
+            let mut home = self.home.borrow_mut();
+            if !matches!(*home, Home::Deferred(_)) {
+                return;
+            }
+            std::mem::replace(&mut *home, Home::Unplaced)
+        };
+        let Home::Deferred(make) = deferred else { return };
+        let resolved = match make() {
+            Ok((create, shown)) => Home::Placed { create, shown },
+            Err(e) => Home::Failed { code: e.code, message: e.source.to_string() },
+        };
+        *self.home.borrow_mut() = resolved;
     }
 
     fn truncate(&self, start: u64) {
@@ -392,21 +431,31 @@ pub(crate) fn temporary_home<F: DestinationRoot>(
     explicit: Option<&Path>,
     temp_root: &Path,
 ) -> Result<(F::Dir, PathBuf), FsError> {
-    let mut caches: Vec<PathBuf> = Vec::new();
-    #[cfg(windows)]
-    if let Some(p) = std::env::var_os("LOCALAPPDATA").filter(|p| !p.is_empty()) {
-        caches.push(PathBuf::from(p));
-    }
-    #[cfg(not(windows))]
-    {
-        if let Some(p) = std::env::var_os("XDG_CACHE_HOME").filter(|p| !p.is_empty()) {
-            caches.push(PathBuf::from(p));
-        }
-        if let Some(p) = std::env::var_os("HOME").filter(|p| !p.is_empty()) {
-            caches.push(PathBuf::from(p).join(".cache"));
-        }
-    }
+    let caches = cache_candidates();
     temporary_home_from(fs, explicit, temp_root, &caches)
+}
+
+/// The user cache directories to try, from the environment.
+pub(crate) fn cache_candidates() -> Vec<PathBuf> {
+    cache_candidates_from(
+        std::env::var_os("XDG_CACHE_HOME"),
+        std::env::var_os("HOME"),
+        std::env::var_os("LOCALAPPDATA"),
+    )
+}
+
+/// A relative or empty value is ignored (the XDG rule, applied to all three).
+fn cache_candidates_from(
+    xdg: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    local_app_data: Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    let absolute = |v: Option<std::ffi::OsString>| v.map(PathBuf::from).filter(|p| p.is_absolute());
+    if cfg!(windows) {
+        absolute(local_app_data).into_iter().collect()
+    } else {
+        absolute(xdg).into_iter().chain(absolute(home).map(|h| h.join(".cache"))).collect()
+    }
 }
 
 fn temporary_home_from<F: DestinationRoot>(
@@ -686,9 +735,98 @@ mod tests {
         let space = ScratchSpace::unplaced(Thresholds::default(), None);
         let home: Result<(crate::fault_fs::FakeDirHandle, PathBuf), FsError> =
             Err(FsError::new(Code::PermissionDenied, std::io::Error::other("no temp dir")));
-        space.place_or_remember(home);
+        space.place_deferred(move || home);
         let err = space.begin(1).err().expect("refused");
         assert_eq!(err.code, Code::PermissionDenied);
+        // Remembered, not retried: every later attempt answers the same.
+        assert_eq!(space.begin(1).err().expect("refused again").code, Code::PermissionDenied);
+    }
+
+    #[test]
+    fn a_deferred_home_is_asked_once_and_only_at_the_first_begin() {
+        use std::rc::Rc;
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        let asked = Rc::new(Cell::new(0));
+        let space = ScratchSpace::unplaced(Thresholds::default(), None);
+        let counter = Rc::clone(&asked);
+        let fs_ref = &fs;
+        space.place_deferred(move || {
+            counter.set(counter.get() + 1);
+            Ok((fs_ref.destination_root(Path::new("/s"))?, PathBuf::from("/s")))
+        });
+        assert!(space.is_placed());
+        assert_eq!(asked.get(), 0, "placing asks nothing");
+        let Ok(first) = space.begin(1) else { panic!("the home resolves") };
+        assert_eq!(asked.get(), 1);
+        drop(first);
+        drop(space.begin(1).ok().unwrap());
+        assert_eq!(asked.get(), 1, "asked once");
+    }
+
+    /// Drops a flag when the closure that holds the home's handle is dropped.
+    struct Held(std::rc::Rc<Cell<bool>>);
+    impl Drop for Held {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+
+    #[test]
+    fn close_releases_the_home_and_a_later_begin_is_the_closed_error() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        let dir = fs.destination_root(Path::new("/s")).unwrap();
+        let released = std::rc::Rc::new(Cell::new(false));
+        let held = Held(std::rc::Rc::clone(&released));
+        let space = ScratchSpace::unplaced(Thresholds::default(), None);
+        space.place_with(
+            Box::new(move || {
+                let _held = &held;
+                dir.create_scratch()
+            }),
+            PathBuf::from("/s"),
+        );
+        space.begin(1).map(drop).unwrap_or_else(|e| panic!("opens: {e}"));
+        assert!(!released.get(), "the home is held while the space is open");
+        space.close();
+        assert!(released.get(), "close drops what holds the workspace handle");
+        let err = space.begin(1).err().expect("refused");
+        assert!(err.to_string().contains("closed"), "{err}");
+    }
+
+    #[test]
+    fn close_before_any_spill_releases_an_unresolved_home_too() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        let space = ScratchSpace::unplaced(Thresholds::default(), None);
+        let fs_ref = &fs;
+        let asked = std::rc::Rc::new(Cell::new(false));
+        let flag = std::rc::Rc::clone(&asked);
+        space.place_deferred(move || {
+            flag.set(true);
+            Ok((fs_ref.destination_root(Path::new("/s"))?, PathBuf::from("/s")))
+        });
+        space.close();
+        assert!(!asked.get(), "a closed space never resolves its home");
+        assert!(space.begin(1).err().expect("refused").to_string().contains("closed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_or_empty_environment_value_is_not_a_cache_directory() {
+        use std::ffi::OsString;
+        let os = |s: &str| Some(OsString::from(s));
+        assert_eq!(
+            cache_candidates_from(os("/x/cache"), os("/home/u"), None),
+            [PathBuf::from("/x/cache"), PathBuf::from("/home/u/.cache")]
+        );
+        assert_eq!(
+            cache_candidates_from(os("rel/cache"), os("/home/u"), None),
+            [PathBuf::from("/home/u/.cache")]
+        );
+        assert_eq!(cache_candidates_from(os(""), os(""), None), Vec::<PathBuf>::new());
+        assert_eq!(cache_candidates_from(None, os("home"), None), Vec::<PathBuf>::new());
     }
     fn home_fs() -> FaultFs {
         use flux_fs::FileSystem;

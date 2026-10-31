@@ -691,7 +691,9 @@ fn run_tree<F: DestinationRoot>(
     // The lockless library copy has no workspace: its scratch goes to the temporary directory (spec 6.1). A home that
     // cannot be found surfaces only if a directory actually spills.
     let scratch = ScratchSpace::unplaced(Thresholds::default(), None);
-    scratch.place_or_remember(temporary_home(fs, None, &std::env::temp_dir()));
+    // Looked up (and made, if need be) only if a directory actually spills.
+    let temp_root = std::env::temp_dir();
+    scratch.place_deferred(move || temporary_home(fs, None, &temp_root));
     let mut source = prepare_source(fs, src_root, dst_root, MountPolicy::of(opts), Some(&scratch))?;
     source.events.set_selection(&opts.selection);
 

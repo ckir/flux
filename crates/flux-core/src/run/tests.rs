@@ -11875,8 +11875,11 @@ fn a_failed_heartbeat_during_a_spilled_listing_stops_the_copy() {
     );
 }
 
+/// Pins that a `--restart` over a spilling source completes, spilling into the NEW operation's workspace and never the
+/// superseded one. It does NOT pin the placement inside `TreePlace::sweep`: `drive` places the same workspace right
+/// after `open_operation`, so the test passes without it. Task 6 (the sweep walks with the scratch) pins that.
 #[test]
-fn a_restart_sweep_over_a_spilling_dest_uses_the_new_workspace() {
+fn a_restart_over_a_spilling_source_completes_into_the_new_workspace() {
     let fs = flat_source(20);
     prior(&fs, 5, OpState::Transferring);
     fs.write_file(format!("/p/dest/f00.flux-partial.{}", id(5)), b"half");
@@ -11908,10 +11911,13 @@ fn a_hardlink_group_straddling_run_boundaries_keeps_its_canonical_member() {
         let out = ok(&r);
         let same = strong(&fs, "/p/dest/f03") == strong(&fs, "/p/dest/f17");
         let names: Vec<bool> = (0..20).map(|i| fs.exists(format!("/p/dest/f{i:02}"))).collect();
-        (out.files_copied, out.files_hardlinked, same, names)
+        let spilled = calls(&fs).iter().any(|c| c.starts_with("create_scratch("));
+        ((out.files_copied, out.files_hardlinked, same, names), spilled)
     };
-    let small = published(spilling());
-    assert_eq!(small, published(crate::scratch::Thresholds::default()));
+    let (small, small_spilled) = published(spilling());
+    let (plain, plain_spilled) = published(crate::scratch::Thresholds::default());
+    assert!(small_spilled && !plain_spilled, "the small run really spilled, the default did not");
+    assert_eq!(small, plain);
     assert_eq!((small.0, small.1, small.2), (19, 1, true), "f03 is copied and f17 links to it");
 }
 
@@ -11921,4 +11927,66 @@ fn a_dry_run_that_never_spills_creates_no_scratch() {
     let (r, _) = run_tree(&fs, &RunConfig { dry_run: true, ..cfg() });
     assert!(r.stop.is_none(), "{:?}", r.stop);
     assert!(!fs.called("create_scratch("), "{:?}", calls(&fs));
+}
+
+/// A dry run's `fake()`-like source of 20 files, `/t` as its temporary root and `/p` beside it.
+fn dry_spill_fs() -> FaultFs {
+    let fs = flat_source(20);
+    fs.create_dir(Path::new("/t")).unwrap();
+    fs
+}
+
+fn dry_in_t() -> RunConfig {
+    RunConfig { dry_run: true, dry_temp_root: Some(PathBuf::from("/t")), ..cfg() }
+}
+
+/// The paths `create_scratch(` was logged on.
+fn scratch_homes(fs: &FaultFs) -> Vec<String> {
+    calls(fs)
+        .iter()
+        .filter_map(|c| c.strip_prefix("create_scratch(")?.strip_suffix(')').map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn a_dry_run_that_spills_keeps_its_scratch_in_the_temporary_directory_and_never_in_dest() {
+    let fs = dry_spill_fs();
+    let (r, _) = run_tree_small(&fs, &dry_in_t(), spilling());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert_eq!(scratch_homes(&fs), ["/t"], "{:?}", calls(&fs));
+    assert!(!fs.exists("/p/dest"), "a dry run makes no DEST");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dry_run_with_a_memory_backed_temporary_directory_spills_to_the_cache() {
+    let fs = dry_spill_fs();
+    fs.set_memory_backed("/t", Some(true));
+    // The cache the environment names, made in the fake (every ancestor).
+    let cache = crate::scratch::cache_candidates().into_iter().next().expect("HOME is set");
+    let mut at = PathBuf::new();
+    for part in cache.components() {
+        at.push(part);
+        if at.parent().is_some() && !fs.exists(&at) {
+            fs.create_dir(&at).unwrap();
+        }
+    }
+    let (r, _) = run_tree_small(&fs, &dry_in_t(), spilling());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert_eq!(scratch_homes(&fs), [cache.display().to_string()], "{:?}", calls(&fs));
+}
+
+#[test]
+fn a_dry_run_that_never_spills_creates_nothing_even_when_the_temporary_directory_is_memory_backed()
+{
+    let fs = dry_spill_fs();
+    fs.set_memory_backed("/t", Some(true));
+    let base = calls(&fs).len();
+    // Default thresholds: 20 entries never spill. The cache directory is absent from the fake.
+    let (r, _) = run_tree_small(&fs, &dry_in_t(), crate::scratch::Thresholds::default());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    let made: Vec<_> =
+        calls(&fs)[base..].iter().filter(|c| c.starts_with("create_dir(")).cloned().collect();
+    assert!(made.is_empty(), "a run that never spills makes nothing: {made:?}");
+    assert!(scratch_homes(&fs).is_empty());
 }

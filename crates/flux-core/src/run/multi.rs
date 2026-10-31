@@ -1053,23 +1053,24 @@ fn root_reports(plans: &[RootPlan], done: Vec<RootDone>, copy_ran: bool) -> Vec<
 /// pre-flight and containment warnings.
 // One input per piece of the run, as `dry_tree`'s.
 #[allow(clippy::too_many_arguments)]
-fn dry_trees<F: DestinationRoot>(
-    fs: &F,
+fn dry_trees<'h, F: DestinationRoot>(
+    fs: &'h F,
     mut run: Run<Result<TreeOutcome, TreeAbort>>,
     mut out: TreeOutcome,
     place: MultiPlace<'_, F>,
     site: &LockSite<'_, F::Dir>,
     anchor: FileIdentity,
-    scratch: &ScratchSpace<'_>,
+    scratch: &ScratchSpace<'h>,
     cfg: &RunConfig,
     opts: &CopyOptions,
     inputs: Vec<RootInput<'_, '_, F>>,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> MultiRun {
-    // A dry run holds no workspace: its scratch goes to the temporary directory at once (a home that cannot be found
-    // surfaces only if a directory actually spills).
+    // A dry run holds no workspace: its scratch goes to the temporary directory, looked up only if a directory
+    // actually spills (spec 6.1).
     let scratch_root = cfg.dry_temp_root.clone().unwrap_or_else(std::env::temp_dir);
-    scratch.place_or_remember(temporary_home(fs, cfg.scratch_dir.as_deref(), &scratch_root));
+    let explicit = cfg.scratch_dir.clone();
+    scratch.place_deferred(move || temporary_home(fs, explicit.as_deref(), &scratch_root));
     let (dest_shown, operations_shown, absent) =
         (place.tree.dest_shown.clone(), place.tree.operations_shown(), place.tree.dest.is_none());
     let mut restart_preview = |priors: &[PriorOp], warnings: &mut Vec<RunWarning>| {
@@ -1166,6 +1167,7 @@ fn dry_trees<F: DestinationRoot>(
         None => RootsDest::Planned(anchor),
     };
     let (done, walked) = copy_roots_at(&cx, dest, false, inputs, &mut out, on_report);
+    scratch.close();
     // Cut 12: the index file and its private directory go with the slot.
     if let Some(slot) = hardlink_slot {
         let failure = slot.failure();

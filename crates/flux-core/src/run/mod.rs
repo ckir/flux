@@ -416,7 +416,7 @@ pub(crate) fn tree_with_thresholds<F: DestinationRoot>(
     // Cut 11a: a dry run plans the walk and touches nothing: no lock, no state, no claim store, no WAL, no finish.
     if cfg.dry_run {
         return dry_tree(
-            run, &mut place, &site, capability, source, &scratch, cfg, &opts, on_report, out,
+            fs, run, &mut place, &site, capability, source, &scratch, cfg, &opts, on_report, out,
         );
     }
     drive(
@@ -442,6 +442,15 @@ pub(crate) fn tree_with_thresholds<F: DestinationRoot>(
         },
         |_, _| {},
     )
+}
+
+/// Closes the scratch space when `drive` returns by any path.
+struct CloseOnDrop<'a, 'h>(&'a ScratchSpace<'h>);
+
+impl Drop for CloseOnDrop<'_, '_> {
+    fn drop(&mut self) {
+        self.0.close();
+    }
 }
 
 /// A place that is a tree's DEST, possibly with more around it (the prefix locks of several roots): what `drive` reads
@@ -492,6 +501,10 @@ where
     F: DestinationRoot + 'p,
     P: TreeAt<'p, F>,
 {
+    // Every exit closes the scratch (a `--restart` sweep inside `open_operation` may have placed it before a later
+    // step failed), releasing the workspace handle it holds. The explicit close after the walk stays: it must come
+    // before `finish`.
+    let _closes_scratch = CloseOnDrop(scratch);
     // Steps 3-5 (and `--restart`): the lock, then this operation's state and the record naming it.
     let locked = match open_operation(
         site,
@@ -1477,22 +1490,24 @@ pub(crate) fn dry_hardlink_slot<F: DestinationRoot>(
 /// Cut 11a: the dry branch of `tree_with`. Reads DEST's prior operations for the notes, then plans the walk over a
 /// claim store that stores nothing; the lock, the workspace, the WAL and `finish` are never reached.
 #[allow(clippy::too_many_arguments)]
-fn dry_tree<F: DestinationRoot>(
+fn dry_tree<'h, F: DestinationRoot>(
+    fs: &'h F,
     mut run: Run<Result<TreeOutcome, TreeAbort>>,
     place: &mut TreePlace<'_, F>,
     site: &LockSite<'_, F::Dir>,
     capability: LockCapability,
     source: Source<'_, '_, F>,
-    scratch: &ScratchSpace<'_>,
+    scratch: &ScratchSpace<'h>,
     cfg: &RunConfig,
     opts: &CopyOptions,
     on_report: &mut dyn FnMut(TreeFailure),
     mut out: TreeOutcome,
 ) -> Run<Result<TreeOutcome, TreeAbort>> {
-    // A dry run holds no workspace: its scratch goes to the temporary directory at once. A home that cannot be found
-    // surfaces only if a directory actually spills.
+    // A dry run holds no workspace: its scratch goes to the temporary directory, looked up only if a directory
+    // actually spills (spec 6.1: small runs never touch the location).
     let scratch_root = cfg.dry_temp_root.clone().unwrap_or_else(std::env::temp_dir);
-    scratch.place_or_remember(temporary_home(place.fs, cfg.scratch_dir.as_deref(), &scratch_root));
+    let explicit = cfg.scratch_dir.clone();
+    scratch.place_deferred(move || temporary_home(fs, explicit.as_deref(), &scratch_root));
     // Spec 3.5: DEST absent means nothing to supersede and no walk.
     let (dest_shown, operations_shown, absent_dest) =
         (place.dest_shown.clone(), place.operations_shown(), place.dest.is_none());
