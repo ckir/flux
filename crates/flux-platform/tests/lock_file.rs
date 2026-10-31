@@ -269,7 +269,6 @@ fn the_test_machines_scratch_directory_is_a_local_strong_filesystem() {
 fn the_boot_session_id_is_known_here_and_stable_within_one_boot() {
     let a = flux_platform::boot_session_id();
     let b = flux_platform::boot_session_id();
-    println!("boot_session_id = {a}");
     assert_ne!(a, "unknown", "every supported platform exposes one");
     assert!(!a.is_empty());
     assert_eq!(a, b, "two reads in one boot agree");
