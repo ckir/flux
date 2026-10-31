@@ -466,7 +466,7 @@ pub fn copy_tree<F: DestinationRoot>(
 
 /// The source side of a tree copy, checked before anything at the destination is touched.
 pub(crate) struct Source<'a, F: FileSystem> {
-    pub(crate) events: Walk<'a, F>,
+    pub(crate) events: Walk<'a, 'a, F>,
     pub(crate) identity: FileIdentity,
 }
 
@@ -480,8 +480,9 @@ pub(crate) fn prepare_source<'a, F: FileSystem>(
 ) -> std::result::Result<Source<'a, F>, CopyError> {
     // 1. The source root. `walk` refuses a missing or non-directory root: the whole
     //    operation failing, before any destination call.
-    let events = walk_with(fs, src_root, WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts })
-        .map_err(|e| CopyError::at(CopyStep::Source, e))?;
+    let events =
+        walk_with(fs, src_root, WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts }, None)
+            .map_err(|e| CopyError::at(CopyStep::Source, e))?;
     let identity = fs.metadata(src_root).map_err(|e| CopyError::at(CopyStep::Source, e))?.identity;
 
     // 2. The lexical floor, before any destination call (§129's own example, `/data`
@@ -756,7 +757,7 @@ fn run_tree<F: DestinationRoot>(
 /// (cut 7b).
 pub(crate) fn copy_tree_at<F: DestinationRoot>(
     cx: &Shared<'_, F>,
-    events: Walk<'_, F>,
+    events: Walk<'_, '_, F>,
     root: F::Dir,
     root_created: bool,
     out: &mut TreeOutcome,
@@ -1096,7 +1097,7 @@ impl RootIdentity {
 /// frame is `fresh` and holds no handle). The root handle is handed back as it came.
 pub(crate) fn copy_tree_frames<F: DestinationRoot>(
     cx: &Shared<'_, F>,
-    mut events: Walk<'_, F>,
+    mut events: Walk<'_, '_, F>,
     root: Option<F::Dir>,
     root_identity: RootIdentity,
     root_created: bool,
@@ -1188,7 +1189,7 @@ fn drain_mode(walked: &std::result::Result<(), CopyError>) -> DrainMode {
 /// `copy_tree_at`'s loop. Every `?` here is an abort.
 fn walk_into<F: DestinationRoot>(
     cx: &Shared<'_, F>,
-    events: &mut Walk<'_, F>,
+    events: &mut Walk<'_, '_, F>,
     root_identity: RootIdentity,
     stack: &mut Vec<Frame<F::Dir>>,
     out: &mut TreeOutcome,

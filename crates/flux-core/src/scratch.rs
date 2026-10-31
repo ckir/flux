@@ -6,9 +6,6 @@
 
 //! The scratch space a bounded listing spills into: one anonymous file in a directory, carved into regions that
 //! are truncated in stack order.
-// Nothing outside this module uses the crate-private surface until the run encoding and the walk are built on it.
-// Remove in Task 4.
-#![allow(dead_code)]
 
 use flux_fs::{Code, DirHandle, FsError};
 use std::cell::{Cell, RefCell};
@@ -243,6 +240,8 @@ impl<'h> ScratchSpace<'h> {
         self.end.get()
     }
 
+    // Read only by tests so far: every scratch call checks the flag itself.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn poisoned(&self) -> bool {
         self.poisoned.get()
     }
@@ -251,6 +250,15 @@ impl<'h> ScratchSpace<'h> {
     /// later `begin` is a fatal error.
     pub fn close(&self) {
         *self.backing.borrow_mut() = Backing::Closed;
+    }
+
+    /// The file's real length, as the operating system reports it (not the logical end).
+    #[cfg(test)]
+    pub(crate) fn physical_len(&self) -> u64 {
+        match &*self.backing.borrow() {
+            Backing::Open(file) => file.metadata().unwrap().len(),
+            _ => panic!("the scratch file is not open"),
+        }
     }
 
     /// The `n+1`-th `write_at` fails with `Code::DiskFull`.
@@ -348,6 +356,8 @@ pub(crate) struct Region<'s, 'h> {
 }
 
 impl Region<'_, '_> {
+    // Read only by tests: the walk never needs a region's start.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn start(&self) -> u64 {
         self.start
     }
@@ -421,10 +431,7 @@ mod tests {
 
     /// The file's real length, as the operating system reports it (not the logical end).
     fn physical_len(space: &ScratchSpace<'_>) -> u64 {
-        match &*space.backing.borrow() {
-            Backing::Open(file) => file.metadata().unwrap().len(),
-            _ => panic!("the scratch file is not open"),
-        }
+        space.physical_len()
     }
 
     fn creations(fs: &FaultFs) -> usize {

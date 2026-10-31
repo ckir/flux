@@ -155,7 +155,7 @@ pub enum ControlFilter {
 
 /// One root's walk, reduced to `Item`s, with one held item for the merge to look at.
 struct Side<'a, F: FileSystem> {
-    walk: Option<Walk<'a, F>>,
+    walk: Option<Walk<'a, 'a, F>>,
     /// One event of lookahead (a `Dir` is followed by its `MountSkipped`).
     peeked: Option<Option<RawEvent>>,
     held: Option<Item>,
@@ -176,7 +176,8 @@ impl<'a, F: FileSystem> Side<'a, F> {
         filter: ControlFilter,
         selection: &'a flux_fs::Selection,
     ) -> Result<Self, FsError> {
-        let mut walk = walk_with(fs, root, WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts })?;
+        let mut walk =
+            walk_with(fs, root, WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts }, None)?;
         walk.set_selection(selection);
         Ok(Side {
             walk: Some(walk),

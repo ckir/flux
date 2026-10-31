@@ -8,8 +8,6 @@
 //!
 //! A record is `u16` LE name length, `u8` file type (0 File, 1 Dir, 2 Symlink, 3 Other), then the name's
 //! `as_encoded_bytes()`. The `ino` hint is not stored: a decoded entry carries `None`.
-// Nothing outside this module uses the crate-private surface until the walk is built on it. Remove in Task 4.
-#![allow(dead_code)]
 
 use crate::scratch::{Region, ScratchSpace};
 use flux_fs::{Code, DirEntry, FileType, FsError};
@@ -76,6 +74,8 @@ fn os_name(bytes: &[u8]) -> OsString {
 /// is one unit; a supplementary scalar is a surrogate pair. Input comes from `OsStr::as_encoded_bytes`, so it is
 /// well formed; a malformed or truncated byte becomes U+FFFD and decoding resumes at the next byte (no overlong
 /// check).
+// Used by `os_name` on Windows only; tests exercise it everywhere.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 pub(crate) fn wtf8_to_wide(bytes: &[u8]) -> Vec<u16> {
     let cont = |i: usize| bytes.get(i).is_some_and(|b| b & 0xC0 == 0x80);
     let c = |i: usize| u32::from(bytes[i] & 0x3F);
