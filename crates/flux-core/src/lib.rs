@@ -19,6 +19,7 @@ pub mod prior;
 pub mod progress;
 pub mod run;
 pub mod scratch;
+mod spill;
 pub mod state;
 pub mod tree;
 pub mod verify;

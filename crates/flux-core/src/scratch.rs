@@ -119,6 +119,8 @@ pub struct ScratchSpace<'h> {
     writes_before_failure: Cell<Option<u64>>,
     #[cfg(test)]
     truncate_fails: Cell<bool>,
+    #[cfg(test)]
+    reads_before_failure: Cell<Option<u64>>,
 }
 
 impl<'h> ScratchSpace<'h> {
@@ -139,6 +141,8 @@ impl<'h> ScratchSpace<'h> {
             writes_before_failure: Cell::new(None),
             #[cfg(test)]
             truncate_fails: Cell::new(false),
+            #[cfg(test)]
+            reads_before_failure: Cell::new(None),
         }
     }
 
@@ -217,6 +221,16 @@ impl<'h> ScratchSpace<'h> {
 
     pub(crate) fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
         self.check_usable()?;
+        #[cfg(test)]
+        if let Some(n) = self.reads_before_failure.get() {
+            if n == 0 {
+                return Err(FsError::new(
+                    Code::IoError,
+                    std::io::Error::other("injected scratch read failure"),
+                ));
+            }
+            self.reads_before_failure.set(Some(n - 1));
+        }
         let backing = self.backing.borrow();
         let Backing::Open(file) = &*backing else {
             return Err(self.not_open(&backing));
@@ -243,6 +257,12 @@ impl<'h> ScratchSpace<'h> {
     #[cfg(test)]
     pub(crate) fn fail_writes_after(&self, n: u64) {
         self.writes_before_failure.set(Some(n));
+    }
+
+    /// The `n+1`-th `read_at` fails with `Code::IoError`.
+    #[cfg(test)]
+    pub(crate) fn fail_reads_after(&self, n: u64) {
+        self.reads_before_failure.set(Some(n));
     }
 
     /// The next truncate fails.
