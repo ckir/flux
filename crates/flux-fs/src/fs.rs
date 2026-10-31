@@ -8,6 +8,7 @@
 
 use crate::Result;
 use std::io::{Read, Write};
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -47,6 +48,12 @@ pub enum FileType {
 pub struct DirEntry {
     pub name: std::ffi::OsString,
     pub file_type: FileType,
+    /// The object number the listing ITSELF carries (Unix `d_ino`), obtained without a `stat`. `None` where the
+    /// platform's listing has none (Windows) and for the fakes.
+    ///
+    /// It is a HINT: it can differ from `ObjectId::index` (a mount-point entry, overlayfs, a btrfs subvolume root,
+    /// NFS), so it must be verified with `metadata` before it identifies anything.
+    pub ino: Option<u64>,
 }
 
 /// A symlink's payload, read without following it (§125: verbatim bytes).
@@ -215,6 +222,25 @@ pub trait FileSystem: Send + Sync {
     /// rather than assumed: `PathBuf::join` discards its base on an absolute
     /// component, so one bad name would take a traversal out of its own root.
     fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>>;
+
+    /// Streams the entries of `path` to `visit`, in no particular order.
+    ///
+    /// The contract: each `DirEntry::name` is exactly ONE bare component, never `.` or `..`, as `read_dir` promises;
+    /// the first `Err` from the visitor is returned and no further entry is visited; `Break` stops the read and
+    /// returns `Ok(())`; a failure of the listing itself is returned and the visitor is never called after it.
+    /// `DirEntry::ino` is a hint (see its doc).
+    fn read_dir_each(
+        &self,
+        path: &Path,
+        visit: &mut dyn FnMut(DirEntry) -> Result<ControlFlow<()>>,
+    ) -> Result<()> {
+        for entry in self.read_dir(path)? {
+            if visit(entry)?.is_break() {
+                break;
+            }
+        }
+        Ok(())
+    }
 
     /// Creates ONE directory. Fails if the parent is missing; the walk creates
     /// ancestors in order, so it never needs the recursive form.
@@ -468,6 +494,23 @@ pub trait DirHandle: Sized {
     /// placeholder) is a `Dir`, as `open_dir` treats it.
     fn read_dir(&self) -> Result<Vec<crate::DirEntry>>;
 
+    /// Streams the entries of the directory this handle holds to `visit`, in no particular order.
+    ///
+    /// The contract is `FileSystem::read_dir_each`'s: one bare component per name, never `.` or `..`; the first
+    /// `Err` from the visitor is returned and no further entry is visited; `Break` stops the read and returns
+    /// `Ok(())`; a failure of the listing itself is returned and the visitor is never called after it.
+    fn read_dir_each(
+        &self,
+        visit: &mut dyn FnMut(crate::DirEntry) -> Result<ControlFlow<()>>,
+    ) -> Result<()> {
+        for entry in self.read_dir()? {
+            if visit(entry)?.is_break() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Read a child REGULAR FILE: at most `limit + 1` bytes, so a caller can tell a file longer than `limit` (as
     /// `LockFile::read_all` does). Never follows a link.
     ///
@@ -702,7 +745,9 @@ mod tests {
 
     #[test]
     fn a_dir_entry_carries_a_name_and_a_type() {
-        let e = DirEntry { name: std::ffi::OsString::from("a"), file_type: FileType::Dir };
+        let e =
+            DirEntry { name: std::ffi::OsString::from("a"), file_type: FileType::Dir, ino: None };
+        assert_eq!(e.ino, None);
         assert_eq!(e.file_type, FileType::Dir);
         assert_ne!(FileType::Dir, FileType::Symlink);
         assert_ne!(FileType::File, FileType::Other);

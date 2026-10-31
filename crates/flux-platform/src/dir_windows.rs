@@ -20,6 +20,7 @@ use flux_fs::{
 };
 use std::ffi::OsStr;
 use std::fs::File;
+use std::ops::ControlFlow;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
@@ -487,7 +488,19 @@ impl DirHandle for StdDir {
     }
 
     fn read_dir(&self) -> Result<Vec<flux_fs::DirEntry>> {
-        read_dir_at(&self.0)
+        let mut out = Vec::new();
+        read_dir_each_at(&self.0, &mut |e| {
+            out.push(e);
+            Ok(ControlFlow::Continue(()))
+        })?;
+        Ok(out)
+    }
+
+    fn read_dir_each(
+        &self,
+        visit: &mut dyn FnMut(flux_fs::DirEntry) -> Result<ControlFlow<()>>,
+    ) -> Result<()> {
+        read_dir_each_at(&self.0, visit)
     }
 
     fn read_file(&self, name: &OsStr, limit: usize) -> Result<Vec<u8>> {
@@ -547,7 +560,10 @@ fn reopen(p: &OwnedHandle, access: u32) -> Result<OwnedHandle> {
     Ok(unsafe { OwnedHandle::from_raw_handle(h as _) })
 }
 
-fn read_dir_at(p: &OwnedHandle) -> Result<Vec<flux_fs::DirEntry>> {
+fn read_dir_each_at(
+    p: &OwnedHandle,
+    visit: &mut dyn FnMut(flux_fs::DirEntry) -> Result<ControlFlow<()>>,
+) -> Result<()> {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::Foundation::ERROR_NO_MORE_FILES;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -558,7 +574,6 @@ fn read_dir_at(p: &OwnedHandle) -> Result<Vec<flux_fs::DirEntry>> {
     // `u64` words, not bytes: each record starts 8-byte aligned inside the buffer (`NextEntryOffset` keeps it so), so
     // the buffer itself must be, for the reason `rename_at` records.
     let mut buf: Vec<u64> = vec![0u64; 8192];
-    let mut out = Vec::new();
     let mut class = FileFullDirectoryRestartInfo;
     loop {
         // SAFETY: `buf` is live and writable for exactly the size given, and the handle outlives the call.
@@ -597,7 +612,11 @@ fn read_dir_at(p: &OwnedHandle) -> Result<Vec<flux_fs::DirEntry>> {
                 )
             };
             if name != "." && name != ".." {
-                out.push(flux_fs::DirEntry { name, file_type: entry_type(attributes, tag) });
+                let entry =
+                    flux_fs::DirEntry { name, file_type: entry_type(attributes, tag), ino: None };
+                if visit(entry)?.is_break() {
+                    return Ok(());
+                }
             }
             if next == 0 {
                 break;

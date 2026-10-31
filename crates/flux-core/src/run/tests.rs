@@ -8378,6 +8378,7 @@ fn broken_leftovers_notes_exactly_the_entries_of_one_lock() {
     let entry = |n: &str| flux_fs::DirEntry {
         name: std::ffi::OsString::from(n),
         file_type: flux_fs::FileType::File,
+        ino: None,
     };
     let entries = [
         entry("a.flux-lock.broken.1"),

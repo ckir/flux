@@ -13,6 +13,7 @@ use flux_fs::{
 };
 use rustix::fs::{Access, AtFlags, Mode, OFlags, accessat, openat, statat};
 use std::ffi::OsStr;
+use std::ops::ControlFlow;
 use std::os::fd::OwnedFd;
 
 /// `Debug` is required, not decorative: the tests call `.unwrap_err()` on a
@@ -513,10 +514,21 @@ impl DirHandle for StdDir {
     }
 
     fn read_dir(&self) -> Result<Vec<flux_fs::DirEntry>> {
+        let mut out = Vec::new();
+        self.read_dir_each(&mut |e| {
+            out.push(e);
+            Ok(ControlFlow::Continue(()))
+        })?;
+        Ok(out)
+    }
+
+    fn read_dir_each(
+        &self,
+        visit: &mut dyn FnMut(flux_fs::DirEntry) -> Result<ControlFlow<()>>,
+    ) -> Result<()> {
         use rustix::fs::{Dir, FileType};
         use std::os::unix::ffi::OsStrExt;
         let io = |e: rustix::io::Errno| FsError::from_io(std::io::Error::from(e));
-        let mut out = Vec::new();
         // `read_from` reads through a descriptor of its own (an `openat` of "."), so this handle is untouched and every
         // call lists from the start.
         for entry in Dir::read_from(&self.0).map_err(io)? {
@@ -542,9 +554,12 @@ impl DirHandle for StdDir {
                 FileType::Symlink => flux_fs::FileType::Symlink,
                 _ => flux_fs::FileType::Other,
             };
-            out.push(flux_fs::DirEntry { name, file_type });
+            let ino = Some(entry.ino());
+            if visit(flux_fs::DirEntry { name, file_type, ino })?.is_break() {
+                return Ok(());
+            }
         }
-        Ok(out)
+        Ok(())
     }
 
     fn read_file(&self, name: &OsStr, limit: usize) -> Result<Vec<u8>> {

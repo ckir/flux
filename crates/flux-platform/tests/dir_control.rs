@@ -9,6 +9,8 @@
 //! a link (§149.7).
 
 use flux_fs::{Code, DestinationRoot, DirHandle, FileType};
+#[cfg(unix)]
+use flux_fs::{FileIdentity, ObjectId};
 use flux_platform::StdFileSystem;
 use std::ffi::{OsStr, OsString};
 use std::io::ErrorKind;
@@ -239,4 +241,74 @@ fn a_socket_file_lists_as_other_and_is_never_read_as_a_state_file() {
     assert_eq!(listing(&d), vec![(OsString::from("sock"), FileType::Other)]);
     let e = d.read_file(OsStr::new("sock"), 8).expect_err("a socket is not a state file");
     assert_eq!(e.code, Code::DestinationError, "{e:?}");
+}
+
+#[test]
+fn read_dir_each_yields_exactly_the_entries_that_exist() {
+    let (tmp, d) = dir();
+    std::fs::write(tmp.path().join("a"), b"x").unwrap();
+    std::fs::create_dir(tmp.path().join("sub")).unwrap();
+    dir_link(&tmp.path().join("sub"), &tmp.path().join("link"));
+    let mut got = Vec::new();
+    d.read_dir_each(&mut |e| {
+        got.push((e.name, e.file_type));
+        Ok(std::ops::ControlFlow::Continue(()))
+    })
+    .expect("stream");
+    got.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(got.len(), 3);
+    assert_eq!(
+        got,
+        vec![
+            (OsString::from("a"), FileType::File),
+            (OsString::from("link"), FileType::Symlink),
+            (OsString::from("sub"), FileType::Dir),
+        ]
+    );
+}
+
+#[test]
+fn read_dir_each_stops_on_break_and_returns_a_visitor_error() {
+    use std::ops::ControlFlow::{Break, Continue};
+    let (tmp, d) = dir();
+    for n in ["a", "b", "c"] {
+        std::fs::write(tmp.path().join(n), b"x").unwrap();
+    }
+    let mut calls = 0;
+    let r = d.read_dir_each(&mut |_| {
+        calls += 1;
+        Ok(Break(()))
+    });
+    assert!(r.is_ok());
+    assert_eq!(calls, 1);
+    let mut calls = 0;
+    let err = d
+        .read_dir_each(&mut |_| {
+            calls += 1;
+            if calls == 2 {
+                return Err(flux_fs::FsError::new(Code::IoError, std::io::Error::other("x")));
+            }
+            Ok(Continue(()))
+        })
+        .unwrap_err();
+    assert_eq!(err.code, Code::IoError);
+    assert_eq!(calls, 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn read_dir_ino_is_the_object_index_of_the_entry() {
+    let (tmp, d) = dir();
+    std::fs::write(tmp.path().join("a"), b"x").unwrap();
+    std::fs::write(tmp.path().join("b"), b"x").unwrap();
+    std::fs::create_dir(tmp.path().join("sub")).unwrap();
+    let entries = d.read_dir().expect("list");
+    assert!(entries.len() >= 3, "the loop must not be vacuous");
+    for entry in entries {
+        let Ok(m) = d.metadata(&entry.name) else { panic!("metadata of {:?}", entry.name) };
+        let FileIdentity::Strong(ObjectId { index, .. }) = m.identity else {
+            panic!("a strong identity for {:?}", entry.name)
+        };
+        assert_eq!(entry.ino, Some(index as u64), "{:?}", entry.name);
+    }
 }

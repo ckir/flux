@@ -101,9 +101,9 @@ Tests are written first and fail first. The implementer receives them as already
   In `crates/flux-platform/tests/dir_control.rs` add:
   - `read_dir_each_yields_exactly_the_entries_that_exist`: in `dir()`'s scratch directory create the file `a`, the subdirectory `sub` and the symlink `link`; assert the sorted `(name, file_type)` of `read_dir_each` equals the literal `[("a", File), ("link", Symlink), ("sub", Dir)]` and its length is 3. It must NOT be compared with `read_dir`/`listing(&d)`: `read_dir` collects through `read_dir_each`, so a bug in the shared loop would hide.
   - `read_dir_each_stops_on_break_and_returns_a_visitor_error`: three files; `Break` on the first gives one call and `Ok`; an `Err` on the second gives that error and two calls.
-  - `#[cfg(unix)] read_dir_ino_is_the_entrys_object_index` (add `use flux_fs::{FileIdentity, ObjectId};` to the file): for every entry, `entry.ino == Some(index as u64)` where `index` comes from `d.metadata(&entry.name)` as `FileIdentity::Strong(ObjectId { index, .. })` (the scratch directory is a plain tempdir, so `d_ino` equals `st_ino` there). Assert the directory has at least three entries so the loop is not vacuous.
+  - `#[cfg(unix)] read_dir_ino_is_the_object_index_of_the_entry` (add `use flux_fs::{FileIdentity, ObjectId};` to the file): for every entry, `entry.ino == Some(index as u64)` where `index` comes from `d.metadata(&entry.name)` as `FileIdentity::Strong(ObjectId { index, .. })` (the scratch directory is a plain tempdir, so `d_ino` equals `st_ino` there). Assert the directory has at least three entries so the loop is not vacuous.
 
-  In `crates/flux-platform/tests/std_fs.rs` add the same pair at the `FileSystem` level (`StdFileSystem.read_dir_each(path, ..)`): `std_read_dir_each_yields_exactly_the_entries_that_exist` (the same literal expectation, through `StdFileSystem.read_dir_each(path, ..)`), and `#[cfg(unix)] std_read_dir_ino_is_the_entrys_object_index`.
+  In `crates/flux-platform/tests/std_fs.rs` add the same pair at the `FileSystem` level (`StdFileSystem.read_dir_each(path, ..)`): `std_read_dir_each_yields_exactly_the_entries_that_exist` (the same literal expectation, through `StdFileSystem.read_dir_each(path, ..)`), and `#[cfg(unix)] std_read_dir_ino_is_the_object_index_of_the_entry`.
 
   In `crates/flux-fs/src/fs.rs` tests, change `a_dir_entry_carries_a_name_and_a_type` (`fs.rs:703`) to build `DirEntry { name, file_type, ino: None }` and add `assert_eq!(e.ino, None)`.
 
@@ -125,7 +125,7 @@ Tests are written first and fail first. The implementer receives them as already
 - [ ] **Step 8: Non-vacuity (logic mutants, one at a time, restore each).** Each must turn the named test red, and no other new test red for an unrelated reason:
   - the default `read_dir_each` ignores `Break` (drops the `is_break` check): `read_dir_each_stops_when_the_visitor_breaks` red.
   - the default swallows the visitor's error (`let _ = visit(entry);`): `read_dir_each_returns_the_visitors_error_and_stops` red.
-  - `dir_unix.rs` sets `ino: None`: `read_dir_ino_is_the_entrys_object_index` red.
+  - `dir_unix.rs` sets `ino: None`: `read_dir_ino_is_the_object_index_of_the_entry` red.
   - `dir_unix.rs` `read_dir_each` skips the first entry: `read_dir_each_yields_exactly_the_entries_that_exist` red (the literal expectation, not a comparison with `read_dir`, is what makes this mutant visible).
   Report the red test names. Use `--no-fail-fast`.
 

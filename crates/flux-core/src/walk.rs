@@ -1200,7 +1200,9 @@ mod tests {
             // exhausted one.
             vec![("/etc/shadow", FileType::File), ("good.txt", FileType::File)]
                 .into_iter()
-                .map(|(n, file_type)| Ok(DirEntry { name: std::ffi::OsString::from(n), file_type }))
+                .map(|(n, file_type)| {
+                    Ok(DirEntry { name: std::ffi::OsString::from(n), file_type, ino: None })
+                })
                 .collect()
         }
 
