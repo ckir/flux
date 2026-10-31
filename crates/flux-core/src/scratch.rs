@@ -7,6 +7,7 @@
 //! The scratch space a bounded listing spills into: one anonymous file in a directory, carved into regions that
 //! are truncated in stack order.
 // Nothing outside this module uses the crate-private surface until the run encoding and the walk are built on it.
+// Remove in Task 4.
 #![allow(dead_code)]
 
 use flux_fs::{Code, DirHandle, FsError};
@@ -267,6 +268,7 @@ impl<'h> ScratchSpace<'h> {
     /// An I/O failure on the file, classified and naming the location; the code is taken before the message is
     /// rebuilt, so `ENOSPC` stays `DiskFull`.
     fn io_error(&self, e: std::io::Error) -> FsError {
+        // `.source` is deliberately rebuilt to name `shown`; consumers must use `.code`, not `raw_os_error`.
         let code = FsError::classify(&e);
         FsError::new(code, std::io::Error::new(e.kind(), format!("{}: {e}", self.shown())))
     }
@@ -333,9 +335,14 @@ impl Region<'_, '_> {
 
 impl Drop for Region<'_, '_> {
     fn drop(&mut self) {
-        self.space.truncate(self.start);
-        self.space.end.set(self.start);
-        self.space.live_regions.set(self.space.live_regions.get() - 1);
+        // A region dropped after its parent finds the end already below its start: it must neither extend the file
+        // (`set_len` past the end pads with zeros) nor raise the end. At `start == end` the truncate still runs,
+        // because a failed partial write can leave bytes physically past `end`.
+        if self.start <= self.space.end.get() {
+            self.space.truncate(self.start);
+            self.space.end.set(self.start);
+        }
+        self.space.live_regions.set(self.space.live_regions.get().saturating_sub(1));
     }
 }
 
@@ -392,6 +399,14 @@ mod tests {
         space
     }
 
+    /// The file's real length, as the operating system reports it (not the logical end).
+    fn physical_len(space: &ScratchSpace<'_>) -> u64 {
+        match &*space.backing.borrow() {
+            Backing::Open(file) => file.metadata().unwrap().len(),
+            _ => panic!("the scratch file is not open"),
+        }
+    }
+
     fn creations(fs: &FaultFs) -> usize {
         fs.calls().iter().filter(|c| c.starts_with("create_scratch(")).count()
     }
@@ -443,13 +458,31 @@ mod tests {
             assert_eq!(b.start(), 10);
             space.write_at(b.start(), &[2u8; 5]).unwrap();
             assert_eq!(space.len(), 15);
+            assert_eq!(physical_len(&space), 15);
         }
         assert_eq!(space.len(), 10);
+        assert_eq!(physical_len(&space), 10);
         let mut buf = [0u8; 10];
         assert_eq!(space.read_at(0, &mut buf).unwrap(), 10);
         assert_eq!(buf, [1u8; 10]);
         drop(a);
         assert_eq!(space.len(), 0);
+        assert_eq!(physical_len(&space), 0);
+    }
+
+    #[test]
+    fn a_parent_dropped_before_its_child_leaves_the_file_empty() {
+        let fs = FaultFs::new();
+        let space = placed(&fs);
+        let a = space.begin(1).ok().unwrap();
+        space.write_at(a.start(), &[1u8; 10]).unwrap();
+        let b = space.begin(1).ok().unwrap();
+        space.write_at(b.start(), &[2u8; 5]).unwrap();
+        drop(a);
+        assert_eq!((space.len(), physical_len(&space)), (0, 0));
+        drop(b);
+        assert_eq!((space.len(), physical_len(&space)), (0, 0));
+        assert!(space.begin(1).is_ok(), "the space is still usable");
     }
 
     #[test]
@@ -462,8 +495,14 @@ mod tests {
             space.write_at(r.start(), b"abc").unwrap();
             let err = space.write_at(r.start() + 3, b"def").unwrap_err();
             assert_eq!(err.code, Code::DiskFull);
+            // A partial write that failed halfway leaves bytes physically past the logical end.
+            if let Backing::Open(file) = &*space.backing.borrow() {
+                write_all_at(file, b"de", r.start() + 3).unwrap();
+            }
+            assert_eq!((space.len(), physical_len(&space)), (3, 5));
         }
         assert_eq!(space.len(), 0);
+        assert_eq!(physical_len(&space), 0);
     }
 
     #[test]
