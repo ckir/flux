@@ -322,6 +322,17 @@ Measured before the bounded-listing cut, so its gates have a number to beat. Bin
 
 The inferred 577 B/entry for a pre-existing destination (see Cut A) is now measured: 614 B/entry, and the run-to-run spread is under 0.1%. The `--resume` runs followed a completed copy, so they exercise the same index build as the overwrite runs and not a partly-written tree; they agree to within 0.1%.
 
-The store micro-benchmark (redb ingest rate and lookup time at 10M and 100M names, spec 6.3) is **not measured**: it is a timing and waits for the owner's go-ahead.
+### redb store micro-benchmark (spec 6.3), criterion MISSED
+
+Throwaway program outside the repo, `redb = "=4.4.0"`. Keys: 49 bytes (a fixed 25-byte prefix plus 24 pseudo-random bytes), value 8 bytes, random insertion order, 16 MiB cache, 100,000 inserts per write transaction with `Durability::None` and one final `Immediate` commit. Database on ext4 (`~/.cache`, not tmpfs). Lookups: 100,000 random keys after the ingest, OS page cache warm (it cannot be dropped without root). Peak RSS and wall time from `/usr/bin/time -v`. Two runs per size.
+
+| names | ingest rate (2 runs) | database size | lookup median / p99 | peak RSS |
+|---|---|---|---|---|
+| 10,000,000 | 32,137 and 34,730 /s (288-311 s) | 2.16 GB (216 B/name) | 11.9-12.5 us / 36.6-39.2 us | 39.1-39.4 MB |
+| 100,000,000 | 10,660 and 12,420 /s (8,051-9,380 s) | 12.9 GB (129 B/name) | 27.6-27.9 us / 896-956 us | 117 MB (both runs) |
+
+Pre-registered criterion: at least 100,000 names/s at both sizes, bounded RSS, lookup median under 1 ms. **Ingest missed by 3x at 10M and 8-9x at 100M, and RSS grew from 39 MB to 117 MB, so it is not flat in n either.** Lookup passed. At 100M the rate extrapolates to roughly 7 hours for 300M names. Background load was uncontrolled (a browser and the desktop).
+
+Caveat found afterwards, in the redb source: every commit but the last used `Durability::None`, and redb keeps the page bookkeeping of non-durable commits in memory until a durable commit (`redb-4.4.0/src/tree_store/page_store/page_manager.rs:378-403`, cleared at `:1281` and `:1764`). The RSS growth, and possibly the rate and database size, are therefore partly an artifact of this setting. A rerun with periodic `Immediate` commits was not made. The ingest-rate miss is a result for random-order inserts only; sorted-order inserts were not measured.
 
 Not controlled: background load (a browser and the desktop session were running; the field check showed no other `flux` or build process).
