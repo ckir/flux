@@ -10,6 +10,7 @@ use super::RunWarning;
 use super::place::Place;
 use super::session::{Fault, Locked, checked};
 use crate::prior::PriorOp;
+use crate::scratch::ScratchSpace;
 use crate::state::{OpState, OperationState};
 use flux_fs::DirHandle;
 
@@ -25,6 +26,7 @@ pub(crate) fn supersede<D: DirHandle, P: Place<D>>(
     place: &P,
     locked: &Locked<'_, D>,
     priors: &[PriorOp],
+    scratch: Option<&ScratchSpace<'_>>,
     warnings: &mut Vec<RunWarning>,
 ) -> Result<(), Fault> {
     let own = &locked.state.operation_id;
@@ -37,7 +39,7 @@ pub(crate) fn supersede<D: DirHandle, P: Place<D>>(
         };
         place.write(&abandoned).map_err(|e| Fault::Io(prior.shown.clone(), e))?;
     }
-    let gone = place.sweep(priors, locked, warnings)?;
+    let gone = place.sweep(priors, locked, scratch, warnings)?;
     for prior in priors.iter().filter(|p| gone.contains(&p.state.operation_id)) {
         checked(locked)?;
         if let Err((path, error)) = place.remove(&prior.state.operation_id) {

@@ -24,6 +24,7 @@ use crate::copy::{CopyError, CopyStep, no_heartbeat, unguarded};
 use crate::dry_run::{DryPrior, DryRun, NullClaimStore};
 use crate::lock::{LockCode, LockError, LockResult, LockSite, Refusal, check_capability};
 use crate::prior::{PriorOp, Scan, check_control_plane};
+use crate::scratch::{ScratchSpace, Thresholds, temporary_home};
 use crate::state::{
     Kind, OperationState, Root, RootKind, absolute_lexical, identity_text, native_hex, wall_time_ns,
 };
@@ -651,9 +652,10 @@ impl<F: DestinationRoot> Place<F::Dir> for MultiPlace<'_, F> {
         &self,
         priors: &[PriorOp],
         locked: &Locked<'_, F::Dir>,
+        scratch: Option<&ScratchSpace<'_>>,
         warnings: &mut Vec<RunWarning>,
     ) -> Result<Vec<String>, Fault> {
-        self.tree.sweep(priors, locked, warnings)
+        self.tree.sweep(priors, locked, scratch, warnings)
     }
 
     fn remove(&self, id: &str) -> Result<(), (PathBuf, FsError)> {
@@ -843,13 +845,16 @@ pub fn trees<F: DestinationRoot>(
             return ended_early(run);
         }
     };
+    // Created before any walk so it outlives them all; placed under the lock (or at once, for a dry run).
+    let scratch = ScratchSpace::unplaced(Thresholds::default(), cfg.scratch_dir.clone());
     let mut plans = Vec::with_capacity(specs.len());
-    let mut inputs: Vec<RootInput<'_, F>> = Vec::with_capacity(specs.len());
+    let mut inputs: Vec<RootInput<'_, '_, F>> = Vec::with_capacity(specs.len());
     for spec in &specs {
         let target = dst_root.join(&spec.name);
         let (kind, identity) = match spec.kind {
             SourceKind::Folder => {
-                match prepare_source(fs, &spec.src, &target, MountPolicy::of(&opts)) {
+                match prepare_source(fs, &spec.src, &target, MountPolicy::of(&opts), Some(&scratch))
+                {
                     Ok(mut source) => {
                         source.events.set_selection(&opts.selection);
                         let identity = source.identity;
@@ -974,7 +979,9 @@ pub fn trees<F: DestinationRoot>(
         prefix: RefCell::new(None),
     };
     if cfg.dry_run {
-        return dry_trees(fs, run, out, place, &site, anchor, cfg, &opts, inputs, on_report);
+        return dry_trees(
+            fs, run, out, place, &site, anchor, &scratch, cfg, &opts, inputs, on_report,
+        );
     }
     let mut done: Vec<RootDone> = Vec::new();
     let run = drive(
@@ -986,6 +993,7 @@ pub fn trees<F: DestinationRoot>(
         cfg,
         &opts,
         checkpoint_policy(cfg, opts.durability),
+        &scratch,
         &first.0,
         first.1,
         out,
@@ -1052,11 +1060,16 @@ fn dry_trees<F: DestinationRoot>(
     place: MultiPlace<'_, F>,
     site: &LockSite<'_, F::Dir>,
     anchor: FileIdentity,
+    scratch: &ScratchSpace<'_>,
     cfg: &RunConfig,
     opts: &CopyOptions,
-    inputs: Vec<RootInput<'_, F>>,
+    inputs: Vec<RootInput<'_, '_, F>>,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> MultiRun {
+    // A dry run holds no workspace: its scratch goes to the temporary directory at once (a home that cannot be found
+    // surfaces only if a directory actually spills).
+    let scratch_root = cfg.dry_temp_root.clone().unwrap_or_else(std::env::temp_dir);
+    scratch.place_or_remember(temporary_home(fs, cfg.scratch_dir.as_deref(), &scratch_root));
     let (dest_shown, operations_shown, absent) =
         (place.tree.dest_shown.clone(), place.tree.operations_shown(), place.tree.dest.is_none());
     let mut restart_preview = |priors: &[PriorOp], warnings: &mut Vec<RunWarning>| {
@@ -1550,6 +1563,7 @@ mod trees_tests {
             dry_run: false,
             dry_temp_root: None,
             progress: None,
+            scratch_dir: None,
         }
     }
 
@@ -3583,8 +3597,9 @@ mod trees_tests {
             [RootStatus::Completed, RootStatus::Failed, RootStatus::NotStarted]
         );
 
-        // T12b: a source file of the second root that cannot be read (`read_dir` is made before the lock, in
-        // `prepare_source`, so it cannot fail mid-plan) is a counted failure, and the third root goes on.
+        // T12b: a source file of the second root that cannot be read (the root's listing is made when its copy begins,
+        // and a dry run starts it when its copy begins too, so a file's metadata is the failure left mid-plan) is a
+        // counted failure, and the third root goes on.
         let reference = dest_only();
         dry_names(&reference, &["a", "b", "f"]);
         let n = nth_of(&reference, "metadata", "/src/b/k");
@@ -4718,5 +4733,22 @@ mod trees_tests {
             &CASE_NAMES,
         );
         assert_eq!(code, LockCode::TargetLockUncertain);
+    }
+
+    #[test]
+    fn an_unlistable_second_root_stops_the_run_after_the_first_root() {
+        let fs = fake();
+        fs.fail_read_dir_of("/src/b", Code::PermissionDenied, ErrorKind::PermissionDenied);
+        let (r, _) = go(&fs, &["a", "b", "c"]);
+        assert!(r.run.stop.is_none(), "{:?}", r.run.stop);
+        assert_eq!(
+            statuses(&r),
+            [RootStatus::Completed, RootStatus::Failed, RootStatus::NotStarted]
+        );
+        assert!(
+            matches!(copy_of(&r), Err(a) if a.error.step == crate::copy::CopyStep::Source),
+            "{:?}",
+            copy_of(&r)
+        );
     }
 }

@@ -45,6 +45,7 @@ fn cfg() -> RunConfig {
         dry_run: false,
         dry_temp_root: None,
         progress: None,
+        scratch_dir: None,
     }
 }
 
@@ -2512,7 +2513,8 @@ fn a_target_that_finds_its_own_claim_proceeds() {
     assert!(matches!(store.insert_if_absent(&key_a, &own).unwrap(), ClaimOutcome::Inserted));
     let claims = std::cell::RefCell::new(store);
     let source =
-        prepare_source(&fs, Path::new("/src"), Path::new("/p/dest"), MountPolicy::Cross).unwrap();
+        prepare_source(&fs, Path::new("/src"), Path::new("/p/dest"), MountPolicy::Cross, None)
+            .unwrap();
     let o = opts();
     let cx = Shared {
         fs: &fs,
@@ -9501,7 +9503,7 @@ fn a_candidate_without_claims_degrades_under_auto_and_fails_under_preserve() {
         fs.create_dir(Path::new("/p/dest")).unwrap();
         let root = fs.destination_root(Path::new("/p/dest")).unwrap();
         let source =
-            prepare_source(&fs, Path::new("/src"), Path::new("/p/dest"), MountPolicy::Cross)
+            prepare_source(&fs, Path::new("/src"), Path::new("/p/dest"), MountPolicy::Cross, None)
                 .unwrap();
         let o = CopyOptions { hardlinks: mode, ..opts() };
         let slot = crate::hardlinks::HardlinkSlot::unavailable(Code::IoError);
@@ -10177,7 +10179,8 @@ fn no_claims_source_stats(existing: ExistingPolicy, slot: bool) -> usize {
     fs.create_dir(Path::new("/p/dest")).unwrap();
     let root = fs.destination_root(Path::new("/p/dest")).unwrap();
     let source =
-        prepare_source(&fs, Path::new("/src"), Path::new("/p/dest"), MountPolicy::Cross).unwrap();
+        prepare_source(&fs, Path::new("/src"), Path::new("/p/dest"), MountPolicy::Cross, None)
+            .unwrap();
     let o = CopyOptions { existing, ..opts() };
     let hardlinks = crate::hardlinks::HardlinkSlot::unavailable(Code::IoError);
     let cx = Shared {
@@ -11773,4 +11776,149 @@ mod op_events {
         assert_eq!(for_a, vec![&ev("replaced", "a", Some(1), None)], "{events:?}");
         assert!(events.contains(&ev("copied", "sub/b", Some(2), None)), "{events:?}");
     }
+}
+
+// ---- Bounded listing (cut 23, plan 2, task 5): the copy places its scratch, starts its walk and beats ----
+
+/// Small thresholds: a directory of more than 4 entries spills, 8 entries per run, 3 entries per tick.
+fn spilling() -> crate::scratch::Thresholds {
+    crate::scratch::Thresholds::new(4, 8, 2, 16, 3).unwrap()
+}
+
+fn run_tree_small(
+    fs: &FaultFs,
+    c: &RunConfig,
+    t: crate::scratch::Thresholds,
+) -> (Run<Result<TreeOutcome, TreeAbort>>, Vec<TreeFailure>) {
+    let mut got = Vec::new();
+    let r = tree_with_thresholds(
+        fs,
+        Path::new("/src"),
+        Path::new("/p/dest"),
+        &opts(),
+        c,
+        &mut |f| got.push(f),
+        checkpoint_policy(c, opts().durability),
+        t,
+    );
+    (r, got)
+}
+
+/// `/src` holding `f00`..`f{n-1}`, and `/p`.
+fn flat_source(n: usize) -> FaultFs {
+    let fs = FaultFs::new();
+    for d in ["/src", "/p"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    for i in 0..n {
+        fs.write_file(format!("/src/f{i:02}"), format!("body {i}").as_bytes());
+    }
+    fs
+}
+
+#[test]
+fn a_copy_whose_root_spills_puts_its_scratch_in_the_workspace() {
+    let fs = flat_source(20);
+    let (r, got) = run_tree_small(&fs, &cfg(), spilling());
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(ok(&r).files_copied, 20);
+    let c = calls(&fs);
+    let scratch = at(&c, &format!("create_scratch(/p/dest/.flux/operations/{ID})"));
+    assert!(scratch > at(&c, "create_lock("), "the scratch is made under the lock: {c:?}");
+    assert!(!fs.exists("/p/dest/.flux"), "the workspace is gone after the finish");
+}
+
+#[test]
+fn a_copy_whose_root_cannot_be_listed_fails_after_the_lock_with_the_source_step() {
+    let fs = fake();
+    fs.fail_read_dir_of("/src", Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let (r, _) = run_tree(&fs, &cfg());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert_eq!(aborted(&r).error.step, CopyStep::Source);
+    assert_eq!(manifest(&fs, ID).state, OpState::Failed);
+    assert!(!fs.exists(LOCK), "released");
+    assert!(!fs.exists("/p/dest/a") && !fs.exists("/p/dest/sub"), "nothing but state");
+    let c = calls(&fs);
+    assert!(at(&c, "read_dir(/src)") > at(&c, "create_lock("), "listed under the lock: {c:?}");
+}
+
+#[test]
+fn a_failed_heartbeat_during_a_spilled_listing_stops_the_copy() {
+    let build = || {
+        let fs = fake();
+        for i in 0..40 {
+            fs.write_file(format!("/src/sub/f{i:02}"), b"x");
+        }
+        fs
+    };
+    // The reference run: the first heartbeat write after the subdirectory is listed lands inside that listing.
+    let reference = build();
+    let (r, _) = run_tree_small(
+        &reference,
+        &beating(),
+        crate::scratch::Thresholds::new(4, 8, 2, 16, 8).unwrap(),
+    );
+    ok(&r);
+    let c = calls(&reference);
+    let listed = at(&c, "read_dir(/src/sub)");
+    let n = c[..listed].iter().filter(|x| x.starts_with("write_at_start(")).count() as u32 + 1;
+    let fs = build();
+    fail_heartbeat(&fs, n, LOCK, false);
+    let (r, got) =
+        run_tree_small(&fs, &beating(), crate::scratch::Thresholds::new(4, 8, 2, 16, 8).unwrap());
+    let a = aborted(&r);
+    assert_eq!((a.error.step, a.error.code()), (CopyStep::Heartbeat, Code::IoError));
+    assert!(got.is_empty(), "an abort, never a file's failure: {got:?}");
+    assert!(
+        (0..40).all(|i| !fs.exists(format!("/p/dest/sub/f{i:02}"))),
+        "nothing of sub published"
+    );
+}
+
+#[test]
+fn a_restart_sweep_over_a_spilling_dest_uses_the_new_workspace() {
+    let fs = flat_source(20);
+    prior(&fs, 5, OpState::Transferring);
+    fs.write_file(format!("/p/dest/f00.flux-partial.{}", id(5)), b"half");
+    let (r, got) = run_tree_small(&fs, &restart(), spilling());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(ok(&r).files_copied, 20);
+    let c = calls(&fs);
+    at(&c, &format!("create_scratch(/p/dest/.flux/operations/{ID})"));
+    assert!(
+        !c.iter().any(|x| x.starts_with("create_scratch(") && x.contains(&id(5))),
+        "never the superseded workspace: {c:?}"
+    );
+}
+
+#[test]
+fn a_hardlink_group_straddling_run_boundaries_keeps_its_canonical_member() {
+    let published = |t: crate::scratch::Thresholds| {
+        let fs = FaultFs::new();
+        for d in ["/src", "/p"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        for i in (0..20).filter(|i| *i != 17) {
+            fs.write_file(format!("/src/f{i:02}"), format!("body {i}").as_bytes());
+        }
+        link_names(&fs, "/src", "f03", &["f17"]);
+        let (r, got) = run_tree_small(&fs, &cfg(), t);
+        assert!(got.is_empty(), "{got:?}");
+        let out = ok(&r);
+        let same = strong(&fs, "/p/dest/f03") == strong(&fs, "/p/dest/f17");
+        let names: Vec<bool> = (0..20).map(|i| fs.exists(format!("/p/dest/f{i:02}"))).collect();
+        (out.files_copied, out.files_hardlinked, same, names)
+    };
+    let small = published(spilling());
+    assert_eq!(small, published(crate::scratch::Thresholds::default()));
+    assert_eq!((small.0, small.1, small.2), (19, 1, true), "f03 is copied and f17 links to it");
+}
+
+#[test]
+fn a_dry_run_that_never_spills_creates_no_scratch() {
+    let fs = fake();
+    let (r, _) = run_tree(&fs, &RunConfig { dry_run: true, ..cfg() });
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert!(!fs.called("create_scratch("), "{:?}", calls(&fs));
 }

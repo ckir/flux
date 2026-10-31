@@ -7,7 +7,7 @@
 //! The scratch space a bounded listing spills into: one anonymous file in a directory, carved into regions that
 //! are truncated in stack order.
 
-use flux_fs::{Code, DirHandle, FsError};
+use flux_fs::{Code, DestinationRoot, DirHandle, FsError};
 use std::cell::{Cell, RefCell};
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -376,6 +376,107 @@ impl Drop for Region<'_, '_> {
     }
 }
 
+impl ScratchSpace<'_> {
+    /// Whether a home (or a remembered failure to find one) was set.
+    pub(crate) fn is_placed(&self) -> bool {
+        !matches!(*self.home.borrow(), Home::Unplaced)
+    }
+}
+
+const NO_HOME: &str = "no disk-backed scratch location (the temporary directory is memory-backed); pass --scratch-dir PATH";
+
+/// Where a run without a placed workspace (a dry run, the lockless library copy) keeps its scratch file (spec 6.1):
+/// `explicit` wins with no memory check; else `temp_root` unless it is memory-backed; else the user cache directory.
+pub(crate) fn temporary_home<F: DestinationRoot>(
+    fs: &F,
+    explicit: Option<&Path>,
+    temp_root: &Path,
+) -> Result<(F::Dir, PathBuf), FsError> {
+    let mut caches: Vec<PathBuf> = Vec::new();
+    #[cfg(windows)]
+    if let Some(p) = std::env::var_os("LOCALAPPDATA").filter(|p| !p.is_empty()) {
+        caches.push(PathBuf::from(p));
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(p) = std::env::var_os("XDG_CACHE_HOME").filter(|p| !p.is_empty()) {
+            caches.push(PathBuf::from(p));
+        }
+        if let Some(p) = std::env::var_os("HOME").filter(|p| !p.is_empty()) {
+            caches.push(PathBuf::from(p).join(".cache"));
+        }
+    }
+    temporary_home_from(fs, explicit, temp_root, &caches)
+}
+
+fn temporary_home_from<F: DestinationRoot>(
+    fs: &F,
+    explicit: Option<&Path>,
+    temp_root: &Path,
+    caches: &[PathBuf],
+) -> Result<(F::Dir, PathBuf), FsError> {
+    if let Some(path) = explicit {
+        return Ok((fs.destination_root(path)?, path.to_path_buf()));
+    }
+    // A temporary directory that cannot be opened is not "memory-backed": its own error is the answer, and nothing
+    // (no cache directory) is created for a run that may never spill.
+    let dir = fs.destination_root(temp_root)?;
+    if dir.memory_backed().unwrap_or(None) != Some(true) {
+        return Ok(windows_subdir(dir, temp_root.to_path_buf()));
+    }
+    for cache in caches {
+        let dir = match fs.destination_root(cache) {
+            Ok(dir) => dir,
+            Err(e) if e.source.kind() == std::io::ErrorKind::NotFound => {
+                match fs.create_dir(cache).and_then(|()| fs.destination_root(cache)) {
+                    Ok(dir) => dir,
+                    Err(_) => continue,
+                }
+            }
+            Err(_) => continue,
+        };
+        if dir.memory_backed().unwrap_or(None) != Some(true) {
+            return Ok(windows_subdir(dir, cache.clone()));
+        }
+    }
+    Err(fatal(NO_HOME))
+}
+
+/// On Windows the scratch file lives in a `flux-scratch` subdirectory, whose files older than 24 hours (a crash's
+/// leftovers) are removed on first use. Best effort: any error keeps the directory itself.
+#[cfg(windows)]
+fn windows_subdir<D: DirHandle>(dir: D, shown: PathBuf) -> (D, PathBuf) {
+    let name = std::ffi::OsStr::new("flux-scratch");
+    let sub = match dir.create_dir(name) {
+        Ok(sub) => sub,
+        Err(e) if e.source.kind() == std::io::ErrorKind::AlreadyExists => {
+            match dir.open_dir(name) {
+                Ok(sub) => sub,
+                Err(_) => return (dir, shown),
+            }
+        }
+        Err(_) => return (dir, shown),
+    };
+    let day = std::time::Duration::from_secs(24 * 60 * 60);
+    if let Ok(entries) = sub.read_dir() {
+        for entry in entries {
+            if entry.file_type == flux_fs::FileType::File
+                && let Ok(m) = sub.metadata(&entry.name)
+                && let Some(age) = m.modified.and_then(|t| t.elapsed().ok())
+                && age > day
+            {
+                let _ignored = sub.remove_file(&entry.name);
+            }
+        }
+    }
+    (sub, shown.join("flux-scratch"))
+}
+
+#[cfg(not(windows))]
+fn windows_subdir<D: DirHandle>(dir: D, shown: PathBuf) -> (D, PathBuf) {
+    (dir, shown)
+}
+
 #[cfg(unix)]
 fn write_all_at(file: &File, bytes: &[u8], offset: u64) -> std::io::Result<()> {
     std::os::unix::fs::FileExt::write_all_at(file, bytes, offset)
@@ -588,5 +689,51 @@ mod tests {
         space.place_or_remember(home);
         let err = space.begin(1).err().expect("refused");
         assert_eq!(err.code, Code::PermissionDenied);
+    }
+    fn home_fs() -> FaultFs {
+        use flux_fs::FileSystem;
+        let fs = FaultFs::new();
+        for d in ["/tmp", "/cache", "/mine"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        fs
+    }
+
+    #[test]
+    fn temporary_home_prefers_explicit_then_a_disk_backed_temp_root_then_the_cache() {
+        let fs = home_fs();
+        let caches = [PathBuf::from("/cache"), PathBuf::from("/absent/.cache")];
+        fs.set_memory_backed("/mine", Some(true));
+        let (_, shown) =
+            temporary_home_from(&fs, Some(Path::new("/mine")), Path::new("/tmp"), &caches).unwrap();
+        assert_eq!(shown, Path::new("/mine"), "explicit wins with no memory check");
+        let (_, shown) = temporary_home_from(&fs, None, Path::new("/tmp"), &caches).unwrap();
+        assert_eq!(shown, Path::new("/tmp"));
+        fs.set_memory_backed("/tmp", Some(true));
+        let (_, shown) = temporary_home_from(&fs, None, Path::new("/tmp"), &caches).unwrap();
+        assert_eq!(shown, Path::new("/cache"));
+        // An unknown answer is not "memory-backed".
+        fs.set_memory_backed("/tmp", None);
+        let (_, shown) = temporary_home_from(&fs, None, Path::new("/tmp"), &caches).unwrap();
+        assert_eq!(shown, Path::new("/tmp"));
+    }
+
+    #[test]
+    fn temporary_home_makes_an_absent_cache_and_names_the_flag_when_nothing_fits() {
+        let fs = home_fs();
+        fs.set_memory_backed("/tmp", Some(true));
+        let caches = [PathBuf::from("/cache/sub")];
+        let (_, shown) = temporary_home_from(&fs, None, Path::new("/tmp"), &caches).unwrap();
+        assert_eq!(shown, Path::new("/cache/sub"));
+        assert!(fs.exists("/cache/sub"), "made because it was absent");
+        fs.set_memory_backed("/cache/sub", Some(true));
+        let Err(e) = temporary_home_from(&fs, None, Path::new("/tmp"), &caches) else {
+            panic!("every location is memory-backed");
+        };
+        assert_eq!(e.code, Code::IoError);
+        assert_eq!(
+            e.source.to_string(),
+            "no disk-backed scratch location (the temporary directory is memory-backed); pass --scratch-dir PATH"
+        );
     }
 }

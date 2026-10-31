@@ -55,6 +55,7 @@ fn config(dry_run: bool) -> RunConfig {
         dry_run,
         dry_temp_root: None,
         progress: None,
+        scratch_dir: None,
     }
 }
 

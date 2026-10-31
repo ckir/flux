@@ -401,6 +401,7 @@ fn run_config(args: &CopyArgs) -> RunConfig {
         dry_run: args.dry_run,
         dry_temp_root: Some(std::env::temp_dir()),
         progress: None,
+        scratch_dir: None,
     }
 }
 

@@ -42,6 +42,7 @@ use crate::lock::site::NAME_LIMIT;
 use crate::lock::{LockCode, LockSite, Refusal, Released, check_capability};
 use crate::oplog::{self, Verb};
 use crate::prior::{check_control_plane, resumable_refusal};
+use crate::scratch::{ScratchSpace, Thresholds, temporary_home};
 use crate::state::{HARDLINK_INDEX, OpState, file_names_fit, identity_text, native_hex};
 use crate::tree::{
     RootIdentity, Shared, Source, TreeAbort, TreeFailure, TreeFailureCause, TreeOutcome,
@@ -54,7 +55,7 @@ use flux_fs::{
     LockCapability, OperationId, Outcome,
 };
 pub use multi::{MultiRun, RootReport, trees};
-use place::{FilePlace, Place, TreePlace, locate_tree};
+use place::{FilePlace, Place, TreePlace, locate_tree, place_scratch};
 pub(crate) use roots::plan_roots;
 pub use roots::{SourceKind, SourceSpec, source_cap};
 
@@ -102,6 +103,8 @@ pub struct RunConfig {
     pub dry_temp_root: Option<PathBuf>,
     /// The live counters a display samples; `None` outside the CLI's terminal case.
     pub progress: Option<std::sync::Arc<crate::progress::Progress>>,
+    /// `--scratch-dir`: where a bounded listing spills; `None` uses the spec 6.1 chain.
+    pub scratch_dir: Option<PathBuf>,
 }
 
 /// §101's heartbeat interval: 5 s.
@@ -123,6 +126,7 @@ impl std::fmt::Debug for RunConfig {
             .field("dry_run", &self.dry_run)
             .field("dry_temp_root", &self.dry_temp_root)
             .field("progress", &self.progress.is_some())
+            .field("scratch_dir", &self.scratch_dir)
             .finish()
     }
 }
@@ -311,6 +315,31 @@ pub(crate) fn tree_with<F: DestinationRoot>(
     on_report: &mut dyn FnMut(TreeFailure),
     policy: CheckpointPolicy,
 ) -> Run<Result<TreeOutcome, TreeAbort>> {
+    tree_with_thresholds(
+        fs,
+        src_root,
+        dst_root,
+        opts,
+        cfg,
+        on_report,
+        policy,
+        Thresholds::default(),
+    )
+}
+
+/// `tree_with` with the listing thresholds given: the test seam for a small spill (`RunConfig` is public, so no test
+/// field goes on it).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn tree_with_thresholds<F: DestinationRoot>(
+    fs: &F,
+    src_root: &Path,
+    dst_root: &Path,
+    opts: &CopyOptions,
+    cfg: &RunConfig,
+    on_report: &mut dyn FnMut(TreeFailure),
+    policy: CheckpointPolicy,
+    thresholds: Thresholds,
+) -> Run<Result<TreeOutcome, TreeAbort>> {
     let mut run = Run {
         copy: None,
         stop: None,
@@ -324,13 +353,16 @@ pub(crate) fn tree_with<F: DestinationRoot>(
         CopyOptions { operation_id: OperationId::new(cfg.operation_id.as_str()), ..opts.clone() };
     let mut out = TreeOutcome { progress: cfg.progress.clone(), ..TreeOutcome::default() };
     // B1: the source side, then DEST and the identity pre-flight, before anything is created.
-    let mut source = match prepare_source(fs, src_root, dst_root, MountPolicy::of(&opts)) {
-        Ok(s) => s,
-        Err(error) => {
-            run.copy = Some(Err(TreeAbort { error, outcome: out }));
-            return run;
-        }
-    };
+    // Created before the walk so it outlives it; placed under the lock (or at once, for a dry run).
+    let scratch = ScratchSpace::unplaced(thresholds, cfg.scratch_dir.clone());
+    let mut source =
+        match prepare_source(fs, src_root, dst_root, MountPolicy::of(&opts), Some(&scratch)) {
+            Ok(s) => s,
+            Err(error) => {
+                run.copy = Some(Err(TreeAbort { error, outcome: out }));
+                return run;
+            }
+        };
     source.events.set_selection(&opts.selection);
     let located = match locate_tree(fs, src_root, dst_root, source.identity, opts.safety, &mut out)
     {
@@ -383,7 +415,9 @@ pub(crate) fn tree_with<F: DestinationRoot>(
     };
     // Cut 11a: a dry run plans the walk and touches nothing: no lock, no state, no claim store, no WAL, no finish.
     if cfg.dry_run {
-        return dry_tree(run, &mut place, &site, capability, source, cfg, &opts, on_report, out);
+        return dry_tree(
+            run, &mut place, &site, capability, source, &scratch, cfg, &opts, on_report, out,
+        );
     }
     drive(
         fs,
@@ -394,6 +428,7 @@ pub(crate) fn tree_with<F: DestinationRoot>(
         cfg,
         &opts,
         policy,
+        &scratch,
         src_root,
         source.identity,
         out,
@@ -440,6 +475,7 @@ fn drive<'p, F, P>(
     cfg: &RunConfig,
     opts: &CopyOptions,
     policy: CheckpointPolicy,
+    scratch: &ScratchSpace<'_>,
     src_root: &Path,
     src_identity: FileIdentity,
     mut out: TreeOutcome,
@@ -457,7 +493,15 @@ where
     P: TreeAt<'p, F>,
 {
     // Steps 3-5 (and `--restart`): the lock, then this operation's state and the record naming it.
-    let locked = match open_operation(site, capability, &mut *place, cfg, opts, &mut run.warnings) {
+    let locked = match open_operation(
+        site,
+        capability,
+        &mut *place,
+        cfg,
+        opts,
+        Some(scratch),
+        &mut run.warnings,
+    ) {
         Ok(l) => l,
         Err(e) => {
             // `create` may have taken locks of its own before a later step of the opening failed.
@@ -474,6 +518,11 @@ where
     // Cut 12: the hardlink slot (a handle on the workspace; the index file is created on first use) and the second
     // handle on DEST the anchor's directory is opened from (plan rulings 8, 9).
     let workspace_id = locked.state.operation_id.clone();
+    // The scratch goes in this operation's workspace (a `--restart` sweep inside `open_operation` already placed it;
+    // this is idempotent). A failure stops the run before the walk.
+    let scratch_failed = place_scratch(fs, place.tree_place(), &workspace_id, scratch)
+        .err()
+        .map(|e| CopyError::at(CopyStep::Resolve, e));
     let (hardlink_slot, anchor_root, mut slot_warned) = if opts.hardlinks
         == flux_fs::Hardlinks::Copy
     {
@@ -564,10 +613,12 @@ where
         &guard,
         &beat,
     );
-    let mut stopped_early = None;
+    let mut stopped_early = scratch_failed;
     match opened {
         Ok(c) => *ckpt.borrow_mut() = c,
-        Err(error) => stopped_early = Some(error),
+        Err(error) => {
+            stopped_early.get_or_insert(error);
+        }
     }
     // The store stays open past the walk, for the final sync; it is dropped before `finish` removes the file.
     let claims = place.tree_place_mut().claims.take().map(std::cell::RefCell::new);
@@ -604,6 +655,9 @@ where
         };
         walk(&cx, &mut *place, &mut out, &mut report)
     };
+    // No scratch handle may be open when `finish` removes the workspace (Windows refuses to remove a directory holding
+    // a delete-pending file), and the WAL thread ends after this.
+    scratch.close();
     let mut result = match walked {
         Ok(()) => Ok(out),
         Err(error) => Err(TreeAbort { error, outcome: out }),
@@ -798,14 +852,14 @@ pub(crate) fn file_with<F: DestinationRoot>(
         return dry_file(run, fs, &place, &site, capability, src, cfg, &opts);
     }
     // Steps 3-5.
-    let locked = match open_operation(&site, capability, &mut place, cfg, &opts, &mut run.warnings)
-    {
-        Ok(l) => l,
-        Err(e) => {
-            run.stop = Some(e);
-            return run;
-        }
-    };
+    let locked =
+        match open_operation(&site, capability, &mut place, cfg, &opts, None, &mut run.warnings) {
+            Ok(l) => l,
+            Err(e) => {
+                run.stop = Some(e);
+                return run;
+            }
+        };
     run.resumed = locked.resumed.clone();
     let opts = CopyOptions { operation_id: OperationId::new(&locked.state.operation_id), ..opts };
     // The one file's size is the expected total, unless a resume makes the figure unreliable or the file is empty.
@@ -1428,12 +1482,17 @@ fn dry_tree<F: DestinationRoot>(
     place: &mut TreePlace<'_, F>,
     site: &LockSite<'_, F::Dir>,
     capability: LockCapability,
-    source: Source<'_, F>,
+    source: Source<'_, '_, F>,
+    scratch: &ScratchSpace<'_>,
     cfg: &RunConfig,
     opts: &CopyOptions,
     on_report: &mut dyn FnMut(TreeFailure),
     mut out: TreeOutcome,
 ) -> Run<Result<TreeOutcome, TreeAbort>> {
+    // A dry run holds no workspace: its scratch goes to the temporary directory at once. A home that cannot be found
+    // surfaces only if a directory actually spills.
+    let scratch_root = cfg.dry_temp_root.clone().unwrap_or_else(std::env::temp_dir);
+    scratch.place_or_remember(temporary_home(place.fs, cfg.scratch_dir.as_deref(), &scratch_root));
     // Spec 3.5: DEST absent means nothing to supersede and no walk.
     let (dest_shown, operations_shown, absent_dest) =
         (place.dest_shown.clone(), place.operations_shown(), place.dest.is_none());
@@ -1544,6 +1603,7 @@ fn dry_tree<F: DestinationRoot>(
             Err(CopyError::at(CopyStep::Resolve, e))
         }
     };
+    scratch.close();
     // Cut 12: the index file and its private directory go with the slot.
     if let Some(slot) = hardlink_slot {
         let failure = slot.failure();
