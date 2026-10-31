@@ -147,6 +147,8 @@ struct Inner {
     next_lock_handle: u64,
     /// What `lock_capability` answers; `None` means `LocalStrong`.
     lock_capability: Option<LockCapability>,
+    /// path -> what `memory_backed` answers there; a missing path answers `Some(false)`.
+    memory_backed: HashMap<PathBuf, Option<bool>>,
     /// (call name, which call) -> an action. The action runs just BEFORE that call, outside the fake's own lock,
     /// so it can drive the fake itself: "another process acts between two of this one's calls" (cut 7a Part 2's
     /// protocol tests). Consumed on use. Keyed by both, so two hooks on one name at different counts coexist.
@@ -1233,6 +1235,11 @@ impl FaultFs {
 
     pub fn called(&self, prefix: &str) -> bool {
         self.calls().iter().any(|c| c.starts_with(prefix))
+    }
+
+    /// What `memory_backed` answers for the directory at `path` (default `Some(false)`).
+    pub fn set_memory_backed(&self, path: impl AsRef<Path>, answer: Option<bool>) {
+        self.inner.lock().unwrap().memory_backed.insert(path.as_ref().to_path_buf(), answer);
     }
 
     /// What every `lock_capability` call answers from now on (default `LocalStrong`).
@@ -2360,6 +2367,19 @@ impl DirHandle for FakeDirHandle {
             path: child_path,
             inner: std::sync::Arc::clone(&self.inner),
         })
+    }
+
+    fn create_scratch(&self) -> Result<std::fs::File> {
+        self.fs()
+            .record(format!("create_scratch({})", self.my_path().display()), "create_scratch")?;
+        // The fake has no bytes of its own to give: an anonymous real file stands in.
+        tempfile::tempfile().map_err(FsError::from_io)
+    }
+
+    fn memory_backed(&self) -> Result<Option<bool>> {
+        let path = self.my_path();
+        let g = self.inner.lock().unwrap();
+        Ok(g.memory_backed.get(&path).copied().unwrap_or(Some(false)))
     }
 
     fn create_hardlink_index(&self, name: &OsStr) -> Result<Self::Index> {
@@ -4105,6 +4125,36 @@ mod tests {
             n.set(n.get() + 1);
             d.create_hardlink_index(OsStr::new(&format!("h{}.db", n.get()))).unwrap()
         });
+    }
+
+    #[test]
+    fn create_scratch_is_logged_and_can_fail() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        d.create_scratch().expect("the first call succeeds");
+        assert!(
+            fs.calls().iter().any(|c| c.replace('\\', "/") == "create_scratch(/d)"),
+            "the call log names the directory: {:?}",
+            fs.calls()
+        );
+        fs.fail("create_scratch", Code::DiskFull);
+        let err = d.create_scratch().expect_err("the injected fault");
+        assert_eq!(err.code, Code::DiskFull);
+    }
+
+    #[test]
+    fn memory_backed_answers_the_switch() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        assert_eq!(d.memory_backed().unwrap(), Some(false), "the default");
+        fs.set_memory_backed("/d", Some(true));
+        assert_eq!(d.memory_backed().unwrap(), Some(true));
+        fs.set_memory_backed("/d", None);
+        assert_eq!(d.memory_backed().unwrap(), None);
     }
 
     #[test]

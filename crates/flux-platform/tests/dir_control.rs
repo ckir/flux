@@ -312,3 +312,71 @@ fn read_dir_ino_is_the_object_index_of_the_entry() {
         assert_eq!(entry.ino, Some(index as u64), "{:?}", entry.name);
     }
 }
+
+/// Read `len` bytes at `offset` without moving a cursor, on either platform.
+fn read_at(f: &std::fs::File, offset: u64, len: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; len];
+    #[cfg(unix)]
+    std::os::unix::fs::FileExt::read_exact_at(f, &mut buf, offset).expect("read_at");
+    #[cfg(windows)]
+    {
+        let n = std::os::windows::fs::FileExt::seek_read(f, &mut buf, offset).expect("seek_read");
+        assert_eq!(n, len);
+    }
+    buf
+}
+
+/// Write `bytes` at `offset` without moving a cursor, on either platform.
+fn write_at(f: &std::fs::File, offset: u64, bytes: &[u8]) {
+    #[cfg(unix)]
+    std::os::unix::fs::FileExt::write_all_at(f, bytes, offset).expect("write_at");
+    #[cfg(windows)]
+    {
+        let n = std::os::windows::fs::FileExt::seek_write(f, bytes, offset).expect("seek_write");
+        assert_eq!(n, bytes.len());
+    }
+}
+
+#[test]
+fn create_scratch_leaves_no_name_in_the_directory() {
+    let (_tmp, d) = dir();
+    std::fs::write(_tmp.path().join("keep"), b"x").unwrap();
+    let before = listing(&d);
+    let f = d.create_scratch().expect("create a scratch file");
+    write_at(&f, 0, b"abc");
+    assert_eq!(read_at(&f, 0, 3), b"abc");
+    assert_eq!(listing(&d), before, "the scratch file has no name in the directory");
+}
+
+#[test]
+fn two_scratch_files_are_independent() {
+    let (_tmp, d) = dir();
+    let a = d.create_scratch().expect("first");
+    let b = d.create_scratch().expect("second");
+    write_at(&a, 0, b"first!");
+    write_at(&b, 0, b"second");
+    assert_eq!(read_at(&a, 0, 6), b"first!");
+    assert_eq!(read_at(&b, 0, 6), b"second");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn memory_backed_says_false_for_the_test_tempdir_and_true_for_dev_shm() {
+    let (tmp, d) = dir();
+    // The runner's temp dir may itself be tmpfs: ask `stat -f` (an oracle independent of the code under test).
+    let fs_type = std::process::Command::new("stat")
+        .args(["-f", "-c", "%T"])
+        .arg(tmp.path())
+        .output()
+        .expect("run stat -f");
+    let fs_type = String::from_utf8_lossy(&fs_type.stdout).trim().to_string();
+    let shm = Path::new("/dev/shm");
+    let expected = Some(fs_type == "tmpfs" || fs_type == "ramfs");
+    assert_eq!(d.memory_backed().expect("fstatfs"), expected, "the test tempdir");
+    if shm.exists() {
+        let s = StdFileSystem.destination_root(shm).expect("open /dev/shm");
+        assert_eq!(s.memory_backed().expect("fstatfs"), Some(true), "/dev/shm is tmpfs");
+    } else {
+        eprintln!("skipping the /dev/shm half: it does not exist here");
+    }
+}

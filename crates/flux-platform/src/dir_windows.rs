@@ -25,12 +25,13 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_DELETE, FILE_DISPOSITION_INFORMATION,
-    FILE_DISPOSITION_INFORMATION_EX, FILE_DISPOSITION_POSIX_SEMANTICS, FILE_LINK_INFORMATION,
-    FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION,
-    FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS, FileDispositionInformation,
-    FileDispositionInformationEx, FileLinkInformation, FileRenameInformation,
-    FileRenameInformationEx, NtCreateFile, NtSetInformationFile,
+    FILE_CREATE, FILE_DELETE_ON_CLOSE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_DELETE,
+    FILE_DISPOSITION_INFORMATION, FILE_DISPOSITION_INFORMATION_EX,
+    FILE_DISPOSITION_POSIX_SEMANTICS, FILE_LINK_INFORMATION, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+    FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS,
+    FILE_RENAME_REPLACE_IF_EXISTS, FileDispositionInformation, FileDispositionInformationEx,
+    FileLinkInformation, FileRenameInformation, FileRenameInformationEx, NtCreateFile,
+    NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
     HANDLE, STATUS_DELETE_PENDING, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_INFO_CLASS,
@@ -463,6 +464,10 @@ impl DirHandle for StdDir {
         // The same exclusive, reparse-point-refusing create as `create_lock`; only the wrapper differs.
         let file = open_file_at(&self.0, name, FILE_CREATE)?;
         crate::RedbClaimStore::create_file(file, durability)
+    }
+
+    fn create_scratch(&self) -> Result<File> {
+        create_scratch_at(&self.0)
     }
 
     fn create_hardlink_index(&self, name: &OsStr) -> Result<Self::Index> {
@@ -1025,6 +1030,60 @@ fn open_file_at(p: &OwnedHandle, n: &OsStr, disposition: u32) -> Result<File> {
         ));
     }
     Ok(File::from(opened))
+}
+
+/// A file in `p` that deletes itself when its last handle closes. `FILE_DELETE_ON_CLOSE` needs `DELETE` access, and
+/// leaving `FILE_SHARE_DELETE` out of the share mode means nothing else can open it for deletion, so the name is gone
+/// when this handle drops, including when the process dies. Created exclusively (`FILE_CREATE`) under a random name,
+/// retried on a collision, and never through a reparse point (`FILE_OPEN_REPARSE_POINT`).
+fn create_scratch_at(p: &OwnedHandle) -> Result<File> {
+    use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let pid = u64::from(std::process::id());
+    for attempt in 0..16u64 {
+        let name = format!(".flux-scratch-{:016x}", nanos ^ pid ^ attempt);
+        let mut wide: Vec<u16> = OsStr::new(&name).encode_wide().collect();
+        let bytes = (wide.len() * 2) as u16;
+        let us = UNICODE_STRING { Length: bytes, MaximumLength: bytes, Buffer: wide.as_mut_ptr() };
+        let mut oa: OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+        oa.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
+        oa.RootDirectory = p.as_raw_handle() as HANDLE;
+        oa.ObjectName = &raw const us;
+        let mut h: HANDLE = std::ptr::null_mut();
+        let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        // SAFETY: every pointer is to a live local that outlives the call, and `wide` outlives `us`.
+        let status = unsafe {
+            NtCreateFile(
+                &raw mut h,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE | SYNCHRONIZE,
+                &raw const oa,
+                &raw mut iosb,
+                std::ptr::null(),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                FILE_CREATE,
+                FILE_NON_DIRECTORY_FILE
+                    | FILE_OPEN_REPARSE_POINT
+                    | FILE_SYNCHRONOUS_IO_NONALERT
+                    | FILE_DELETE_ON_CLOSE,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if status == 0 {
+            // SAFETY: NtCreateFile returned STATUS_SUCCESS, so `h` is a valid handle we own.
+            return Ok(File::from(unsafe { OwnedHandle::from_raw_handle(h as _) }));
+        }
+        if status == STATUS_OBJECT_NAME_COLLISION || status == STATUS_DELETE_PENDING {
+            continue;
+        }
+        let code =
+            if status == STATUS_ACCESS_DENIED { Code::PermissionDenied } else { Code::IoError };
+        return Err(FsError::new(code, nt_io_error("NtCreateFile", status)));
+    }
+    Err(FsError::from_io(std::io::Error::from(std::io::ErrorKind::AlreadyExists)))
 }
 
 fn metadata_at(p: &OwnedHandle, n: &OsStr) -> Result<Metadata> {
