@@ -435,6 +435,18 @@ pub(crate) fn temporary_home<F: DestinationRoot>(
     temporary_home_from(fs, explicit, temp_root, &caches)
 }
 
+/// Opens the operator's `--scratch-dir`. A failure names the path: the code is taken from the error first, then the
+/// message is rebuilt to carry the location.
+pub(crate) fn open_explicit<F: DestinationRoot>(fs: &F, path: &Path) -> Result<F::Dir, FsError> {
+    fs.destination_root(path).map_err(|e| {
+        // `.source` is deliberately rebuilt to name the path; consumers must use `.code`, not `raw_os_error`.
+        FsError::new(
+            e.code,
+            std::io::Error::new(e.source.kind(), format!("{}: {}", path.display(), e.source)),
+        )
+    })
+}
+
 /// The user cache directories to try, from the environment.
 pub(crate) fn cache_candidates() -> Vec<PathBuf> {
     cache_candidates_from(
@@ -465,7 +477,7 @@ fn temporary_home_from<F: DestinationRoot>(
     caches: &[PathBuf],
 ) -> Result<(F::Dir, PathBuf), FsError> {
     if let Some(path) = explicit {
-        return Ok((fs.destination_root(path)?, path.to_path_buf()));
+        return Ok((open_explicit(fs, path)?, path.to_path_buf()));
     }
     // A temporary directory that cannot be opened is not "memory-backed": its own error is the answer, and nothing
     // (no cache directory) is created for a run that may never spill.
@@ -854,6 +866,20 @@ mod tests {
         fs.set_memory_backed("/tmp", None);
         let (_, shown) = temporary_home_from(&fs, None, Path::new("/tmp"), &caches).unwrap();
         assert_eq!(shown, Path::new("/tmp"));
+    }
+
+    #[test]
+    fn a_missing_explicit_scratch_dir_is_named_and_keeps_its_code() {
+        use flux_fs::DestinationRoot;
+        let fs = home_fs();
+        let Err(bare) = fs.destination_root(Path::new("/nope")) else { panic!("absent") };
+        let before = bare.code;
+        let Err(e) = temporary_home_from(&fs, Some(Path::new("/nope")), Path::new("/tmp"), &[])
+        else {
+            panic!("the explicit directory is absent");
+        };
+        assert_eq!(e.code, before);
+        assert!(e.source.to_string().contains("/nope"), "{}", e.source);
     }
 
     #[test]

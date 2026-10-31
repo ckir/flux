@@ -465,7 +465,7 @@ pub(crate) fn place_scratch<F: DestinationRoot>(
         return Ok(());
     }
     if let Some(dir) = scratch.explicit() {
-        scratch.place(fs.destination_root(dir)?, dir.to_path_buf());
+        scratch.place(crate::scratch::open_explicit(fs, dir)?, dir.to_path_buf());
         return Ok(());
     }
     let workspace = place.open_workspace(id)?;
@@ -882,5 +882,42 @@ impl<D: DirHandle> Place<D> for FilePlace<'_, D> {
         _warnings: &mut Vec<RunWarning>,
     ) -> Result<Option<AdoptedStore>, RunError> {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    use super::*;
+    use crate::fault_fs::FaultFs;
+    use crate::scratch::Thresholds;
+    use flux_fs::{DestinationRoot, FileSystem};
+
+    #[test]
+    fn a_missing_explicit_scratch_dir_is_named_and_keeps_its_code() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let Err(bare) = fs.destination_root(Path::new("/nope")) else { panic!("absent") };
+        let before = bare.code;
+        let holder = fs.destination_root(Path::new("/d")).unwrap();
+        let place = TreePlace {
+            fs: &fs,
+            holder: &holder,
+            holder_shown: PathBuf::from("/d"),
+            name: None,
+            dest: None,
+            dest_shown: PathBuf::from("/d"),
+            created_dest: false,
+            operations: None,
+            claims: None,
+            durability: Durability::Normal,
+            src_root: PathBuf::from("/s"),
+            src_identity: FileIdentity::Unavailable,
+        };
+        let scratch = ScratchSpace::unplaced(Thresholds::default(), Some(PathBuf::from("/nope")));
+        let Err(e) = place_scratch(&fs, &place, "id", &scratch) else {
+            panic!("the explicit directory is absent");
+        };
+        assert_eq!(e.code, before);
+        assert!(e.source.to_string().contains("/nope"), "{}", e.source);
     }
 }

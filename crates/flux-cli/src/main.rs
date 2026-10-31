@@ -105,6 +105,9 @@ struct VerifyArgs {
     /// Take only the top level of each source folder: only the top level of each side is compared; no subdirectory is entered.
     #[arg(long)]
     no_recursive: bool,
+    /// Where a directory too large to sort in memory is spilled (default: the operation's workspace for a copy, else the system temporary directory, or the user cache directory when that is memory-backed). Never refused as memory-backed when given.
+    #[arg(long, value_name = "PATH")]
+    scratch_dir: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -223,6 +226,9 @@ struct CopyArgs {
     /// Take only the top level of each source folder: its files and links, no subdirectory is created or entered.
     #[arg(long)]
     no_recursive: bool,
+    /// Where a directory too large to sort in memory is spilled (default: the operation's workspace for a copy, else the system temporary directory, or the user cache directory when that is memory-backed). Never refused as memory-backed when given.
+    #[arg(long, value_name = "PATH")]
+    scratch_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -401,7 +407,7 @@ fn run_config(args: &CopyArgs) -> RunConfig {
         dry_run: args.dry_run,
         dry_temp_root: Some(std::env::temp_dir()),
         progress: None,
-        scratch_dir: None,
+        scratch_dir: args.scratch_dir.clone(),
     }
 }
 
@@ -841,7 +847,7 @@ fn verify_options(args: &VerifyArgs) -> flux_core::verify::VerifyOptions {
         },
         selection: selection_of(&args.exclude, args.no_recursive)
             .expect("validated at the top of copy/verify"),
-        scratch_dir: None,
+        scratch_dir: args.scratch_dir.clone(),
     }
 }
 
@@ -1053,7 +1059,10 @@ fn verify_several_cli(args: &VerifyArgs) -> u8 {
 fn verify_error_code(e: &VerifyError) -> u8 {
     match e {
         VerifyError::Failed { .. } => exit_code::FAILED,
-        _ => exit_code::USAGE,
+        VerifyError::RefusedRoots { .. }
+        | VerifyError::RefusedRoot { .. }
+        | VerifyError::RefusedNames { .. }
+        | VerifyError::RefusedAlias { .. } => exit_code::USAGE,
     }
 }
 

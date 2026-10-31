@@ -908,3 +908,41 @@ fn verify_with_sixty_five_patterns_exits_2_not_101() {
     assert!(out.stdout.is_empty(), "{}", stdout(&out));
     assert!(stderr(&out).contains("error:"), "{}", stderr(&out));
 }
+
+#[test]
+fn verify_uses_scratch_dir_when_it_spills() {
+    let d = TempDir::new().unwrap();
+    for side in ["src", "dst"] {
+        let p = d.path().join(side);
+        std::fs::create_dir_all(&p).unwrap();
+        for i in 0..9_000 {
+            std::fs::File::create(p.join(format!("f{i:05}"))).unwrap();
+        }
+    }
+    let (src, dst) = (d.path().join("src"), d.path().join("dst"));
+    let missing = d.path().join("missing");
+    let out = flux()
+        .arg("verify")
+        .arg(&src)
+        .arg(&dst)
+        .arg("--scratch-dir")
+        .arg(&missing)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).starts_with("error: "), "{}", stderr(&out));
+    assert!(stderr(&out).contains(missing.to_str().unwrap()), "{}", stderr(&out));
+    let home = TempDir::new().unwrap();
+    let out = flux()
+        .arg("verify")
+        .arg(&src)
+        .arg(&dst)
+        .arg("--scratch-dir")
+        .arg(home.path())
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let last = ndjson(&out).pop().unwrap();
+    assert_eq!(last["summary"]["matched"].as_u64(), Some(9_000), "{last}");
+}
