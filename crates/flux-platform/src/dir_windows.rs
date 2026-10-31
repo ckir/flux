@@ -624,7 +624,7 @@ fn read_dir_each_at(
             off += next as usize;
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// An entry's type from what enumeration reports. On a reparse point `EaSize` carries the reparse TAG, not an EA size.
