@@ -1,43 +1,43 @@
 {
  "pairs": {
   "linux/large/cp": {
-   "calibrated": "2026-10-30T12:47:04Z",
-   "cv": 0.0082,
+   "calibrated": "2026-10-31T13:21:35Z",
+   "cv": 0.0826,
    "image": "20261026.180.1",
    "source": "calibration",
-   "stable": true
+   "stable": false
   },
   "linux/large/rsync": {
-   "calibrated": "2026-10-30T12:47:04Z",
-   "cv": 0.0051,
+   "calibrated": "2026-10-31T13:21:35Z",
+   "cv": 0.0566,
    "image": "20261026.180.1",
    "source": "calibration",
-   "stable": true
+   "stable": false
   },
   "linux/mixed/cp": {
-   "calibrated": "2026-10-30T12:47:04Z",
-   "cv": 0.01,
+   "calibrated": "2026-10-31T13:21:35Z",
+   "cv": 0.1382,
    "image": "20261026.180.1",
    "source": "calibration",
-   "stable": true
+   "stable": false
   },
   "linux/mixed/rsync": {
-   "calibrated": "2026-10-30T12:47:04Z",
-   "cv": 0.008,
+   "calibrated": "2026-10-31T13:21:35Z",
+   "cv": 0.1175,
    "image": "20261026.180.1",
    "source": "calibration",
-   "stable": true
+   "stable": false
   },
   "linux/small/cp": {
-   "calibrated": "2026-10-30T12:47:04Z",
-   "cv": 0.0837,
+   "calibrated": "2026-10-31T13:21:35Z",
+   "cv": 0.0679,
    "image": "20261026.180.1",
    "source": "calibration",
    "stable": false
   },
   "linux/small/rsync": {
-   "calibrated": "2026-10-30T12:47:04Z",
-   "cv": 0.1124,
+   "calibrated": "2026-10-31T13:21:35Z",
+   "cv": 0.0942,
    "image": "20261026.180.1",
    "source": "calibration",
    "stable": false
