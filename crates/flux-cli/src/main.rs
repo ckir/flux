@@ -939,6 +939,10 @@ fn verify_one(args: &VerifyArgs, source: &Path, dest: &Path) -> u8 {
         Ok(summary) => summary,
         Err(e) => {
             err(&refusal_line(&e, &dst));
+            // Only a failed run prints the stopped summary (as `stopped()` does); a refusal (exit 2) prints none.
+            if matches!(e, VerifyError::Failed { .. }) {
+                return stopped();
+            }
             return verify_error_code(&e);
         }
     };
@@ -1034,6 +1038,10 @@ fn verify_several_cli(args: &VerifyArgs) -> u8 {
         Ok(total) => total,
         Err(e) => {
             err(&refusal_line(&e, &dst));
+            // Only a failed run prints the stopped summary (as `stopped()` does); a refusal (exit 2) prints none.
+            if matches!(e, VerifyError::Failed { .. }) {
+                return stopped();
+            }
             return verify_error_code(&e);
         }
     };
