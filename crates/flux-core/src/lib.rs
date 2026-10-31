@@ -18,6 +18,7 @@ pub mod oplog;
 pub mod prior;
 pub mod progress;
 pub mod run;
+pub mod scratch;
 pub mod state;
 pub mod tree;
 pub mod verify;
