@@ -409,3 +409,22 @@ Round 3 (lookup criterion) ALIGNED on a combined clause: latency gates where the
 | 100M, nothing pre-read | | 2.15, 263 us / 1,451 us | 2.41, 224 us / 1,592 us |
 
 The miss counts do not change with the page-cache state (identical to the probe with and without the pre-read); the latencies do. A random probe reads one block per level (3) plus the data block; the root and most of the second level stay in the 256-block cache, so 2.15 and 2.41 of the 4 reads miss. The peer's round 3 text put the `names` gate at 2.0 and the `inodes` gate at 2.5; the measured 2.15 refutes the first and leaves the second a 4% margin, so the numbers proposed to the owner are the structural bound of 3 misses per probe (levels plus the data block, minus the always-resident root) for both families, and 0.05 per probe for walk order (7x the measured 0.0067, which is one data block per about 150 consecutive probes). Walk-order latency gates stay at the peer's 5 us median and 20 us p99 (3.5x and 2.6x the measured figures).
+
+## Cut 23 plan 2: the walk's spill
+
+Commit measured: tip of `feat/bounded-listing` after Task 7 (`87bf540`); the test file is `crates/flux-core/tests/walk_cascade_memory.rs`. Peak RSS is not a timing and no timing is claimed here; the wall time of the run (584 s, dominated by creating 3,000,000 files) is incidental and UNVERIFIED as a figure.
+
+### GATE-C (library): the cascade holds memory flat
+
+Method: a counting global allocator (the pattern of `dry_run_memory.rs`), a flat directory of 1,000,000 and one of 2,000,000 zero-byte files made in permuted order under `~/.cache` (ext4), walked with `Thresholds::new(512, 4_096, 8, 16_384, 65_536)` (488 runs at 2,000,000, two cascade levels), the space placed on a second directory. Every yielded name is compared with the sorted sequence as it arrives (the zero-padded names sort numerically), `spilled_directories() == 1` for each walk, and the live bytes are compared with their baseline after the walk and the space are dropped.
+
+| entries | peak live bytes above the baseline | live bytes left after drop |
+|---|---|---|
+| 1,000,000 | 597,860 | 0 |
+| 2,000,000 | 604,748 | 0 |
+
+Criterion: `peak_2m <= peak_1m + 1 MiB` (met: the difference is 6,888 B) and `LIVE` back at its baseline (met: 0 B, tolerance 64 KiB). One run; the allocation counts are deterministic and do not depend on machine load. Not mutation-tested: the test was not run against a deliberately leaking or non-cascading walk (each run takes about ten minutes); the non-vacuity of the pieces it relies on is covered by the unit tests of plan 2 (Tasks 3 and 4).
+
+### GATE-A and GATE-X: NOT RUN
+
+The release-binary gates (GATE-A at 500,000, 1,000,000 and 2,000,000 entries for `--dry-run`, a fresh `copy` and `verify`, flat and `--dirs 1`; GATE-X at 10,000,000 entries) need the owner's go-ahead for fixtures of that size and an idle machine; they are recorded as open in `TODO.md` and the plan's ledger. Windows CI has not run (no push without the owner's go-ahead): the Windows branches are compile-checked only.

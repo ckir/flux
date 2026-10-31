@@ -89,6 +89,16 @@ summary line appends `; N excluded`); subdirectories skipped by `--no-recursive`
 `--recursive` are part of the resume fingerprint: `--resume` with a different selection is refused. A source that is a
 file is not filtered, and a source operand itself (file or folder) is never matched; patterns apply below it.
 
+### Large directories and `--scratch-dir`
+
+A directory of more than 8,192 entries is sorted on disk, not in memory, so the resident memory of `flux copy`,
+`flux copy --dry-run` and `flux verify` does not grow with the size of one directory (the visit order is unchanged).
+The spill is a nameless temporary file: for a real copy it sits in the operation's workspace under `DEST/.flux`; for
+`--dry-run` and `verify` it goes to the system temporary directory, or to the user cache directory when the temporary
+directory is memory-backed (`tmpfs`). `--scratch-dir PATH` (on `copy` and `verify`) chooses the place instead and is
+never refused as memory-backed. Only a run that actually spills touches the location. A scratch write error stops the
+whole run (exit 1); it is never reported as one skipped directory.
+
 ### Verification
 
 `flux copy --verify[=none|source-stream|destination|full]` checks each copied file's content; `--verify` alone means
@@ -124,7 +134,7 @@ On `flux verify`, `-v` also prints the `match` records. On `verify` and `cleanup
 
 ### Verify
 
-`flux verify SOURCE... DEST [--links=copy|skip] [--exclude PATTERN]... [--recursive|--no-recursive] [--cross-filesystems] [--hash=blake3] [--json] [-v|--verbose]` compares one
+`flux verify SOURCE... DEST [--links=copy|skip] [--exclude PATTERN]... [--recursive|--no-recursive] [--cross-filesystems] [--hash=blake3] [--scratch-dir PATH] [--json] [-v|--verbose]` compares one
 source (a file or a folder, mapped onto DEST as `flux copy` maps it) with DEST by content and writes nothing. With
 several sources each is compared with `DEST/<name>`, as `flux copy` places it; what else DEST holds is not examined.
 Both sides are walked together in path order and every file is read in full on both sides and hashed. Flux's own control
