@@ -2052,7 +2052,7 @@ mod tests {
             assert!(walk.next().is_none());
             assert!(walk.next().is_none());
         }
-        assert_eq!(space.len(), 0);
+        assert_eq!((space.len(), space.physical_len()), (0, 0));
     }
 
     fn big_root(n: usize) -> FaultFs {
@@ -2089,22 +2089,133 @@ mod tests {
 
     #[test]
     fn the_tick_runs_at_least_once_per_tick_entries() {
+        // 100 entries, tick every 8: the read phase alone gives 12 ticks, so the bound is on the ticks AFTER it.
         let fs = big_root(100);
         let t = Thresholds::new(4, 32, 2, 16, 8).unwrap();
         let space = spilled(&fs, t);
         let mut walk = walk_unstarted(&fs, Path::new("/r"), opts(), Some(&space)).unwrap();
-        let mut calls = 0;
+        let calls = std::cell::Cell::new(0u32);
         let mut tick = || {
-            calls += 1;
+            calls.set(calls.get() + 1);
             Ok(())
         };
+        walk.start(&mut tick).unwrap();
+        let after_start = calls.get();
+        // 12 read ticks, then the cascade (100 entries merged: 12 ticks plus one at the end of the pass).
+        assert!(after_start >= 12 + 12, "the cascade must tick as it merges; got {after_start}");
         let mut n = 0;
         while let Some(item) = walk.next_with(&mut tick) {
             item.unwrap();
             n += 1;
         }
         assert_eq!(n, 100);
-        assert!(calls >= 12, "got {calls}");
+        let pulled = calls.get() - after_start;
+        assert!(pulled >= 12, "the streaming merge must tick as it yields; got {pulled}");
+    }
+
+    /// 40 entries in one root, runs of 8, fan-in 2 (so a two-pass cascade), tick every 8.
+    fn merge_fixture() -> (FaultFs, Thresholds) {
+        (big_root(40), Thresholds::new(4, 8, 2, 16, 8).unwrap())
+    }
+
+    /// The tick calls a passing run makes: `(by the end of start, in total)`.
+    fn passing_tick_cadence() -> (u32, u32) {
+        let (fs, t) = merge_fixture();
+        let space = spilled(&fs, t);
+        let mut walk = walk_unstarted(&fs, Path::new("/r"), opts(), Some(&space)).unwrap();
+        let calls = std::cell::Cell::new(0u32);
+        let mut tick = || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
+        walk.start(&mut tick).unwrap();
+        let after_start = calls.get();
+        while let Some(item) = walk.next_with(&mut tick) {
+            item.unwrap();
+        }
+        (after_start, calls.get())
+    }
+
+    /// Runs the merge fixture with a tick that fails on call number `fail_at`; returns the Ok items before the
+    /// error and the error, after checking nothing follows it and the run file is empty once the walk is dropped.
+    fn walk_with_tick_failing_at(fail_at: u32) -> (usize, WalkError) {
+        let (fs, t) = merge_fixture();
+        let space = spilled(&fs, t);
+        let mut walk = walk_unstarted(&fs, Path::new("/r"), opts(), Some(&space)).unwrap();
+        let mut calls = 0;
+        let mut tick = || {
+            calls += 1;
+            if calls == fail_at {
+                Err(FsError::new(Code::TargetLockBusy, std::io::Error::other("beat lapsed")))
+            } else {
+                Ok(())
+            }
+        };
+        let mut oks = 0;
+        let err = loop {
+            match walk.next_with(&mut tick).expect("the walk must yield the fatal error") {
+                Ok(_) => oks += 1,
+                Err(e) => break e,
+            }
+        };
+        assert!(walk.next_with(&mut tick).is_none());
+        assert!(walk.next_with(&mut tick).is_none());
+        drop(walk);
+        assert_eq!((space.len(), space.physical_len()), (0, 0));
+        (oks, err)
+    }
+
+    #[test]
+    fn a_tick_that_fails_during_the_cascade_is_fatal() {
+        // 40 entries / 8 = 5 read ticks, then the cascade: pass 1 merges 32 entries (4 ticks + 1), pass 2 another
+        // 32 (4 + 1); then 40 / 8 = 5 pull ticks.
+        assert_eq!(passing_tick_cadence(), (15, 20));
+        // Call 6 is the first tick of the cascade.
+        let (oks, e) = walk_with_tick_failing_at(6);
+        assert_eq!(oks, 0, "the root was never listed");
+        assert!(e.fatal);
+        assert_eq!(e.cause.code, Code::TargetLockBusy);
+    }
+
+    #[test]
+    fn a_tick_that_fails_during_the_streaming_merge_is_fatal() {
+        let (after_start, total) = passing_tick_cadence();
+        assert!(total > after_start);
+        // The first pull-side tick comes with the 8th entry, before it is yielded.
+        let (oks, e) = walk_with_tick_failing_at(after_start + 1);
+        assert_eq!(oks, 7);
+        assert!(e.fatal);
+        assert_eq!(e.cause.code, Code::TargetLockBusy);
+    }
+
+    #[test]
+    fn a_read_failure_in_the_merge_is_one_fatal_error_for_that_directory() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/r")).unwrap();
+        fs.create_dir(Path::new("/r/big")).unwrap();
+        files(&fs, "/r/big", "f", 40);
+        // Five runs, fan-in 8: no cascade, so the first five reads are the merge's initial heads.
+        let space = spilled(&fs, Thresholds::new(4, 8, 8, 16, 1000).unwrap());
+        space.fail_reads_after(5);
+        {
+            let mut walk = walk_with(&fs, Path::new("/r"), opts(), Some(&space)).unwrap();
+            let mut errors = Vec::new();
+            let mut after_error = 0;
+            for item in walk.by_ref() {
+                match item {
+                    Err(e) => errors.push(e),
+                    Ok(_) if !errors.is_empty() => after_error += 1,
+                    Ok(_) => {}
+                }
+            }
+            assert_eq!(errors.len(), 1);
+            assert_eq!(after_error, 0);
+            assert!(errors[0].fatal);
+            assert_eq!(rel(&errors[0].path), "big");
+            assert!(walk.next().is_none());
+            assert!(walk.next().is_none());
+        }
+        assert_eq!((space.len(), space.physical_len()), (0, 0));
     }
 
     #[test]
