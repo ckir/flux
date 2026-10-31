@@ -308,3 +308,20 @@ Slope = (median at 500,000 - median at 100,000) * 1024 / 400,000, bytes per entr
 Acceptance (written in the plan before the data): the changed full-copy slope at most 120 B/entry on both fixtures, every run copied all files, the `--dry-run` slope within 5 B/entry of 76.1. **PASS** on all three. The full-copy slope falls by about 481 B/entry (83%), as the throwaway ablation predicted (95.4 B/entry; recorded in the plan's "Measured basis", `docs/superpowers/plans/2026-10-30-fresh-dir-names.md`, not in this report); `--dry-run` is unchanged, as it should be, because a dry run never publishes.
 
 What this cut does NOT bound: a directory that already existed when the run started (an empty destination made with `mkdir`, or a `--resume` over an interrupted run) is not fresh and keeps its tracked index, about 577 B/entry (inferred from the baseline slope, not measured separately; it applies to a directory that has a claim key, because a directory without one never touches its index). The source walk's listing (about 76 B/entry, in `walk.rs`) is cut B. Background load was uncontrolled; peak RSS varied by under 1% across the three runs of each cell except two: the changed one-subdirectory 100,000-entry copy (17136 against 16504 and 16596) and the changed flat 100,000-entry `--dry-run` (13748 to 13932, 1.3%).
+
+## Cut 23 baseline: peak memory of the unbounded directory structures
+
+Measured before the bounded-listing cut, so its gates have a number to beat. Binary: release build of `main` at `c286819` (`~/.cache/flux-b-target/release/flux`). Fixtures: flat zero-byte trees from `benches/phase3/make_tree.py` (`flux-rss-flat-N`). Method: `/usr/bin/time -v`, "Maximum resident set size", two runs each, KiB. Peak RSS is not a timing.
+
+| Command | 500,000 | 1,000,000 | 2,000,000 | Slope 1M to 2M |
+|---|---|---|---|---|
+| copy onto a pre-existing destination (default `--overwrite`) | 322224, 322224 | 622268, 621968 | 1221640, 1221720 | 614 B/entry |
+| the same with `--resume` | 322260, 322052 | 622204, 622112 | 1221860, 1221780 | 614 B/entry |
+| `verify` (both sides the same fixture) | not run | 145340, 145392 | 285972, 285656 | 144 B/entry |
+| one file copied into a directory holding N entries | not run | 67340, 67272 | 129920, 129772 | 64 B/entry |
+
+The inferred 577 B/entry for a pre-existing destination (see Cut A) is now measured: 614 B/entry, and the run-to-run spread is under 0.1%. The `--resume` runs followed a completed copy, so they exercise the same index build as the overwrite runs and not a partly-written tree; they agree to within 0.1%.
+
+The store micro-benchmark (redb ingest rate and lookup time at 10M and 100M names, spec 6.3) is **not measured**: it is a timing and waits for the owner's go-ahead.
+
+Not controlled: background load (a browser and the desktop session were running; the field check showed no other `flux` or build process).
