@@ -17,6 +17,7 @@ use crate::lock::{
     Refusal, obtain,
 };
 use crate::prior::{PriorOp, resumable_refusal};
+use crate::scratch::ScratchSpace;
 use crate::state::{
     ARTIFACT_STATE, Config, FileFields, OpState, OperationState, Options, Takeover, identity_text,
     wall_time_ns,
@@ -126,6 +127,7 @@ pub(crate) fn open_operation<'a, D: DirHandle, P: Place<D>>(
     place: &mut P,
     cfg: &RunConfig,
     opts: &CopyOptions,
+    scratch: Option<&ScratchSpace<'_>>,
     warnings: &mut Vec<RunWarning>,
 ) -> Result<Locked<'a, D>, RunError> {
     let own_id = cfg.operation_id.as_str();
@@ -283,7 +285,7 @@ pub(crate) fn open_operation<'a, D: DirHandle, P: Place<D>>(
         };
         // Q-H (a): `--restart` supersedes, with this operation's state and record already written. When §99 fails
         // there, `locked` drops without unlinking (`S21_1_s3_refuse_close`).
-        if let Err(fault) = supersede(place, &locked, &priors, warnings) {
+        if let Err(fault) = supersede(place, &locked, &priors, scratch, warnings) {
             return Err(match fault {
                 Fault::Lost => lost(),
                 Fault::Io(path, error) => {

@@ -13,6 +13,7 @@ use flux_fs::{
 };
 use rustix::fs::{Access, AtFlags, Mode, OFlags, accessat, openat, statat};
 use std::ffi::OsStr;
+use std::ops::ControlFlow;
 use std::os::fd::OwnedFd;
 
 /// `Debug` is required, not decorative: the tests call `.unwrap_err()` on a
@@ -406,6 +407,62 @@ impl DirHandle for StdDir {
         crate::RedbClaimStore::create_file(std::fs::File::from(fd), durability)
     }
 
+    fn create_scratch(&self) -> Result<std::fs::File> {
+        // Linux: an unnamed inode in this directory. The filesystem may not support it (EOPNOTSUPP), the kernel may
+        // answer EISDIR for an old kernel that reads TMPFILE as a plain directory open, or EINVAL for one that does
+        // not know the flag; each falls through to the named create.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use rustix::io::Errno;
+            match openat(
+                &self.0,
+                ".",
+                OFlags::RDWR | OFlags::TMPFILE | OFlags::CLOEXEC,
+                Mode::from_raw_mode(0o600),
+            ) {
+                Ok(fd) => return Ok(std::fs::File::from(fd)),
+                Err(Errno::OPNOTSUPP | Errno::ISDIR | Errno::INVAL) => {}
+                Err(e) => return Err(FsError::from_io(std::io::Error::from(e))),
+            }
+        }
+        // The named create, then unlink at once. NOFOLLOW + EXCL: a planted link at the name is never followed.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64);
+        let pid = u64::from(std::process::id());
+        for attempt in 0..16u64 {
+            let name = format!(".flux-scratch-{:016x}", nanos ^ pid ^ attempt);
+            match openat(
+                &self.0,
+                name.as_str(),
+                OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::from_raw_mode(0o600),
+            ) {
+                Ok(fd) => {
+                    if let Err(e) = rustix::fs::unlinkat(&self.0, name.as_str(), AtFlags::empty()) {
+                        return Err(FsError::from_io(std::io::Error::from(e)));
+                    }
+                    return Ok(std::fs::File::from(fd));
+                }
+                Err(rustix::io::Errno::EXIST) => {}
+                Err(e) => return Err(FsError::from_io(std::io::Error::from(e))),
+            }
+        }
+        Err(FsError::from_io(std::io::Error::from(std::io::ErrorKind::AlreadyExists)))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn memory_backed(&self) -> Result<Option<bool>> {
+        // tmpfs and ramfs (statfs(2) f_type magic numbers).
+        const MEMORY: [u32; 2] = [0x0102_1994, 0x8584_58f6];
+        let st =
+            rustix::fs::fstatfs(&self.0).map_err(|e| FsError::from_io(std::io::Error::from(e)))?;
+        // f_type's width and signedness differ by architecture; every magic fits in 32 bits.
+        #[allow(clippy::unnecessary_cast)]
+        let magic = st.f_type as u64 as u32;
+        Ok(Some(MEMORY.contains(&magic)))
+    }
+
     fn create_hardlink_index(&self, name: &OsStr) -> Result<Self::Index> {
         check_component(name)?;
         let fd = openat(
@@ -513,10 +570,21 @@ impl DirHandle for StdDir {
     }
 
     fn read_dir(&self) -> Result<Vec<flux_fs::DirEntry>> {
+        let mut out = Vec::new();
+        self.read_dir_each(&mut |e| {
+            out.push(e);
+            Ok(ControlFlow::Continue(()))
+        })?;
+        Ok(out)
+    }
+
+    fn read_dir_each(
+        &self,
+        visit: &mut dyn FnMut(flux_fs::DirEntry) -> Result<ControlFlow<()>>,
+    ) -> Result<()> {
         use rustix::fs::{Dir, FileType};
         use std::os::unix::ffi::OsStrExt;
         let io = |e: rustix::io::Errno| FsError::from_io(std::io::Error::from(e));
-        let mut out = Vec::new();
         // `read_from` reads through a descriptor of its own (an `openat` of "."), so this handle is untouched and every
         // call lists from the start.
         for entry in Dir::read_from(&self.0).map_err(io)? {
@@ -542,9 +610,12 @@ impl DirHandle for StdDir {
                 FileType::Symlink => flux_fs::FileType::Symlink,
                 _ => flux_fs::FileType::Other,
             };
-            out.push(flux_fs::DirEntry { name, file_type });
+            let ino = Some(entry.ino());
+            if visit(flux_fs::DirEntry { name, file_type, ino })?.is_break() {
+                return Ok(());
+            }
         }
-        Ok(out)
+        Ok(())
     }
 
     fn read_file(&self, name: &OsStr, limit: usize) -> Result<Vec<u8>> {

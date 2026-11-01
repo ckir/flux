@@ -9,6 +9,8 @@
 //! a link (§149.7).
 
 use flux_fs::{Code, DestinationRoot, DirHandle, FileType};
+#[cfg(unix)]
+use flux_fs::{FileIdentity, ObjectId};
 use flux_platform::StdFileSystem;
 use std::ffi::{OsStr, OsString};
 use std::io::ErrorKind;
@@ -239,4 +241,150 @@ fn a_socket_file_lists_as_other_and_is_never_read_as_a_state_file() {
     assert_eq!(listing(&d), vec![(OsString::from("sock"), FileType::Other)]);
     let e = d.read_file(OsStr::new("sock"), 8).expect_err("a socket is not a state file");
     assert_eq!(e.code, Code::DestinationError, "{e:?}");
+}
+
+#[test]
+fn read_dir_each_yields_exactly_the_entries_that_exist() {
+    let (tmp, d) = dir();
+    std::fs::write(tmp.path().join("a"), b"x").unwrap();
+    std::fs::create_dir(tmp.path().join("sub")).unwrap();
+    dir_link(&tmp.path().join("sub"), &tmp.path().join("link"));
+    let mut got = Vec::new();
+    d.read_dir_each(&mut |e| {
+        got.push((e.name, e.file_type));
+        Ok(std::ops::ControlFlow::Continue(()))
+    })
+    .expect("stream");
+    got.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(got.len(), 3);
+    assert_eq!(
+        got,
+        vec![
+            (OsString::from("a"), FileType::File),
+            (OsString::from("link"), FileType::Symlink),
+            (OsString::from("sub"), FileType::Dir),
+        ]
+    );
+}
+
+#[test]
+fn read_dir_each_stops_on_break_and_returns_a_visitor_error() {
+    use std::ops::ControlFlow::{Break, Continue};
+    let (tmp, d) = dir();
+    for n in ["a", "b", "c"] {
+        std::fs::write(tmp.path().join(n), b"x").unwrap();
+    }
+    let mut calls = 0;
+    let r = d.read_dir_each(&mut |_| {
+        calls += 1;
+        Ok(Break(()))
+    });
+    assert!(r.is_ok());
+    assert_eq!(calls, 1);
+    let mut calls = 0;
+    let err = d
+        .read_dir_each(&mut |_| {
+            calls += 1;
+            if calls == 2 {
+                return Err(flux_fs::FsError::new(Code::IoError, std::io::Error::other("x")));
+            }
+            Ok(Continue(()))
+        })
+        .unwrap_err();
+    assert_eq!(err.code, Code::IoError);
+    assert_eq!(calls, 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn read_dir_ino_is_the_object_index_of_the_entry() {
+    let (tmp, d) = dir();
+    std::fs::write(tmp.path().join("a"), b"x").unwrap();
+    std::fs::write(tmp.path().join("b"), b"x").unwrap();
+    std::fs::create_dir(tmp.path().join("sub")).unwrap();
+    let entries = d.read_dir().expect("list");
+    assert!(entries.len() >= 3, "the loop must not be vacuous");
+    for entry in entries {
+        let Ok(m) = d.metadata(&entry.name) else { panic!("metadata of {:?}", entry.name) };
+        let FileIdentity::Strong(ObjectId { index, .. }) = m.identity else {
+            panic!("a strong identity for {:?}", entry.name)
+        };
+        assert_eq!(entry.ino, Some(index as u64), "{:?}", entry.name);
+    }
+}
+
+/// Read `len` bytes at `offset` without moving a cursor, on either platform.
+fn read_at(f: &std::fs::File, offset: u64, len: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; len];
+    #[cfg(unix)]
+    std::os::unix::fs::FileExt::read_exact_at(f, &mut buf, offset).expect("read_at");
+    #[cfg(windows)]
+    {
+        let n = std::os::windows::fs::FileExt::seek_read(f, &mut buf, offset).expect("seek_read");
+        assert_eq!(n, len);
+    }
+    buf
+}
+
+/// Write `bytes` at `offset` without moving a cursor, on either platform.
+fn write_at(f: &std::fs::File, offset: u64, bytes: &[u8]) {
+    #[cfg(unix)]
+    std::os::unix::fs::FileExt::write_all_at(f, bytes, offset).expect("write_at");
+    #[cfg(windows)]
+    {
+        let n = std::os::windows::fs::FileExt::seek_write(f, bytes, offset).expect("seek_write");
+        assert_eq!(n, bytes.len());
+    }
+}
+
+#[test]
+fn create_scratch_leaves_no_name_in_the_directory() {
+    let (_tmp, d) = dir();
+    std::fs::write(_tmp.path().join("keep"), b"x").unwrap();
+    let before = listing(&d);
+    let f = d.create_scratch().expect("create a scratch file");
+    write_at(&f, 0, b"abc");
+    assert_eq!(read_at(&f, 0, 3), b"abc");
+    // Unix: the file never has a name once the call returns, so the listing is unchanged while it is open.
+    #[cfg(unix)]
+    assert_eq!(listing(&d), before, "the scratch file has no name in the directory");
+    // Windows: `FILE_DELETE_ON_CLOSE` keeps the name visible until the last handle closes.
+    #[cfg(windows)]
+    {
+        drop(f);
+        assert_eq!(listing(&d), before, "the name is gone after the last handle closes");
+    }
+}
+
+#[test]
+fn two_scratch_files_are_independent() {
+    let (_tmp, d) = dir();
+    let a = d.create_scratch().expect("first");
+    let b = d.create_scratch().expect("second");
+    write_at(&a, 0, b"first!");
+    write_at(&b, 0, b"second");
+    assert_eq!(read_at(&a, 0, 6), b"first!");
+    assert_eq!(read_at(&b, 0, 6), b"second");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn memory_backed_says_false_for_the_test_tempdir_and_true_for_dev_shm() {
+    let (tmp, d) = dir();
+    // The runner's temp dir may itself be tmpfs: ask `stat -f` (an oracle independent of the code under test).
+    let fs_type = std::process::Command::new("stat")
+        .args(["-f", "-c", "%T"])
+        .arg(tmp.path())
+        .output()
+        .expect("run stat -f");
+    let fs_type = String::from_utf8_lossy(&fs_type.stdout).trim().to_string();
+    let shm = Path::new("/dev/shm");
+    let expected = Some(fs_type == "tmpfs" || fs_type == "ramfs");
+    assert_eq!(d.memory_backed().expect("fstatfs"), expected, "the test tempdir");
+    if shm.exists() {
+        let s = StdFileSystem.destination_root(shm).expect("open /dev/shm");
+        assert_eq!(s.memory_backed().expect("fstatfs"), Some(true), "/dev/shm is tmpfs");
+    } else {
+        eprintln!("skipping the /dev/shm half: it does not exist here");
+    }
 }

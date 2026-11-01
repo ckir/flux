@@ -105,6 +105,9 @@ struct VerifyArgs {
     /// Take only the top level of each source folder: only the top level of each side is compared; no subdirectory is entered.
     #[arg(long)]
     no_recursive: bool,
+    /// Where a directory too large to sort in memory is spilled (default: the operation's workspace for a copy, else the system temporary directory, or the user cache directory when that is memory-backed). Never refused as memory-backed when given.
+    #[arg(long, value_name = "PATH")]
+    scratch_dir: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -223,6 +226,9 @@ struct CopyArgs {
     /// Take only the top level of each source folder: its files and links, no subdirectory is created or entered.
     #[arg(long)]
     no_recursive: bool,
+    /// Where a directory too large to sort in memory is spilled (default: the operation's workspace for a copy, else the system temporary directory, or the user cache directory when that is memory-backed). Never refused as memory-backed when given.
+    #[arg(long, value_name = "PATH")]
+    scratch_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -401,6 +407,7 @@ fn run_config(args: &CopyArgs) -> RunConfig {
         dry_run: args.dry_run,
         dry_temp_root: Some(std::env::temp_dir()),
         progress: None,
+        scratch_dir: args.scratch_dir.clone(),
     }
 }
 
@@ -840,6 +847,7 @@ fn verify_options(args: &VerifyArgs) -> flux_core::verify::VerifyOptions {
         },
         selection: selection_of(&args.exclude, args.no_recursive)
             .expect("validated at the top of copy/verify"),
+        scratch_dir: args.scratch_dir.clone(),
     }
 }
 
@@ -931,7 +939,11 @@ fn verify_one(args: &VerifyArgs, source: &Path, dest: &Path) -> u8 {
         Ok(summary) => summary,
         Err(e) => {
             err(&refusal_line(&e, &dst));
-            return exit_code::USAGE;
+            // Only a failed run prints the stopped summary (as `stopped()` does); a refusal (exit 2) prints none.
+            if matches!(e, VerifyError::Failed { .. }) {
+                return stopped();
+            }
+            return verify_error_code(&e);
         }
     };
     let code = exit_code::for_verify(&summary);
@@ -1026,7 +1038,11 @@ fn verify_several_cli(args: &VerifyArgs) -> u8 {
         Ok(total) => total,
         Err(e) => {
             err(&refusal_line(&e, &dst));
-            return exit_code::USAGE;
+            // Only a failed run prints the stopped summary (as `stopped()` does); a refusal (exit 2) prints none.
+            if matches!(e, VerifyError::Failed { .. }) {
+                return stopped();
+            }
+            return verify_error_code(&e);
         }
     };
     let code = exit_code::for_verify(&total);
@@ -1047,7 +1063,18 @@ fn verify_several_cli(args: &VerifyArgs) -> u8 {
     code
 }
 
-/// The one error line for a verify that did not run (exit 2); `dst` is the canonical destination.
+/// The exit code of a verify that ended in `e`: a failed walk is an operation failure (1), a refusal is exit 2.
+fn verify_error_code(e: &VerifyError) -> u8 {
+    match e {
+        VerifyError::Failed { .. } => exit_code::FAILED,
+        VerifyError::RefusedRoots { .. }
+        | VerifyError::RefusedRoot { .. }
+        | VerifyError::RefusedNames { .. }
+        | VerifyError::RefusedAlias { .. } => exit_code::USAGE,
+    }
+}
+
+/// The one error line for a verify that did not run (exit 2) or failed (exit 1); `dst` is the canonical destination.
 fn refusal_line(e: &VerifyError, dst: &Path) -> String {
     match e {
         VerifyError::RefusedRoots { reason } | VerifyError::RefusedNames { reason } => {
@@ -1057,6 +1084,7 @@ fn refusal_line(e: &VerifyError, dst: &Path) -> String {
             verify_report::refused_root_line(name, dst, reason)
         }
         VerifyError::RefusedAlias { a, b } => verify_report::refused_alias_line(a, b),
+        VerifyError::Failed { error } => format!("error: verify stopped: {}", error.source),
     }
 }
 

@@ -908,3 +908,75 @@ fn verify_with_sixty_five_patterns_exits_2_not_101() {
     assert!(out.stdout.is_empty(), "{}", stdout(&out));
     assert!(stderr(&out).contains("error:"), "{}", stderr(&out));
 }
+
+#[test]
+fn verify_uses_scratch_dir_when_it_spills() {
+    let d = TempDir::new().unwrap();
+    for side in ["src", "dst"] {
+        let p = d.path().join(side);
+        std::fs::create_dir_all(&p).unwrap();
+        for i in 0..9_000 {
+            std::fs::File::create(p.join(format!("f{i:05}"))).unwrap();
+        }
+    }
+    let (src, dst) = (d.path().join("src"), d.path().join("dst"));
+    let missing = d.path().join("missing");
+    let out = flux()
+        .arg("verify")
+        .arg(&src)
+        .arg(&dst)
+        .arg("--scratch-dir")
+        .arg(&missing)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).starts_with("error: "), "{}", stderr(&out));
+    assert!(stderr(&out).starts_with("error: verify stopped: "), "{}", stderr(&out));
+    assert!(stderr(&out).contains(missing.to_str().unwrap()), "{}", stderr(&out));
+    let stopped = ndjson(&out);
+    assert_eq!(stopped.len(), 1, "only the summary object: {}", stdout(&out));
+    assert_eq!(stopped[0]["summary"]["exit"].as_u64(), Some(1), "{}", stopped[0]);
+    let stopped_keys: Vec<String> =
+        stopped[0]["summary"].as_object().unwrap().keys().cloned().collect();
+    let home = TempDir::new().unwrap();
+    let out = flux()
+        .arg("verify")
+        .arg(&src)
+        .arg(&dst)
+        .arg("--scratch-dir")
+        .arg(home.path())
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let last = ndjson(&out).pop().unwrap();
+    assert_eq!(last["summary"]["matched"].as_u64(), Some(9_000), "{last}");
+    let ok_keys: Vec<String> = last["summary"].as_object().unwrap().keys().cloned().collect();
+    assert_eq!(stopped_keys, ok_keys, "a stopped run prints the same summary object");
+
+    // Several sources: the same failure prints the same shape.
+    let (a, b) = (d.path().join("a"), d.path().join("b"));
+    for side in [&a, &b] {
+        let p = side.join("x");
+        std::fs::create_dir_all(&p).unwrap();
+        for i in 0..9_000 {
+            std::fs::File::create(p.join(format!("f{i:05}"))).unwrap();
+        }
+    }
+    let out = flux()
+        .arg("verify")
+        .arg(&a)
+        .arg(&b)
+        .arg(d.path().join("dst2"))
+        .arg("--scratch-dir")
+        .arg(&missing)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains(missing.to_str().unwrap()), "{}", stderr(&out));
+    let several = ndjson(&out);
+    assert_eq!(several.len(), 1, "{}", stdout(&out));
+    assert!(several[0]["summary"].is_object(), "{}", several[0]);
+}

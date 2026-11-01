@@ -10,7 +10,8 @@
 //! as it is decided; the engine holds no list of records.
 
 use crate::run::{RunError, SourceKind, SourceSpec, plan_roots};
-use crate::walk::{DEFAULT_MAX_DEPTH, MountPolicy, Walk, WalkEvent, WalkOptions, walk_with};
+use crate::scratch::{ScratchSpace, Thresholds, temporary_home};
+use crate::walk::{DEFAULT_MAX_DEPTH, MountPolicy, Walk, WalkEvent, WalkOptions, walk_unstarted};
 use flux_fs::{
     Code, DestinationRoot, DirHandle, FileIdentity, FileSystem, FileType, FluxPathKey, FsError,
     HashAlgorithm, Links, ObjectId, Safety,
@@ -114,6 +115,9 @@ pub struct VerifyOptions {
     pub hash: HashAlgorithm,
     /// Applied to BOTH walks (design 5.6).
     pub selection: flux_fs::Selection,
+    /// The operator's `--scratch-dir`: where a directory too large to sort in memory spills. `None` uses the
+    /// temporary directory (or the user cache when that is memory-backed).
+    pub scratch_dir: Option<PathBuf>,
 }
 
 /// Why a verify did not run.
@@ -128,6 +132,9 @@ pub enum VerifyError {
     RefusedNames { reason: String },
     /// Exit 2 (several sources): two roots are one directory on this filesystem.
     RefusedAlias { a: OsString, b: OsString },
+    /// Exit 1: an operation-level failure after records may have been emitted (a failed scratch file while listing a
+    /// large directory). The listing of one side is incomplete, so no verdict is given.
+    Failed { error: FsError },
 }
 
 /// One entry of one side's walk, in the form the merge compares.
@@ -154,8 +161,11 @@ pub enum ControlFilter {
 }
 
 /// One root's walk, reduced to `Item`s, with one held item for the merge to look at.
-struct Side<'a, F: FileSystem> {
-    walk: Option<Walk<'a, F>>,
+struct Side<'a, 'h, F: FileSystem> {
+    walk: Option<Walk<'a, 'h, F>>,
+    /// A FATAL walk error (a scratch failure): the side ended early, so the merge must stop, not report the other
+    /// side's remaining items as missing or extra.
+    fatal: Option<FsError>,
     /// One event of lookahead (a `Dir` is followed by its `MountSkipped`).
     peeked: Option<Option<RawEvent>>,
     held: Option<Item>,
@@ -167,7 +177,7 @@ struct Side<'a, F: FileSystem> {
     filter: ControlFilter,
 }
 
-impl<'a, F: FileSystem> Side<'a, F> {
+impl<'a, 'h, F: FileSystem> Side<'a, 'h, F> {
     fn new(
         fs: &'a F,
         root: &Path,
@@ -175,14 +185,29 @@ impl<'a, F: FileSystem> Side<'a, F> {
         skip_links: bool,
         filter: ControlFilter,
         selection: &'a flux_fs::Selection,
+        scratch: Option<&'a ScratchSpace<'h>>,
     ) -> Result<Self, FsError> {
-        let mut walk = walk_with(fs, root, WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts })?;
+        let mut walk = walk_unstarted(
+            fs,
+            root,
+            WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts },
+            scratch,
+        )?;
         walk.set_selection(selection);
+        // The root is listed here, eagerly: an unlistable root is the caller's root-unreadable report. A FATAL
+        // error (the listing spilled and the scratch failed) is held for the merge to stop on.
+        let fatal = match walk.start(&mut || Ok(())) {
+            Ok(()) => None,
+            Err(e) if e.fatal => Some(e.cause),
+            Err(e) => return Err(e.cause),
+        };
+        let fatal_is_set = fatal.is_some();
         Ok(Side {
             walk: Some(walk),
+            fatal,
             peeked: None,
             held: None,
-            done: false,
+            done: fatal_is_set,
             pruned: None,
             skip_links,
             filter,
@@ -198,6 +223,7 @@ impl<'a, F: FileSystem> Side<'a, F> {
     fn empty() -> Self {
         Side {
             walk: None,
+            fatal: None,
             peeked: None,
             held: None,
             done: true,
@@ -280,7 +306,13 @@ impl<'a, F: FileSystem> Side<'a, F> {
                 return None;
             };
             let item = match ev {
-                // Every `WalkError` is a directory today: the walker raises one only from `enter` (listing a
+                // A fatal error ends this side: the merge sees `fatal` and stops before it emits anything more.
+                Err(we) if we.fatal => {
+                    self.fatal = Some(we.cause);
+                    self.done = true;
+                    return None;
+                }
+                // Every other `WalkError` is a directory today: the walker raises one only from `enter` (listing a
                 // directory), `walk.rs`.
                 Err(we) => Self::item(we.path, Kind::Dir, false, Some(we.cause)),
                 Ok(WalkEvent::Dir { path, .. }) => {
@@ -418,6 +450,22 @@ pub fn verify_tree_notifying<F: DestinationRoot>(
     verify_tree_filtered(fs, src, dst, opts, ControlFilter::Root, on_absent, sink)
 }
 
+/// How a verify's two scratch spaces are set up (one per side: the two walks are iterated in alternation, and a space
+/// is for one active walk).
+#[derive(Clone, Copy)]
+struct Spill<'t> {
+    thresholds: Thresholds,
+    /// Called with the two fresh spaces (source, destination) before either walk starts. Production does nothing;
+    /// tests inject failures through it.
+    tune: &'t dyn Fn(&ScratchSpace<'_>, &ScratchSpace<'_>),
+}
+
+impl Spill<'static> {
+    fn standard() -> Self {
+        Spill { thresholds: Thresholds::default(), tune: &|_, _| {} }
+    }
+}
+
 /// `verify_tree_notifying` with the destination side's control-state `filter` chosen by the caller.
 pub(crate) fn verify_tree_filtered<F: DestinationRoot>(
     fs: &F,
@@ -428,13 +476,28 @@ pub(crate) fn verify_tree_filtered<F: DestinationRoot>(
     on_absent: &mut dyn FnMut(),
     sink: &mut dyn FnMut(Record),
 ) -> Result<Summary, VerifyError> {
+    verify_tree_spilling(fs, src, dst, opts, filter, Spill::standard(), on_absent, sink)
+}
+
+/// `verify_tree_filtered` with the spill thresholds (and a hook on the two scratch spaces) chosen by the caller.
+#[allow(clippy::too_many_arguments)]
+fn verify_tree_spilling<F: DestinationRoot>(
+    fs: &F,
+    src: &Path,
+    dst: &Path,
+    opts: &VerifyOptions,
+    filter: ControlFilter,
+    spill: Spill<'_>,
+    on_absent: &mut dyn FnMut(),
+    sink: &mut dyn FnMut(Record),
+) -> Result<Summary, VerifyError> {
     let mut out = Emitter { summary: Summary::default(), sink: &mut *sink };
     let verdict =
         check_pair(fs, src, dst).map_err(|reason| VerifyError::RefusedRoots { reason })?;
     if matches!(verdict, RootVerdict::Absent) {
         on_absent();
     }
-    walk_checked(fs, src, dst, opts, filter, verdict, &mut out);
+    walk_checked(fs, src, dst, opts, filter, verdict, spill, &mut out)?;
     Ok(out.summary)
 }
 
@@ -540,8 +603,9 @@ pub fn verify_several<F: DestinationRoot>(
                     opts,
                     ControlFilter::NestedRoot,
                     verdict,
+                    Spill::standard(),
                     &mut out,
-                );
+                )?;
                 out.summary
             }
             // Invariant: no record precedes an exit 2, and `verify_file` has no refusal path today.
@@ -593,7 +657,9 @@ fn check_pair<F: DestinationRoot>(fs: &F, src: &Path, dst: &Path) -> Result<Root
     }
 }
 
-/// The walk of one checked pair (design 6.3), its records emitted through `out`.
+/// The walk of one checked pair (design 6.3), its records emitted through `out`. A fatal walk error on either side
+/// (checked after every peek, before anything is emitted) ends it as `VerifyError::Failed`.
+#[allow(clippy::too_many_arguments)]
 fn walk_checked<F: DestinationRoot>(
     fs: &F,
     src: &Path,
@@ -601,12 +667,13 @@ fn walk_checked<F: DestinationRoot>(
     opts: &VerifyOptions,
     filter: ControlFilter,
     verdict: RootVerdict,
+    spill: Spill<'_>,
     out: &mut Emitter<'_>,
-) {
+) -> Result<(), VerifyError> {
     let dst_absent = match verdict {
         RootVerdict::Unreadable { side, error } => {
             root_unreadable(out, &format!("{side}{}", error.source), error.code);
-            return;
+            return Ok(());
         }
         RootVerdict::Absent => true,
         RootVerdict::Checked { .. } => false,
@@ -614,6 +681,16 @@ fn walk_checked<F: DestinationRoot>(
             unreachable!("only verify_several probes the type, and it reports it itself")
         }
     };
+    // One scratch space per side, declared before the sides so they outlive the walks. Each finds its home only at
+    // its first spill, so a verify that never spills never looks at the location.
+    let scratch_a = ScratchSpace::unplaced(spill.thresholds, opts.scratch_dir.clone());
+    let scratch_b = ScratchSpace::unplaced(spill.thresholds, opts.scratch_dir.clone());
+    for scratch in [&scratch_a, &scratch_b] {
+        let explicit = opts.scratch_dir.clone();
+        scratch
+            .place_deferred(move || temporary_home(fs, explicit.as_deref(), &std::env::temp_dir()));
+    }
+    (spill.tune)(&scratch_a, &scratch_b);
     // The source walk is built first, then the destination's (a test pins the `read_dir` order).
     let mut a = match Side::new(
         fs,
@@ -622,26 +699,38 @@ fn walk_checked<F: DestinationRoot>(
         opts.links == Links::Skip,
         ControlFilter::None,
         &opts.selection,
+        Some(&scratch_a),
     ) {
         Ok(a) => a,
         Err(e) => {
             root_unreadable(out, &format!("{SOURCE}{}", e.source), e.code);
-            return;
+            return Ok(());
         }
     };
     let mut b = if dst_absent {
         Side::empty()
     } else {
-        match Side::new(fs, dst, opts.mounts, false, filter, &opts.selection) {
+        match Side::new(fs, dst, opts.mounts, false, filter, &opts.selection, Some(&scratch_b)) {
             Ok(b) => b,
             Err(e) => {
+                // A fatal error the source side holds must not be lost to the destination's unreadable root.
+                if let Some(error) = a.fatal.take() {
+                    return Err(VerifyError::Failed { error });
+                }
                 root_unreadable(out, &format!("{DESTINATION}{}", e.source), e.code);
-                return;
+                return Ok(());
             }
         }
     };
     let mut buf = vec![0u8; crate::copy::COPY_BUF_MAX];
     loop {
+        a.peek();
+        b.peek();
+        // Before anything is emitted: a side that ended early must not make the other's remaining items look
+        // missing or extra.
+        if let Some(error) = a.fatal.take().or_else(|| b.fatal.take()) {
+            return Err(VerifyError::Failed { error });
+        }
         let order = match (a.peek(), b.peek()) {
             (None, None) => break,
             (Some(_), None) => Ordering::Less,
@@ -666,6 +755,7 @@ fn walk_checked<F: DestinationRoot>(
     }
     // The SOURCE side only: the destination's walk drops entries the same way, but they are not the run's to count.
     out.summary.excluded += a.excluded();
+    Ok(())
 }
 
 /// Why the root check stopped the run.
@@ -763,8 +853,8 @@ fn alone<F: FileSystem>(
     out: &mut Emitter<'_>,
     item: &Item,
     outcome: Outcome,
-    a: &mut Side<'_, F>,
-    b: &mut Side<'_, F>,
+    a: &mut Side<'_, '_, F>,
+    b: &mut Side<'_, '_, F>,
 ) {
     match (&item.failed, outcome) {
         (Some(e), Outcome::Extra) => {
@@ -794,7 +884,7 @@ fn pair<F: FileSystem>(
     out: &mut Emitter<'_>,
     buf: &mut [u8],
     items: (&Item, &Item),
-    sides: (&mut Side<'_, F>, &mut Side<'_, F>),
+    sides: (&mut Side<'_, '_, F>, &mut Side<'_, '_, F>),
 ) {
     let (x, y) = items;
     let (a, b) = sides;
@@ -951,6 +1041,7 @@ mod tests {
             mounts: MountPolicy::Cross,
             hash: HashAlgorithm::Blake3,
             selection: flux_fs::Selection::default(),
+            scratch_dir: None,
         }
     }
 
@@ -2602,6 +2693,7 @@ mod tests {
         let patterns: Vec<String> = patterns.iter().map(|p| (*p).to_string()).collect();
         VerifyOptions {
             selection: flux_fs::Selection::compile(&patterns, recursive).unwrap(),
+            scratch_dir: None,
             ..opts()
         }
     }
@@ -2718,5 +2810,119 @@ mod tests {
             vec![("m".to_string(), Outcome::Match, Kind::Dir, None, MOUNT_NOT_ENTERED.to_string())]
         );
         assert_eq!((s.not_entered, s.excluded), (1, 1));
+    }
+
+    // ---- bounded listing: the two sides spill into their own scratch spaces ----
+
+    fn small_thresholds() -> Thresholds {
+        Thresholds::new(4, 8, 2, 16, 3).unwrap()
+    }
+
+    fn spilling_opts() -> VerifyOptions {
+        VerifyOptions { scratch_dir: Some(PathBuf::from("/scratch")), ..opts() }
+    }
+
+    /// `n` identical files `<prefix>000..` under `dir` of both roots.
+    fn identical_files(fs: &FaultFs, dir: &str, n: usize) {
+        for root in ["/s", "/d"] {
+            for i in 0..n {
+                fs.write_file(format!("{root}{dir}/f{i:03}"), b"same");
+            }
+        }
+    }
+
+    fn creations(fs: &FaultFs) -> usize {
+        fs.calls().iter().filter(|c| c.starts_with("create_scratch(")).count()
+    }
+
+    fn run_spilling(
+        fs: &FaultFs,
+        thresholds: Thresholds,
+        tune: &dyn Fn(&ScratchSpace<'_>, &ScratchSpace<'_>),
+    ) -> (Vec<Row>, Result<Summary, VerifyError>) {
+        let mut rows = Vec::new();
+        let result = verify_tree_spilling(
+            fs,
+            Path::new("/s"),
+            Path::new("/d"),
+            &spilling_opts(),
+            ControlFilter::Root,
+            Spill { thresholds, tune },
+            &mut || {},
+            &mut |r| rows.push(row(&r)),
+        );
+        (rows, result)
+    }
+
+    #[test]
+    fn a_fatal_scratch_error_ends_verify_as_failed_without_missing_records() {
+        // Every combination of the failing side and where the large directory is: at the root (the failure comes
+        // while the walk starts) or below it (the failure comes mid-merge).
+        for source_fails in [true, false] {
+            for below_root in [false, true] {
+                let fs = FaultFs::new();
+                fs.create_dir(Path::new("/scratch")).unwrap();
+                tree(&fs, "/s", &["sub"], &[]);
+                tree(&fs, "/d", &["sub"], &[]);
+                identical_files(&fs, if below_root { "/sub" } else { "" }, 40);
+                let (rows, result) = run_spilling(&fs, small_thresholds(), &|a, b| {
+                    if source_fails {
+                        a.fail_writes_after(2);
+                    } else {
+                        b.fail_writes_after(2);
+                    }
+                });
+                let what = format!("source_fails={source_fails} below_root={below_root}: {rows:?}");
+                assert!(matches!(result, Err(VerifyError::Failed { .. })), "{what}");
+                // The two trees are identical: an early-ended side must not make the other's items look
+                // missing or extra.
+                assert!(
+                    rows.iter().all(|r| r.1 == Outcome::Match),
+                    "only matches may precede the failure; {what}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_held_source_fatal_is_not_lost_to_an_unreadable_destination_root() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/scratch")).unwrap();
+        tree(&fs, "/s", &[], &[]);
+        tree(&fs, "/d", &[], &[]);
+        identical_files(&fs, "", 40);
+        fs.fail_read_dir_of("/d", Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+        let (rows, result) = run_spilling(&fs, small_thresholds(), &|a, _| a.fail_writes_after(2));
+        assert!(matches!(result, Err(VerifyError::Failed { .. })), "{rows:?} {result:?}");
+    }
+
+    #[test]
+    fn both_sides_spilling_match_as_when_neither_spills() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/scratch")).unwrap();
+        tree(&fs, "/s", &[], &[("odd", b"left")]);
+        tree(&fs, "/d", &[], &[("odd", b"rite")]);
+        identical_files(&fs, "", 40);
+        let (plain, plain_result) = run_spilling(&fs, Thresholds::default(), &|_, _| {});
+        assert_eq!(creations(&fs), 0, "the default thresholds do not spill this tree");
+        let (spilled, spilled_result) = run_spilling(&fs, small_thresholds(), &|_, _| {});
+        assert_eq!(creations(&fs), 2, "one scratch file per side");
+        assert_eq!(plain, spilled);
+        assert_eq!(plain.len(), 41);
+        assert_eq!(plain_result.unwrap(), spilled_result.unwrap());
+    }
+
+    #[test]
+    fn a_verify_that_never_spills_needs_no_scratch_location() {
+        let fs = FaultFs::new();
+        for root in ["/s", "/d"] {
+            tree(&fs, root, &["sub"], &[("a", b"alpha"), ("sub/b", b"bravo!!")]);
+        }
+        let (rows, plain) = run(&fs, "/s", "/d", &opts());
+        let missing = VerifyOptions { scratch_dir: Some(PathBuf::from("/nonexistent")), ..opts() };
+        let (rows_missing, with_location) = run(&fs, "/s", "/d", &missing);
+        assert_eq!(rows, rows_missing);
+        assert_eq!(plain, with_location);
+        assert!(!with_location.failed());
     }
 }

@@ -1273,3 +1273,75 @@ fn dry_run_with_exclude_reports_the_same_count() {
         .unwrap();
     assert_eq!(json(&real)["excluded"], json(&dry)["excluded"]);
 }
+
+/// `n` empty files in `d/src` (above the 8,192 `inline_entries`, the root spills with the production constants).
+fn wide_source(d: &Path, n: usize) -> PathBuf {
+    let src = d.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    for i in 0..n {
+        std::fs::File::create(src.join(format!("f{i:05}"))).unwrap();
+    }
+    src
+}
+
+#[test]
+fn scratch_dir_is_used_by_a_spilling_copy() {
+    let d = TempDir::new().unwrap();
+    let src = wide_source(d.path(), 9_000);
+    let missing = d.path().join("missing");
+    let out = flux()
+        .arg("copy")
+        .arg(&src)
+        .arg(d.path().join("dst0"))
+        .arg("--scratch-dir")
+        .arg(&missing)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains(missing.to_str().unwrap()), "{}", stderr(&out));
+    let home = TempDir::new().unwrap();
+    let dst = d.path().join("dst");
+    let out = flux()
+        .arg("copy")
+        .arg(&src)
+        .arg(&dst)
+        .arg("--scratch-dir")
+        .arg(home.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(std::fs::read_dir(&dst).unwrap().filter(|e| e.is_ok()).count(), 9_000);
+    assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0, "the scratch file is nameless");
+}
+
+#[test]
+fn a_real_copy_with_an_unusable_scratch_dir_creates_nothing() {
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let dst = d.path().join("dst");
+    let missing = d.path().join("missing");
+    let out =
+        flux().arg("copy").arg(&src).arg(&dst).arg("--scratch-dir").arg(&missing).output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains(missing.to_str().unwrap()), "{}", stderr(&out));
+    assert!(!dst.exists(), "DEST was not made");
+    assert!(!missing.exists());
+    let out = flux().arg("copy").arg(&src).arg(&dst).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(dst.join("sub").join("b").exists());
+}
+
+#[test]
+fn a_dry_run_that_does_not_spill_ignores_an_unusable_scratch_dir() {
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let out = flux()
+        .arg("copy")
+        .arg(&src)
+        .arg(d.path().join("dst"))
+        .args(["--dry-run", "--scratch-dir"])
+        .arg(d.path().join("missing"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+}

@@ -45,6 +45,7 @@ fn cfg() -> RunConfig {
         dry_run: false,
         dry_temp_root: None,
         progress: None,
+        scratch_dir: None,
     }
 }
 
@@ -2512,7 +2513,8 @@ fn a_target_that_finds_its_own_claim_proceeds() {
     assert!(matches!(store.insert_if_absent(&key_a, &own).unwrap(), ClaimOutcome::Inserted));
     let claims = std::cell::RefCell::new(store);
     let source =
-        prepare_source(&fs, Path::new("/src"), Path::new("/p/dest"), MountPolicy::Cross).unwrap();
+        prepare_source(&fs, Path::new("/src"), Path::new("/p/dest"), MountPolicy::Cross, None)
+            .unwrap();
     let o = opts();
     let cx = Shared {
         fs: &fs,
@@ -8378,6 +8380,7 @@ fn broken_leftovers_notes_exactly_the_entries_of_one_lock() {
     let entry = |n: &str| flux_fs::DirEntry {
         name: std::ffi::OsString::from(n),
         file_type: flux_fs::FileType::File,
+        ino: None,
     };
     let entries = [
         entry("a.flux-lock.broken.1"),
@@ -8391,6 +8394,25 @@ fn broken_leftovers_notes_exactly_the_entries_of_one_lock() {
         matches!(w.as_slice(), [RunWarning::DryRunBrokenLeftover { name }] if name == "a.flux-lock.broken.1"),
         "{w:?}"
     );
+}
+
+#[test]
+fn broken_leftovers_in_agrees_with_the_slice_version() {
+    use super::dry_prior::{broken_leftovers, broken_leftovers_in};
+    let fs = fake();
+    for n in ["a.flux-lock.broken.1", "a.flux-lock", "b.flux-lock.broken.2", "a.flux-lock.broken"] {
+        fs.write_file(format!("/p/{n}"), b"");
+    }
+    for i in 0..1_000 {
+        fs.write_file(format!("/p/unrelated{i:04}"), b"");
+    }
+    let dir = fs.destination_root(Path::new("/p")).unwrap();
+    let mut want = Vec::new();
+    broken_leftovers(&dir.read_dir().unwrap(), OsStr::new("a.flux-lock"), &mut want);
+    let mut got = Vec::new();
+    broken_leftovers_in(&dir, OsStr::new("a.flux-lock"), &mut got);
+    assert_eq!(want.len(), 1, "{want:?}");
+    assert_eq!(format!("{got:?}"), format!("{want:?}"));
 }
 
 #[test]
@@ -9481,7 +9503,7 @@ fn a_candidate_without_claims_degrades_under_auto_and_fails_under_preserve() {
         fs.create_dir(Path::new("/p/dest")).unwrap();
         let root = fs.destination_root(Path::new("/p/dest")).unwrap();
         let source =
-            prepare_source(&fs, Path::new("/src"), Path::new("/p/dest"), MountPolicy::Cross)
+            prepare_source(&fs, Path::new("/src"), Path::new("/p/dest"), MountPolicy::Cross, None)
                 .unwrap();
         let o = CopyOptions { hardlinks: mode, ..opts() };
         let slot = crate::hardlinks::HardlinkSlot::unavailable(Code::IoError);
@@ -10157,7 +10179,8 @@ fn no_claims_source_stats(existing: ExistingPolicy, slot: bool) -> usize {
     fs.create_dir(Path::new("/p/dest")).unwrap();
     let root = fs.destination_root(Path::new("/p/dest")).unwrap();
     let source =
-        prepare_source(&fs, Path::new("/src"), Path::new("/p/dest"), MountPolicy::Cross).unwrap();
+        prepare_source(&fs, Path::new("/src"), Path::new("/p/dest"), MountPolicy::Cross, None)
+            .unwrap();
     let o = CopyOptions { existing, ..opts() };
     let hardlinks = crate::hardlinks::HardlinkSlot::unavailable(Code::IoError);
     let cx = Shared {
@@ -11753,4 +11776,296 @@ mod op_events {
         assert_eq!(for_a, vec![&ev("replaced", "a", Some(1), None)], "{events:?}");
         assert!(events.contains(&ev("copied", "sub/b", Some(2), None)), "{events:?}");
     }
+}
+
+// ---- Bounded listing (cut 23, plan 2, task 5): the copy places its scratch, starts its walk and beats ----
+
+/// Small thresholds: a directory of more than 4 entries spills, 8 entries per run, 3 entries per tick.
+fn spilling() -> crate::scratch::Thresholds {
+    crate::scratch::Thresholds::new(4, 8, 2, 16, 3).unwrap()
+}
+
+fn run_tree_small(
+    fs: &FaultFs,
+    c: &RunConfig,
+    t: crate::scratch::Thresholds,
+) -> (Run<Result<TreeOutcome, TreeAbort>>, Vec<TreeFailure>) {
+    let mut got = Vec::new();
+    let r = tree_with_thresholds(
+        fs,
+        Path::new("/src"),
+        Path::new("/p/dest"),
+        &opts(),
+        c,
+        &mut |f| got.push(f),
+        checkpoint_policy(c, opts().durability),
+        t,
+    );
+    (r, got)
+}
+
+/// `/src` holding `f00`..`f{n-1}`, and `/p`.
+fn flat_source(n: usize) -> FaultFs {
+    let fs = FaultFs::new();
+    for d in ["/src", "/p"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    for i in 0..n {
+        fs.write_file(format!("/src/f{i:02}"), format!("body {i}").as_bytes());
+    }
+    fs
+}
+
+#[test]
+fn a_copy_whose_root_spills_puts_its_scratch_in_the_workspace() {
+    let fs = flat_source(20);
+    let (r, got) = run_tree_small(&fs, &cfg(), spilling());
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(ok(&r).files_copied, 20);
+    let c = calls(&fs);
+    let scratch = at(&c, &format!("create_scratch(/p/dest/.flux/operations/{ID})"));
+    assert!(scratch > at(&c, "create_lock("), "the scratch is made under the lock: {c:?}");
+    assert!(!fs.exists("/p/dest/.flux"), "the workspace is gone after the finish");
+}
+
+#[test]
+fn a_copy_whose_root_cannot_be_listed_fails_after_the_lock_with_the_source_step() {
+    let fs = fake();
+    fs.fail_read_dir_of("/src", Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let (r, _) = run_tree(&fs, &cfg());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert_eq!(aborted(&r).error.step, CopyStep::Source);
+    assert_eq!(manifest(&fs, ID).state, OpState::Failed);
+    assert!(!fs.exists(LOCK), "released");
+    assert!(!fs.exists("/p/dest/a") && !fs.exists("/p/dest/sub"), "nothing but state");
+    let c = calls(&fs);
+    assert!(at(&c, "read_dir(/src)") > at(&c, "create_lock("), "listed under the lock: {c:?}");
+}
+
+#[test]
+fn a_failed_heartbeat_during_a_spilled_listing_stops_the_copy() {
+    let build = || {
+        let fs = fake();
+        for i in 0..40 {
+            fs.write_file(format!("/src/sub/f{i:02}"), b"x");
+        }
+        fs
+    };
+    // The reference run: the first heartbeat write after the subdirectory is listed lands inside that listing.
+    let reference = build();
+    let (r, _) = run_tree_small(
+        &reference,
+        &beating(),
+        crate::scratch::Thresholds::new(4, 8, 2, 16, 8).unwrap(),
+    );
+    ok(&r);
+    let c = calls(&reference);
+    let listed = at(&c, "read_dir(/src/sub)");
+    let n = c[..listed].iter().filter(|x| x.starts_with("write_at_start(")).count() as u32 + 1;
+    let fs = build();
+    fail_heartbeat(&fs, n, LOCK, false);
+    let (r, got) =
+        run_tree_small(&fs, &beating(), crate::scratch::Thresholds::new(4, 8, 2, 16, 8).unwrap());
+    let a = aborted(&r);
+    assert_eq!((a.error.step, a.error.code()), (CopyStep::Heartbeat, Code::IoError));
+    assert!(got.is_empty(), "an abort, never a file's failure: {got:?}");
+    assert!(
+        (0..40).all(|i| !fs.exists(format!("/p/dest/sub/f{i:02}"))),
+        "nothing of sub published"
+    );
+}
+
+/// Pins that a `--restart` over a spilling source completes, spilling into the NEW operation's workspace and never the
+/// superseded one. It does NOT pin the placement inside `TreePlace::sweep`: `drive` places the same workspace right
+/// after `open_operation`, so the test passes without it. `a_restart_sweep_over_a_spilling_dest_uses_the_new_workspace`
+/// (the sweep walks with the scratch) pins that.
+#[test]
+fn a_restart_over_a_spilling_source_completes_into_the_new_workspace() {
+    let fs = flat_source(20);
+    prior(&fs, 5, OpState::Transferring);
+    fs.write_file(format!("/p/dest/f00.flux-partial.{}", id(5)), b"half");
+    let (r, got) = run_tree_small(&fs, &restart(), spilling());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(ok(&r).files_copied, 20);
+    let c = calls(&fs);
+    at(&c, &format!("create_scratch(/p/dest/.flux/operations/{ID})"));
+    assert!(
+        !c.iter().any(|x| x.starts_with("create_scratch(") && x.contains(&id(5))),
+        "never the superseded workspace: {c:?}"
+    );
+}
+
+#[test]
+fn a_hardlink_group_straddling_run_boundaries_keeps_its_canonical_member() {
+    let published = |t: crate::scratch::Thresholds| {
+        let fs = FaultFs::new();
+        for d in ["/src", "/p"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        for i in (0..20).filter(|i| *i != 17) {
+            fs.write_file(format!("/src/f{i:02}"), format!("body {i}").as_bytes());
+        }
+        link_names(&fs, "/src", "f03", &["f17"]);
+        let (r, got) = run_tree_small(&fs, &cfg(), t);
+        assert!(got.is_empty(), "{got:?}");
+        let out = ok(&r);
+        let same = strong(&fs, "/p/dest/f03") == strong(&fs, "/p/dest/f17");
+        let names: Vec<bool> = (0..20).map(|i| fs.exists(format!("/p/dest/f{i:02}"))).collect();
+        let spilled = calls(&fs).iter().any(|c| c.starts_with("create_scratch("));
+        ((out.files_copied, out.files_hardlinked, same, names), spilled)
+    };
+    let (small, small_spilled) = published(spilling());
+    let (plain, plain_spilled) = published(crate::scratch::Thresholds::default());
+    assert!(small_spilled && !plain_spilled, "the small run really spilled, the default did not");
+    assert_eq!(small, plain);
+    assert_eq!((small.0, small.1, small.2), (19, 1, true), "f03 is copied and f17 links to it");
+}
+
+#[test]
+fn a_real_copy_with_an_unusable_scratch_dir_stops_before_the_lock_and_touches_no_dest() {
+    let fs = fake();
+    let c = RunConfig { scratch_dir: Some(PathBuf::from("/nope")), ..cfg() };
+    let (r, got) = run_tree(&fs, &c);
+    assert!(got.is_empty(), "{got:?}");
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    let a = aborted(&r);
+    assert_eq!(a.error.step, CopyStep::Resolve);
+    assert!(a.error.cause.source.to_string().contains("/nope"), "{}", a.error.cause.source);
+    let log = calls(&fs);
+    assert!(!log.iter().any(|c| c.starts_with("create_lock(")), "{log:?}");
+    assert!(!log.iter().any(|c| c.starts_with("create_dir(") && c.contains("dest")), "{log:?}");
+    assert!(!fs.exists("/p/dest"), "DEST was not made");
+    assert!(!fs.exists("/p/dest.flux-lock"), "no lock file");
+}
+
+#[test]
+fn a_dry_run_that_never_spills_creates_no_scratch() {
+    let fs = fake();
+    let (r, _) = run_tree(&fs, &RunConfig { dry_run: true, ..cfg() });
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert!(!fs.called("create_scratch("), "{:?}", calls(&fs));
+}
+
+/// A dry run's `fake()`-like source of 20 files, `/t` as its temporary root and `/p` beside it.
+fn dry_spill_fs() -> FaultFs {
+    let fs = flat_source(20);
+    fs.create_dir(Path::new("/t")).unwrap();
+    fs
+}
+
+fn dry_in_t() -> RunConfig {
+    RunConfig { dry_run: true, dry_temp_root: Some(PathBuf::from("/t")), ..cfg() }
+}
+
+/// The paths `create_scratch(` was logged on.
+fn scratch_homes(fs: &FaultFs) -> Vec<String> {
+    calls(fs)
+        .iter()
+        .filter_map(|c| c.strip_prefix("create_scratch(")?.strip_suffix(')').map(str::to_string))
+        .collect()
+}
+
+/// Where a dry run's scratch file goes for the temporary root `/t`: on Windows into its `flux-scratch` subdirectory.
+fn expected_temporary_home() -> &'static str {
+    if cfg!(windows) { "/t/flux-scratch" } else { "/t" }
+}
+
+#[test]
+fn a_dry_run_that_spills_keeps_its_scratch_in_the_temporary_directory_and_never_in_dest() {
+    let fs = dry_spill_fs();
+    let (r, _) = run_tree_small(&fs, &dry_in_t(), spilling());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert_eq!(scratch_homes(&fs), [expected_temporary_home()], "{:?}", calls(&fs));
+    assert!(!fs.exists("/p/dest"), "a dry run makes no DEST");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dry_run_with_a_memory_backed_temporary_directory_spills_to_the_cache() {
+    let fs = dry_spill_fs();
+    fs.set_memory_backed("/t", Some(true));
+    // The cache the environment names, made in the fake (every ancestor).
+    let cache = crate::scratch::cache_candidates().into_iter().next().expect("HOME is set");
+    let mut at = PathBuf::new();
+    for part in cache.components() {
+        at.push(part);
+        if at.parent().is_some() && !fs.exists(&at) {
+            fs.create_dir(&at).unwrap();
+        }
+    }
+    let (r, _) = run_tree_small(&fs, &dry_in_t(), spilling());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert_eq!(scratch_homes(&fs), [cache.display().to_string()], "{:?}", calls(&fs));
+}
+
+#[test]
+fn a_dry_run_that_never_spills_creates_nothing_even_when_the_temporary_directory_is_memory_backed()
+{
+    let fs = dry_spill_fs();
+    fs.set_memory_backed("/t", Some(true));
+    let base = calls(&fs).len();
+    // Default thresholds: 20 entries never spill. The cache directory is absent from the fake.
+    let (r, _) = run_tree_small(&fs, &dry_in_t(), crate::scratch::Thresholds::default());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    let made: Vec<_> =
+        calls(&fs)[base..].iter().filter(|c| c.starts_with("create_dir(")).cloned().collect();
+    assert!(made.is_empty(), "a run that never spills makes nothing: {made:?}");
+    assert!(scratch_homes(&fs).is_empty());
+}
+
+/// A prior operation's state, its partial and `n` other files in DEST, and a small source: only the `--restart` sweep
+/// lists DEST's root, so only it can spill there.
+fn restart_dest_fs(n: usize) -> FaultFs {
+    let fs = fake();
+    prior(&fs, 5, OpState::Transferring);
+    fs.write_file(format!("/p/dest/a.flux-partial.{}", id(5)), b"half");
+    for i in 0..n {
+        fs.write_file(format!("/p/dest/old{i:02}"), b"x");
+    }
+    fs
+}
+
+/// Pins the placement at the top of `TreePlace::sweep`: the sweep runs inside `open_operation`, before `drive` places
+/// the scratch, so without it the sweep's own spill meets an unplaced space (a fatal scratch error).
+#[test]
+fn a_restart_sweep_over_a_spilling_dest_uses_the_new_workspace() {
+    let fs = restart_dest_fs(20);
+    let (r, got) = run_tree_small(&fs, &restart(), spilling());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(ok(&r).files_copied, 2);
+    assert_eq!(
+        scratch_homes(&fs),
+        [format!("/p/dest/.flux/operations/{ID}")],
+        "the sweep's spill, on the NEW operation's workspace: {:?}",
+        calls(&fs)
+    );
+    assert!(!fs.exists(format!("/p/dest/a.flux-partial.{}", id(5))), "the partial was swept");
+}
+
+#[test]
+fn a_dry_restart_whose_sweep_walk_fails_fatally_stops_the_preview() {
+    let fs = restart_dest_fs(20);
+    fs.create_dir(Path::new("/t")).unwrap();
+    fs.fail("create_scratch", Code::DiskFull);
+    let c = RunConfig { restart: true, ..dry_in_t() };
+    let (r, got) = run_tree_small(&fs, &c, spilling());
+    let Some(RunError::Failed { step, error, .. }) = &r.stop else {
+        panic!("the preview must stop: {:?}", r.stop);
+    };
+    assert_eq!((*step, error.code), (RunStep::State, Code::DiskFull));
+    let reported_restart = r
+        .dry
+        .as_ref()
+        .is_some_and(|d| matches!(d.prior, Some(crate::dry_run::DryPrior::Restart { .. })));
+    assert!(!reported_restart, "nothing is reported as a restart: {:?}", r.dry);
+    assert!(r.copy.is_none(), "{:?}", r.copy);
+    assert!(
+        !got.iter().any(|f| matches!(
+            &f.cause,
+            TreeFailureCause::Planned(PlannedEntry { object: PlannedObject::Partial, .. })
+        )),
+        "no partial is planned for discard: {got:?}"
+    );
 }

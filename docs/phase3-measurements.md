@@ -308,3 +308,146 @@ Slope = (median at 500,000 - median at 100,000) * 1024 / 400,000, bytes per entr
 Acceptance (written in the plan before the data): the changed full-copy slope at most 120 B/entry on both fixtures, every run copied all files, the `--dry-run` slope within 5 B/entry of 76.1. **PASS** on all three. The full-copy slope falls by about 481 B/entry (83%), as the throwaway ablation predicted (95.4 B/entry; recorded in the plan's "Measured basis", `docs/superpowers/plans/2026-10-30-fresh-dir-names.md`, not in this report); `--dry-run` is unchanged, as it should be, because a dry run never publishes.
 
 What this cut does NOT bound: a directory that already existed when the run started (an empty destination made with `mkdir`, or a `--resume` over an interrupted run) is not fresh and keeps its tracked index, about 577 B/entry (inferred from the baseline slope, not measured separately; it applies to a directory that has a claim key, because a directory without one never touches its index). The source walk's listing (about 76 B/entry, in `walk.rs`) is cut B. Background load was uncontrolled; peak RSS varied by under 1% across the three runs of each cell except two: the changed one-subdirectory 100,000-entry copy (17136 against 16504 and 16596) and the changed flat 100,000-entry `--dry-run` (13748 to 13932, 1.3%).
+
+## Cut 23 baseline: peak memory of the unbounded directory structures
+
+Measured before the bounded-listing cut, so its gates have a number to beat. Binary: release build of `main` at `c286819` (`~/.cache/flux-b-target/release/flux`). Fixtures: flat zero-byte trees from `benches/phase3/make_tree.py` (`flux-rss-flat-N`). Method: `/usr/bin/time -v`, "Maximum resident set size", two runs each, KiB. Peak RSS is not a timing.
+
+| Command | 500,000 | 1,000,000 | 2,000,000 | Slope 1M to 2M |
+|---|---|---|---|---|
+| copy onto a pre-existing destination (default `--overwrite`) | 322224, 322224 | 622268, 621968 | 1221640, 1221720 | 614 B/entry |
+| the same with `--resume` | 322260, 322052 | 622204, 622112 | 1221860, 1221780 | 614 B/entry |
+| `verify` (both sides the same fixture) | not run | 145340, 145392 | 285972, 285656 | 144 B/entry |
+| one file copied into a directory holding N entries | not run | 67340, 67272 | 129920, 129772 | 64 B/entry |
+
+The inferred 577 B/entry for a pre-existing destination (see Cut A) is now measured: 614 B/entry, and the run-to-run spread is under 0.1%. The `--resume` runs followed a completed copy, so they exercise the same index build as the overwrite runs and not a partly-written tree; they agree to within 0.1%.
+
+### redb store micro-benchmark (spec 6.3), criterion MISSED
+
+Throwaway program outside the repo, `redb = "=4.4.0"`. Keys: 49 bytes (a fixed 25-byte prefix plus 24 pseudo-random bytes), value 8 bytes, random insertion order, 16 MiB cache, 100,000 inserts per write transaction with `Durability::None` and one final `Immediate` commit. Database on ext4 (`~/.cache`, not tmpfs). Lookups: 100,000 random keys after the ingest, OS page cache warm (it cannot be dropped without root). Peak RSS and wall time from `/usr/bin/time -v`. Two runs per size.
+
+| names | ingest rate (2 runs) | database size | lookup median / p99 | peak RSS |
+|---|---|---|---|---|
+| 10,000,000 | 32,137 and 34,730 /s (288-311 s) | 2.16 GB (216 B/name) | 11.9-12.5 us / 36.6-39.2 us | 39.1-39.4 MB |
+| 100,000,000 | 10,660 and 12,420 /s (8,051-9,380 s) | 12.9 GB (129 B/name) | 27.6-27.9 us / 896-956 us | 117 MB (both runs) |
+
+Pre-registered criterion: at least 100,000 names/s at both sizes, bounded RSS, lookup median under 1 ms. **Ingest missed by 3x at 10M and 8-9x at 100M, and RSS grew from 39 MB to 117 MB, so it is not flat in n either.** Lookup passed. At 100M the rate extrapolates to roughly 7 hours for 300M names. Background load was uncontrolled (a browser and the desktop).
+
+Caveat found afterwards, in the redb source: every commit but the last used `Durability::None`, and redb keeps the page bookkeeping of non-durable commits in memory until a durable commit (`redb-4.4.0/src/tree_store/page_store/page_manager.rs:378-403`, cleared at `:1281` and `:1764`). The RSS growth, and possibly the rate and database size, are therefore partly an artifact of this setting. A rerun with periodic `Immediate` commits was not made. The ingest-rate miss is a result for random-order inserts only; sorted-order inserts were not measured.
+
+Not controlled: background load (a browser and the desktop session were running; the field check showed no other `flux` or build process).
+
+### Hybrid destination index micro-benchmark (spec 6.3, amended at `6c8c25e`), criteria MISSED in both tiers
+
+Throwaway program outside the tree (`.clavity/scratch/bounded-listing-hybrid/`, gitignored; built in the session scratchpad), run once by the orchestrator at top level with no other tool calls during the suite. Data on ext4 under `~/.cache` (not tmpfs), each program deleting its files at exit. Peak RSS and wall time from `/usr/bin/time -v`; `RssAnon` and `VmRSS` read from `/proc/self/status` by the program. Two runs per size, back to back; the load average was 6.59 (1 min) on 8 cores when the suite started and 5.35 when it ended, from uncontrolled background processes (an editor agent and a desktop process at up to one core).
+
+**Tier 1** builds both always-built families, `names` (u16 length, u8 type, 24-byte pseudo-random name) and `inodes` (u64 `d_ino` big-endian, then the name record), for N entries: sorted runs of `RUN_ENTRIES = 262,144`, cascade merge with fan-in 64 and 64 KiB buffers, final run packed into 4 KiB blocks with a static multi-level block index, 256-block cache shared by both families. `build_rate` is N over the wall time of building BOTH families. Lookups: 100,000 random present keys per family after the build, through the block cache; the OS page cache is whatever the build left (stated, not controlled: at 100M the build wrote roughly 19 GB through a 23 GB box).
+
+| entries | build rate (2 runs) | runs / merge passes | index bytes `names` + `inodes` | levels | peak RSS | `RssAnon` after build | `names` median / p99 | `inodes` median / p99 | block cache hit rate |
+|---|---|---|---|---|---|---|---|---|---|
+| 10,000,000 | 461,443 and 435,629 names/s (21.7 and 23.0 s) | 39 / 1 | 274 MB + 357 MB (27 + 36 B/entry) | 3 | 24.6 MB (both) | 3,884 and 3,880 KB | 4.8-5.0 us / 21.3-21.9 us | 3.6 us / 11.6-14.5 us | 54% |
+| 100,000,000 | 221,139 and 325,857 names/s (452 and 307 s) | 382 / 2 | 2.74 GB + 3.57 GB | 3 | 24.6 and 24.5 MB | 5,316 KB (both) | 452 and 332 us / 8,740 and 4,531 us | 56.4 and 36.3 us / 5,198 and 3,248 us | 43% |
+
+Against the pre-registered criteria (spec 6.3): **build rate at least 1,000,000 names/s MISSED at both sizes** (0.44-0.46 M/s at 10M; 0.22-0.33 M/s at 100M, where the second pass over 382 runs is added; counting both families' rows doubles the figures and still misses at 10M). **Resident memory flat PASSED**: peak RSS 24.6 MB at both sizes (within 8 MiB: the spread is 0.1 MB), `RssAnon` 3,884 KB to 5,316 KB over 90M more entries is 0.016 B/entry. **Lookups PASSED at 10M** (median 3.6-5.0 us, p99 under 22 us) and **MISSED at 100M** (medians 36-452 us, p99 3.2-8.7 ms). The 100M lookup figures are consistent with 2 to 3 reads per lookup reaching the device: the 1 MiB block cache holds the root and the second level but not the ~20 MB first level of a 100M-entry family, and the page cache was not warm after the build; the per-run `time` output was overwritten by later runs, so the page-fault count for those runs is not available. The 10M-to-100M build spread (452 vs 307 s) is a 47% gap between two consecutive runs of the same binary and the same input; the background load was uncontrolled.
+
+**Tier 2** inserts N rows (25-byte prefix plus 24 pseudo-random bytes, 8-byte value) into one `redb = "=4.4.0"` table in random key order, 16 MiB cache, committing with `Durability::Immediate` every 1,024 inserts and rotating the write transaction after each commit (spec 6.3 wording). Lookups: 100,000 random present keys after the ingest.
+
+| rows | ingest rate (2 runs) | commits | per commit | database | bytes written (from `time`) | `RssAnon` at 5M / 10M | lookup median / p99 | peak RSS |
+|---|---|---|---|---|---|---|---|---|
+| 10,000,000 | 3,533 and 3,476 rows/s (2,831 and 2,877 s) | 9,766 | about 290 ms | 1.08 GB (108 B/row) | 73 GB (143,444,120 blocks of 512 B, run 2) | 18,268 / 18,372 and 18,368 KB | 13.9-16.1 us / 38.4-46.5 us | 22.0 and 21.9 MB |
+
+Against the criteria: **sustained rate at least 5,000 inserts/s MISSED** (3,476-3,533/s, 70% of the bar). **`RssAnon` slope PASSED**: about 100 KB between 5M and 10M rows, 0.02 B/row, so the periodic durable commit does remove the growth the earlier benchmark saw. The process had 26% of a CPU (user 319 s, system 443 s of 2,877 s wall), so the time goes to waiting on the durable commits; at 7.3 MB written per commit of 1,024 rows (copy-on-write of the leaf and its path for random keys) the commits are write-bound, not CPU-bound. The smoke run at 50,000 rows ingested at 178,557/s (6 ms per commit), so the per-commit cost grows with the tree.
+
+Spec 6.3 and R1 pre-register the consequence: a missed criterion stops the plan and returns it to the owner with the numbers; no other store is designed speculatively. The criteria were the peer's proposal adopted as a veto-able call. Not controlled: background load (load average 5.4-6.6 on 8 cores throughout; an editor agent and a desktop process were running; the field check showed no other benchmark, `flux` or build process, and a stale wait loop was killed before the start).
+
+#### Optimization rounds (same day; owner ruled the misses unacceptable)
+
+Each candidate change became a flag of the same program (default: the original behaviour; the original binary was kept as the baseline), so each could be measured alone and together. Every run's `verify` mode and the byte-identical index sizes pin that no change altered the merged order or the record layout. Two runs per configuration at 10M; load averages 2.9-5.6 at the starts and ends (uncontrolled: an editor agent, the display server, once a transient pre-push hook from another repository).
+
+Tier 1 at 10M, build rate in names/s (both families in the time), two runs each:
+
+| configuration | build rate | peak RSS | random `names` lookup median / p99 |
+|---|---|---|---|
+| original | 521,724 and 542,564 | 24.5 MB | 4.8-4.9 us / 12.0-13.1 us |
+| 8-byte key prefix in the spill sort | 1,011,916 and 1,334,756 | 28.7 MB | 4.7-4.9 us / 8.8-21.4 us |
+| two threads, one family each | 515,481 and 602,859 | 28.8 MB | 4.4-4.7 us / 11.7-12.0 us |
+| prefix sort + two threads | 1,631,658 and 1,747,346 | 28.7 MB | 4.4-4.7 us / 8.8-18.4 us |
+| prefix sort + threads + prefix in the merge heap | 1,568,076 and 1,932,506 | 28.7-28.9 MB | (walk-order probes) 1.3-1.4 us / 3.4-3.8 us |
+
+The spill sort's indirect slice comparisons were about half of the build time (the prefix alone doubled the rate); the two threads add about 1.1x because the single-threaded generation and spill phase dominates once the sort is fast. The 16-byte sort entry costs 4 MB of peak RSS.
+
+Tier 1 at 100M, all with prefix sort and two threads:
+
+| configuration | passes | build rate | peak RSS | `names` lookups median / p99 | `inodes` lookups (random) median / p99 |
+|---|---|---|---|---|---|
+| fan-in 384, 64 KiB merge buffers | 1 | 846,878 and 949,894 | 53.6-53.9 MB | walk order 1.4 us / 2.9 us; random with levels warmed 215 us / 1,596 us | 265-283 us / 2.4-3.2 ms |
+| fan-in 384, 64 KiB, prefix merge | 1 | 1,215,727 | 53.8 MB | walk order 1.4 us / 3.4 us | 224 us / 1.2 ms |
+| fan-in 384, 16 KiB, prefix merge | 1 | 1,210,000 and 1,217,771 | 28.8 and 28.7 MB | walk order 1.4 us / 3.1-3.4 us | 249-288 us / 1.6-3.8 ms |
+| fan-in 64 (the spec's value), 64 KiB, prefix merge | 2 | 931,718 | 28.7 MB | walk order 1.4 us / 3.6 us | 14.2 us / 1.0 ms |
+
+At fan-in 384 the 382 runs merge in one pass; the second pass costs about 1.3x. With 64 KiB buffers the two families' 384 readers hold 48 MB and peak RSS rises to 54 MB, which the "within 8 MiB of the 10M figure" criterion does not allow; 16 KiB buffers (6 MiB per family) keep it at 28.8 MB, equal to the 10M figure, at the same build rate. Walk-order `names` probes (the first L names in index order, read from the data blocks: the production step-1 pattern under C1) take 1.4 us at 100M because consecutive probes share blocks. Random probes at 100M still pay one device read per probe for the data block (about 200 us on this disk) even with the level blocks pre-read; the page-cache state after the build is not controlled (one run had the `inodes` file cached and measured 14 us).
+
+Tier 2 at 10M rows, `Durability::Immediate` every 1,024, 16 MiB cache:
+
+| configuration | ingest rate | first half | written | `RssAnon` 5M / 10M | lookup median / p99 |
+|---|---|---|---|---|---|
+| original (fsync, random keys) | 3,476 and 3,533 rows/s | | 73 GB | 18.3 / 18.4 MB | 14-16 us / 38-47 us |
+| no-op `sync_data` backend, random keys | 25,473 rows/s | 28,904 | 11 GB | 18.2 / 18.4 MB | 11.8 us / 45.1 us |
+| no-op `sync_data` backend, ascending keys | 568,532 rows/s | 647,360 | 0.7 GB | 17.5 / 17.5 MB | 13.2 us / 54.9 us |
+| fsync, ascending keys | 159,992 rows/s | 169,881 | 1.1 GB | 17.5 / 17.5 MB | 13.0 us / 53.2 us |
+
+The backend implements `redb::StorageBackend` (`db.rs:69-100`) over a `File` with `sync_data` returning `Ok(())`; `Database::builder().create_with_backend` (`db.rs:2182`). The durable commit path (`page_manager.rs:1739-1764`) still writes every dirty page and clears the non-durable bookkeeping at `:1764`, so the memory property is kept; only the `fdatasync` calls go (strace: zero with the backend, 59 for 49 commits without it). The store is an unlinked scratch no later run reads, so durability buys nothing there. Ascending keys are the production order of `names2`, `owners` and `learned` (publications arrive in walk order within a directory, C1); the order of `ids` keys is not established.
+
+Against the criteria with the full set (prefix sort, prefix merge, two threads, fan-in 384 at 16 KiB, no-op `sync_data`): tier 1 build PASSES at both sizes (1.57-1.93 M and 1.21-1.22 M names/s), peak RSS flat PASSES (28.7-28.9 MB at both sizes), walk-order lookups PASS; random-probe lookups at 100M MISS as written (the data block read reaches the device); tier 2 PASSES (25k rows/s on random keys, 568k on ascending) with the `RssAnon` slope flat. Peer consult: two AGY-FIRST rounds (briefs `.clavity/seams/bounded-listing-hybrid-opt-r1.md`, `-r2.md`; replies under `.clavity/scratch/bounded-listing-hybrid-opt/`). Round 1 proposed the no-op `sync_data` backend, fan-in 384, the two threads, the prefix sort and the page-cache warming; it ranked the spill sort too low (third at 15-20%; measured about half), over-predicted the threads (1.7x; measured 1.1x) and the tier 2 gain (15-30x; measured 7.3x), omitted the second family's arena from the merge-phase RSS, and expected warmed levels to fix random probes (they fix the level read, not the data-block read). Round 2 accepted all five corrections and ALIGNED on the measured set with fixed constants `MERGE_FAN_IN = 384`, `MERGE_BUFFER = 16 KiB` (one pass to about 100M entries per directory, two passes above, measured price 1.3x; a 1,024 fan-in or a byte-budgeted dynamic fan-in was rejected as either 32 MiB of reader buffers or four times the read syscalls), the no-op `sync_data` backend as spec text (line 145), the two finish threads (line 133; the listing pass stays single), the prefix comparisons as an implementation requirement, and a rewording of the lookup criterion by probe pattern (walk-order `names` as the production step-1 figure; random probes stated under the page-cache state they ran in) and of the memory criterion as "bounded by the line 195 formula with the chosen constants". The owner adopted the set, the constants, the memory wording and the `tick` placement, and sent the lookup wording to a third round.
+
+Round 3 (lookup criterion) ALIGNED on a combined clause: latency gates where the index controls the environment (walk-order `names`, the production step-1 pattern), structural gates (block-cache misses per probe, which are a property of the index and the probe stream, not of the machine) for random probes, random latencies reported with the page-cache state. Per-loop counters were then added and measured with the full set (`out4.txt`, one run each, load average 2.8 at the start and 2.0 at the end):
+
+| probes at | `names` walk order: misses/probe, median / p99 | `names` random: misses/probe, median / p99 | `inodes` random: misses/probe, median / p99 |
+|---|---|---|---|
+| 10M | 0.0067, 1.4 us / 7.7 us | 1.79, 5.1 us / 20.1 us (files in the page cache) | 1.89, 4.3 us / 17.5-20.0 us |
+| 100M, levels pre-read | 0.0067, 1.5 us / 3.8 us | 2.15, 256 us / 1,227 us | 2.41, 219-243 us / 1,165-1,475 us |
+| 100M, nothing pre-read | | 2.15, 263 us / 1,451 us | 2.41, 224 us / 1,592 us |
+
+The miss counts do not change with the page-cache state (identical to the probe with and without the pre-read); the latencies do. A random probe reads one block per level (3) plus the data block; the root and most of the second level stay in the 256-block cache, so 2.15 and 2.41 of the 4 reads miss. The peer's round 3 text put the `names` gate at 2.0 and the `inodes` gate at 2.5; the measured 2.15 refutes the first and leaves the second a 4% margin, so the numbers proposed to the owner are the structural bound of 3 misses per probe (levels plus the data block, minus the always-resident root) for both families, and 0.05 per probe for walk order (7x the measured 0.0067, which is one data block per about 150 consecutive probes). Walk-order latency gates stay at the peer's 5 us median and 20 us p99 (3.5x and 2.6x the measured figures).
+
+## Cut 23 plan 2: the walk's spill
+
+Commit measured: tip of `feat/bounded-listing` after Task 7 (`87bf540`); the test file is `crates/flux-core/tests/walk_cascade_memory.rs`. Peak RSS is not a timing and no timing is claimed here; the wall time of the run (584 s, dominated by creating 3,000,000 files) is incidental and UNVERIFIED as a figure.
+
+### GATE-C (library): the cascade holds memory flat
+
+Method: a counting global allocator (the pattern of `dry_run_memory.rs`), a flat directory of 1,000,000 and one of 2,000,000 zero-byte files made in permuted order under `~/.cache` (ext4), walked with `Thresholds::new(512, 4_096, 8, 16_384, 65_536)` (488 runs at 2,000,000, two cascade levels), the space placed on a second directory. Every yielded name is compared with the sorted sequence as it arrives (the zero-padded names sort numerically), `spilled_directories() == 1` for each walk, and the live bytes are compared with their baseline after the walk and the space are dropped.
+
+| entries | peak live bytes above the baseline | live bytes left after drop |
+|---|---|---|
+| 1,000,000 | 597,860 | 0 |
+| 2,000,000 | 604,748 | 0 |
+
+Criterion: `peak_2m <= peak_1m + 1 MiB` (met: the difference is 6,888 B) and `LIVE` back at its baseline (met: 0 B, tolerance 64 KiB). One run; the allocation counts are deterministic and do not depend on machine load. Not mutation-tested: the test was not run against a deliberately leaking or non-cascading walk (each run takes about ten minutes); the non-vacuity of the pieces it relies on is covered by the unit tests of plan 2 (Tasks 3 and 4).
+
+### GATE-A and GATE-X: release binary, peak RSS
+
+Binary: release build of `feat/bounded-listing` at `7fb94df` (`~/.cache/flux-c23-target/release/flux`). Fixtures: `benches/phase3/make_tree.py` zero-byte trees, flat (`flux-rss-flat-N`) and one created subdirectory holding every entry (`flux-rss-one-N`, `--dirs 1`), N = 500,000, 1,000,000, 2,000,000, plus a flat 10,000,000. Method: `/usr/bin/time -v` "Maximum resident set size" (KiB), two runs each; `Anonymous` from `/proc/<pid>/smaps_rollup`, the sample with the largest `Rss` of a 50 ms sampler (it can miss a short peak, so it is a breakdown, not the peak). `--dry-run` (DEST absent), a fresh `copy` (DEST removed before each run), and `verify` over the freshly copied identical tree, all at `-vv`; the "listing spilled" lines on stderr were counted (stdout to `/dev/null`, stderr through a counting pipe). Peak RSS is not a timing; no wall-clock figure is claimed. Background load was NOT controlled (a browser at about 30% of a core and the review peer were running; the box had been idle of my own work); the field check found no stale measurement process and a probe (`yes`) read 100%.
+
+Peak RSS, KiB, two runs each:
+
+| Case | 500,000 | 1,000,000 | 2,000,000 | Slope 1M to 2M |
+|---|---|---|---|---|
+| flat, `--dry-run` | 29068, 29468 | 29300, 29548 | 29176, 29576 | -0.05 B/entry |
+| flat, fresh `copy` | 30340, 30264 | 30260, 30320 | 30260, 30040 | -0.14 B/entry |
+| flat, `verify` | 29384, 29668 | 29268, 29460 | 29424, 29668 | +0.19 B/entry |
+| one dir, `--dry-run` | 28452, 29468 | 28920, 29696 | 29260, 29572 | +0.11 B/entry |
+| one dir, fresh `copy` | 30312, 30336 | 30452, 30168 | 30348, 30376 | +0.05 B/entry |
+| one dir, `verify` | 29592, 29724 | 29476, 29608 | 29692, 29512 | +0.06 B/entry |
+
+Before this plan (`Cut 23 baseline` above, `main` at `c286819`): `--dry-run` grew by about 76 B/entry, a copy onto a pre-existing destination by 614, `verify` by 144. Now every slope is inside the run-to-run spread (up to about 1 MiB between two runs of one cell), so the figures are "flat", not "fractionally positive". Criterion: slope at most 5 B/entry (met in all six rows).
+
+`Anonymous` at the sampled peak, KiB (two runs): dry-run 24880/24884 (500k), 24876/24876 (1M), 24876/24876 (2M); copy 24976/24980, 24976/24980, 24980/24980; verify 24892/24892, 24924/24920, 24988/24988; the one-dir rows are within 20 KiB of these. The anonymous slope 1M to 2M is 0 to 0.07 B/entry (at most 1 B required: met). The file-backed part is the binary and the shared libraries (`Rss` minus `Anonymous` is about 4.6 to 5 MiB, constant).
+
+Spill counts: every `--dry-run` and `copy` run reported one "listing spilled" line (`entries=1000000 runs=4` at 1M), every `verify` run two (one per side), so the threshold was crossed in every cell; at N = 500,000 and above the production constants (8,192 inline, 262,144 per run) apply.
+
+GATE-X (one `--dry-run` over the flat 10,000,000-entry fixture): peak RSS 29216 and 29072 KiB against 29176 and 29576 KiB at 2,000,000 (the difference is at most 0.5 MiB; the criterion is within 64 MiB: met); the `-vv` line reads `listing spilled entries=10000000 runs=39`, the 39 runs the spec predicts (10,000,000 / 262,144 rounded up).
+
+A first attempt at this run was discarded: it took `ru_maxrss` from `wait4` inside a Python driver, and a forked child's peak includes the driver's own memory (the driver grew while deleting a 2,000,000-entry destination), so its figures climbed with N for a reason unrelated to the program; it also captured `-vv` stderr to a file that exhausted the `/tmp` user quota. The figures above come from `/usr/bin/time -v` around the binary (a small parent process), with stderr counted through a pipe.
+
+Not measured: GATE-B and GATE-D (plan 3 and plan 1), a destination above the threshold (structure B), Windows, any timing. Windows CI has not run (no push without the owner's go-ahead): the Windows branches are compile-checked only.

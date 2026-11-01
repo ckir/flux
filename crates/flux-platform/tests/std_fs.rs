@@ -1070,3 +1070,59 @@ fn mount_root_never_follows_a_link_at_the_path() {
         eprintln!("skipped: /proc is absent");
     }
 }
+
+#[test]
+fn std_read_dir_each_yields_exactly_the_entries_that_exist() {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("a"), b"x").unwrap();
+    std::fs::create_dir(d.path().join("sub")).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(d.path().join("sub"), d.path().join("link")).unwrap();
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(d.path().join("link"))
+            .arg(d.path().join("sub"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    let mut got = Vec::new();
+    StdFileSystem
+        .read_dir_each(d.path(), &mut |e| {
+            got.push((e.name.to_string_lossy().into_owned(), e.file_type));
+            Ok(std::ops::ControlFlow::Continue(()))
+        })
+        .unwrap();
+    got.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(got.len(), 3);
+    assert_eq!(
+        got,
+        vec![
+            ("a".to_string(), flux_fs::FileType::File),
+            ("link".to_string(), flux_fs::FileType::Symlink),
+            ("sub".to_string(), flux_fs::FileType::Dir),
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn std_read_dir_ino_is_the_object_index_of_the_entry() {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("a"), b"x").unwrap();
+    std::fs::write(d.path().join("b"), b"x").unwrap();
+    std::fs::create_dir(d.path().join("sub")).unwrap();
+    let mut n = 0;
+    StdFileSystem
+        .read_dir_each(d.path(), &mut |e| {
+            n += 1;
+            let m = StdFileSystem.metadata(&d.path().join(&e.name)).unwrap();
+            let FileIdentity::Strong(id) = m.identity else { panic!("strong identity") };
+            assert_eq!(e.ino, Some(id.index as u64), "{:?}", e.name);
+            Ok(std::ops::ControlFlow::Continue(()))
+        })
+        .unwrap();
+    assert!(n >= 3, "the loop must not be vacuous");
+}

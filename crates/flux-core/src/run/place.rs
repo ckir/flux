@@ -18,6 +18,7 @@ use crate::cleanup::delete;
 use crate::copy::{CopyError, CopyStep, split_destination};
 use crate::lock::{LockCode, LockResult, Refusal};
 use crate::prior::{PriorOp, Scan, scan_file, scan_tree};
+use crate::scratch::ScratchSpace;
 use crate::state::{
     FLUX_DIR, Kind, MANIFEST, OPERATIONS_DIR, OpState, OperationState, PROBE, PROBE_TEMP, Root,
     STATE_DB, absolute_lexical, begin_workspace, creating_name, from_native_hex, identity_text,
@@ -64,6 +65,7 @@ pub(crate) trait Place<D: DirHandle> {
         &self,
         priors: &[PriorOp],
         locked: &Locked<'_, D>,
+        scratch: Option<&ScratchSpace<'_>>,
         warnings: &mut Vec<RunWarning>,
     ) -> Result<Vec<String>, Fault>;
     /// Remove operation `id`'s state: a workspace, retired first (decision 17), or a record and its temporary.
@@ -450,6 +452,27 @@ impl<F: DestinationRoot> TreePlace<'_, F> {
     }
 }
 
+/// Places the scratch space: on `--scratch-dir` when given, else directly on the operation's workspace
+/// `DEST/.flux/operations/<id>/` (no subdirectory: the file is nameless, and a `--resume` that reuses the prior's
+/// workspace needs nothing extra). Idempotent: `place` ignores a second call, and a placed space is not reopened.
+pub(crate) fn place_scratch<F: DestinationRoot>(
+    fs: &F,
+    place: &TreePlace<'_, F>,
+    id: &str,
+    scratch: &ScratchSpace<'_>,
+) -> flux_fs::Result<()> {
+    if scratch.is_placed() {
+        return Ok(());
+    }
+    if let Some(dir) = scratch.explicit() {
+        scratch.place(crate::scratch::open_explicit(fs, dir)?, dir.to_path_buf());
+        return Ok(());
+    }
+    let workspace = place.open_workspace(id)?;
+    scratch.place(workspace, place.operations_shown().join(id));
+    Ok(())
+}
+
 impl<F: DestinationRoot> Place<F::Dir> for TreePlace<'_, F> {
     fn kind(&self) -> Kind {
         Kind::Tree
@@ -496,11 +519,18 @@ impl<F: DestinationRoot> Place<F::Dir> for TreePlace<'_, F> {
         &self,
         priors: &[PriorOp],
         locked: &Locked<'_, F::Dir>,
+        scratch: Option<&ScratchSpace<'_>>,
         warnings: &mut Vec<RunWarning>,
     ) -> Result<Vec<String>, Fault> {
         let ids: BTreeSet<&str> = priors.iter().map(|p| p.state.operation_id.as_str()).collect();
         if ids.is_empty() {
             return Ok(Vec::new());
+        }
+        // The `--restart` sweep runs inside `open_operation`, before `drive` regains control, so the scratch is
+        // placed here too (idempotent).
+        if let Some(scratch) = scratch {
+            place_scratch(self.fs, self, &locked.state.operation_id, scratch)
+                .map_err(|e| Fault::Io(self.shown(&locked.state.operation_id), e))?;
         }
         let dest = self.dest.as_ref().expect("DEST exists once this run's state does");
         sweep_partials(
@@ -512,6 +542,7 @@ impl<F: DestinationRoot> Place<F::Dir> for TreePlace<'_, F> {
             &|id| self.shown(id),
             &mut || checked(locked),
             &mut |_| {},
+            scratch,
             warnings,
         )
     }
@@ -729,6 +760,7 @@ impl<D: DirHandle> Place<D> for FilePlace<'_, D> {
         &self,
         priors: &[PriorOp],
         locked: &Locked<'_, D>,
+        _scratch: Option<&ScratchSpace<'_>>,
         warnings: &mut Vec<RunWarning>,
     ) -> Result<Vec<String>, Fault> {
         let mut gone = Vec::new();
@@ -850,5 +882,42 @@ impl<D: DirHandle> Place<D> for FilePlace<'_, D> {
         _warnings: &mut Vec<RunWarning>,
     ) -> Result<Option<AdoptedStore>, RunError> {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    use super::*;
+    use crate::fault_fs::FaultFs;
+    use crate::scratch::Thresholds;
+    use flux_fs::{DestinationRoot, FileSystem};
+
+    #[test]
+    fn a_missing_explicit_scratch_dir_is_named_and_keeps_its_code() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let Err(bare) = fs.destination_root(Path::new("/nope")) else { panic!("absent") };
+        let before = bare.code;
+        let holder = fs.destination_root(Path::new("/d")).unwrap();
+        let place = TreePlace {
+            fs: &fs,
+            holder: &holder,
+            holder_shown: PathBuf::from("/d"),
+            name: None,
+            dest: None,
+            dest_shown: PathBuf::from("/d"),
+            created_dest: false,
+            operations: None,
+            claims: None,
+            durability: Durability::Normal,
+            src_root: PathBuf::from("/s"),
+            src_identity: FileIdentity::Unavailable,
+        };
+        let scratch = ScratchSpace::unplaced(Thresholds::default(), Some(PathBuf::from("/nope")));
+        let Err(e) = place_scratch(&fs, &place, "id", &scratch) else {
+            panic!("the explicit directory is absent");
+        };
+        assert_eq!(e.code, before);
+        assert!(e.source.to_string().contains("/nope"), "{}", e.source);
     }
 }

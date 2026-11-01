@@ -147,6 +147,8 @@ struct Inner {
     next_lock_handle: u64,
     /// What `lock_capability` answers; `None` means `LocalStrong`.
     lock_capability: Option<LockCapability>,
+    /// path -> what `memory_backed` answers there; a missing path answers `Some(false)`.
+    memory_backed: HashMap<PathBuf, Option<bool>>,
     /// (call name, which call) -> an action. The action runs just BEFORE that call, outside the fake's own lock,
     /// so it can drive the fake itself: "another process acts between two of this one's calls" (cut 7a Part 2's
     /// protocol tests). Consumed on use. Keyed by both, so two hooks on one name at different counts coexist.
@@ -1235,6 +1237,11 @@ impl FaultFs {
         self.calls().iter().any(|c| c.starts_with(prefix))
     }
 
+    /// What `memory_backed` answers for the directory at `path` (default `Some(false)`).
+    pub fn set_memory_backed(&self, path: impl AsRef<Path>, answer: Option<bool>) {
+        self.inner.lock().unwrap().memory_backed.insert(path.as_ref().to_path_buf(), answer);
+    }
+
     /// What every `lock_capability` call answers from now on (default `LocalStrong`).
     pub fn set_lock_capability(&self, capability: LockCapability) {
         self.inner.lock().unwrap().lock_capability = Some(capability);
@@ -1818,7 +1825,7 @@ impl FileSystem for FaultFs {
             } else {
                 g.types.get(key).copied().unwrap_or(FileType::File)
             };
-            out.push(DirEntry { name: name.to_os_string(), file_type });
+            out.push(DirEntry { name: name.to_os_string(), file_type, ino: None });
         }
         Ok(out)
     }
@@ -2360,6 +2367,19 @@ impl DirHandle for FakeDirHandle {
             path: child_path,
             inner: std::sync::Arc::clone(&self.inner),
         })
+    }
+
+    fn create_scratch(&self) -> Result<std::fs::File> {
+        self.fs()
+            .record(format!("create_scratch({})", self.my_path().display()), "create_scratch")?;
+        // The fake has no bytes of its own to give: an anonymous real file stands in.
+        tempfile::tempfile().map_err(FsError::from_io)
+    }
+
+    fn memory_backed(&self) -> Result<Option<bool>> {
+        let path = self.my_path();
+        let g = self.inner.lock().unwrap();
+        Ok(g.memory_backed.get(&path).copied().unwrap_or(Some(false)))
     }
 
     fn create_hardlink_index(&self, name: &OsStr) -> Result<Self::Index> {
@@ -4108,6 +4128,36 @@ mod tests {
     }
 
     #[test]
+    fn create_scratch_is_logged_and_can_fail() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        d.create_scratch().expect("the first call succeeds");
+        assert!(
+            fs.calls().iter().any(|c| c.replace('\\', "/") == "create_scratch(/d)"),
+            "the call log names the directory: {:?}",
+            fs.calls()
+        );
+        fs.fail("create_scratch", Code::DiskFull);
+        let err = d.create_scratch().expect_err("the injected fault");
+        assert_eq!(err.code, Code::DiskFull);
+    }
+
+    #[test]
+    fn memory_backed_answers_the_switch() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        assert_eq!(d.memory_backed().unwrap(), Some(false), "the default");
+        fs.set_memory_backed("/d", Some(true));
+        assert_eq!(d.memory_backed().unwrap(), Some(true));
+        fs.set_memory_backed("/d", None);
+        assert_eq!(d.memory_backed().unwrap(), None);
+    }
+
+    #[test]
     fn create_hardlink_index_refuses_a_taken_name() {
         use flux_fs::{DestinationRoot, DirHandle};
         let fs = FaultFs::new();
@@ -4536,6 +4586,156 @@ mod tests {
         // The directory is named in another case; the entries come back as stored.
         assert_eq!(names(&fs, "/D"), vec!["Sub", "file.txt"]);
         assert!(called_norm(&fs, "read_dir(/d)"));
+    }
+
+    fn five_files() -> FaultFs {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        for n in ["a", "b", "c", "d", "e"] {
+            fs.write_file(format!("/d/{n}"), b"x");
+        }
+        fs
+    }
+
+    fn mixed_dir() -> FaultFs {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.write_file("/d/a", b"x");
+        fs.write_file("/d/b", b"x");
+        fs.create_dir(Path::new("/d/c")).unwrap();
+        fs
+    }
+
+    #[test]
+    fn read_dir_each_visits_every_entry_once_like_read_dir() {
+        let fs = mixed_dir();
+        let mut seen = Vec::new();
+        fs.read_dir_each(Path::new("/d"), &mut |e| {
+            assert_eq!(e.ino, None);
+            seen.push((e.name, e.file_type));
+            Ok(std::ops::ControlFlow::Continue(()))
+        })
+        .unwrap();
+        seen.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut want: Vec<_> = fs
+            .read_dir(Path::new("/d"))
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.name, e.file_type))
+            .collect();
+        want.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(seen, want);
+        assert_eq!(seen.len(), 3);
+    }
+
+    #[test]
+    fn read_dir_each_stops_when_the_visitor_breaks() {
+        let fs = five_files();
+        let mut calls = 0;
+        let r = fs.read_dir_each(Path::new("/d"), &mut |_| {
+            calls += 1;
+            Ok(std::ops::ControlFlow::Break(()))
+        });
+        assert!(r.is_ok());
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn read_dir_each_returns_the_visitors_error_and_stops() {
+        let fs = five_files();
+        let mut calls = 0;
+        let r = fs.read_dir_each(Path::new("/d"), &mut |_| {
+            calls += 1;
+            if calls == 2 {
+                return Err(FsError::new(Code::IoError, std::io::Error::other("x")));
+            }
+            Ok(std::ops::ControlFlow::Continue(()))
+        });
+        let err = r.unwrap_err();
+        assert_eq!(err.code, Code::IoError);
+        assert!(err.to_string().contains('x'), "{err}");
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn read_dir_each_records_exactly_one_read_dir_call() {
+        let fs = mixed_dir();
+        fs.read_dir_each(Path::new("/d"), &mut |_| Ok(std::ops::ControlFlow::Continue(())))
+            .unwrap();
+        assert_eq!(fs.calls().iter().filter(|c| c.starts_with("read_dir(")).count(), 1);
+    }
+
+    #[test]
+    fn a_failed_listing_never_calls_the_visitor() {
+        let fs = five_files();
+        fs.fail_nth("read_dir", 1, Code::IoError, std::io::ErrorKind::PermissionDenied);
+        let mut calls = 0;
+        let r = fs.read_dir_each(Path::new("/d"), &mut |_| {
+            calls += 1;
+            Ok(std::ops::ControlFlow::Continue(()))
+        });
+        assert!(r.is_err());
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn read_dir_each_on_a_handle_matches_read_dir() {
+        use flux_fs::{DestinationRoot, DirHandle};
+        use std::ops::ControlFlow::{Break, Continue};
+        // Every entry once, like read_dir, with no inode number.
+        let fs = mixed_dir();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let mut seen = Vec::new();
+        DirHandle::read_dir_each(&d, &mut |e| {
+            assert_eq!(e.ino, None);
+            seen.push((e.name, e.file_type));
+            Ok(Continue(()))
+        })
+        .unwrap();
+        seen.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut want: Vec<_> =
+            DirHandle::read_dir(&d).unwrap().into_iter().map(|e| (e.name, e.file_type)).collect();
+        want.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(seen, want);
+        // Break stops after one call and is Ok.
+        let fs = five_files();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let mut calls = 0;
+        assert!(
+            DirHandle::read_dir_each(&d, &mut |_| {
+                calls += 1;
+                Ok(Break(()))
+            })
+            .is_ok()
+        );
+        assert_eq!(calls, 1);
+        // The visitor's error is returned and stops the read.
+        let mut calls = 0;
+        let err = DirHandle::read_dir_each(&d, &mut |_| {
+            calls += 1;
+            if calls == 2 {
+                return Err(FsError::new(Code::IoError, std::io::Error::other("x")));
+            }
+            Ok(Continue(()))
+        })
+        .unwrap_err();
+        assert_eq!(err.code, Code::IoError);
+        assert!(err.to_string().contains('x'), "{err}");
+        assert_eq!(calls, 2);
+        // One read_dir call per streaming read.
+        let n = fs.calls().iter().filter(|c| c.starts_with("read_dir(")).count();
+        assert_eq!(n, 2);
+        // A failed listing never calls the visitor.
+        let fs = five_files();
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        fs.fail_nth("read_dir", 1, Code::IoError, std::io::ErrorKind::PermissionDenied);
+        let mut calls = 0;
+        let r = DirHandle::read_dir_each(&d, &mut |_| {
+            calls += 1;
+            Ok(Continue(()))
+        });
+        assert!(r.is_err());
+        assert_eq!(calls, 0);
     }
 
     #[test]

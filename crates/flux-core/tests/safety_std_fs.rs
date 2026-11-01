@@ -148,6 +148,7 @@ fn run_cfg() -> RunConfig {
         dry_run: false,
         dry_temp_root: None,
         progress: None,
+        scratch_dir: None,
     }
 }
 

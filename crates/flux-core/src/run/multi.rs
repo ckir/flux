@@ -9,7 +9,7 @@
 //! makes the workspace, so a refusal at any of those finds no workspace and releases every lock it took.
 
 use super::dry_prior::{
-    DryAdopt, LockPreview, broken_leftovers, dry_adopt, dry_lock_record, dry_restart,
+    DryAdopt, LockPreview, broken_prefix, dry_adopt, dry_lock_record, dry_restart,
 };
 use super::place::{AdoptedStore, LocatedTree, Place, TreePlace, locate_dest};
 use super::prefix::{PrefixId, PrefixIdOwned, PrefixLocks, PrefixRefusal};
@@ -24,6 +24,7 @@ use crate::copy::{CopyError, CopyStep, no_heartbeat, unguarded};
 use crate::dry_run::{DryPrior, DryRun, NullClaimStore};
 use crate::lock::{LockCode, LockError, LockResult, LockSite, Refusal, check_capability};
 use crate::prior::{PriorOp, Scan, check_control_plane};
+use crate::scratch::{ScratchSpace, Thresholds, temporary_home};
 use crate::state::{
     Kind, OperationState, Root, RootKind, absolute_lexical, identity_text, native_hex, wall_time_ns,
 };
@@ -40,6 +41,7 @@ use std::cell::{OnceCell, RefCell};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io::ErrorKind;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
 /// One root of the run: the name it takes under DEST, what it is, where it comes from, and the identity it had when
@@ -76,13 +78,112 @@ fn swap_first_letter(name: &str) -> String {
         .collect()
 }
 
+/// What one streaming pass over a user directory keeps (spec 6.4): bounded by `FOLD_CANDIDATES` and by the leftovers of
+/// the roots' locks, never by the directory's size.
+pub(crate) struct DirScan {
+    /// Up to `FOLD_CANDIDATES` of the smallest usable names, bytewise ascending.
+    candidates: Vec<String>,
+    /// `leftovers[i]`: in stream order, the names that start with `broken_prefix(lock_names[i])`.
+    leftovers: Vec<Vec<OsString>>,
+}
+
+/// One pass over `dir`: the fold candidates and, for each of `lock_names`, its `.broken.` leftovers. Best-effort: a
+/// listing error is `None`, as `dir.read_dir().ok()` was.
+fn scan_dir<D: DirHandle>(dir: &D, lock_names: &[OsString]) -> Option<DirScan> {
+    let prefixes: Vec<Vec<u8>> = lock_names.iter().map(|n| broken_prefix(n)).collect();
+    let mut heap: BinaryHeap<String> = BinaryHeap::with_capacity(FOLD_CANDIDATES + 1);
+    let mut leftovers: Vec<Vec<OsString>> = vec![Vec::new(); lock_names.len()];
+    dir.read_dir_each(&mut |entry| {
+        if let Some(name) = fold_candidate(&entry)
+            && (heap.len() < FOLD_CANDIDATES || heap.peek().is_some_and(|top| name < top.as_str()))
+        {
+            heap.push(name.to_string());
+            if heap.len() > FOLD_CANDIDATES {
+                heap.pop();
+            }
+        }
+        for (i, prefix) in prefixes.iter().enumerate() {
+            if entry.name.as_encoded_bytes().starts_with(prefix) {
+                leftovers[i].push(entry.name.clone());
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    })
+    .ok()?;
+    Some(DirScan { candidates: heap.into_sorted_vec(), leftovers })
+}
+
+/// Spec 4.2 step 2 (vi): whether `dir`, whose scan is `scan`, folds ASCII case. Read-only. It asks about at most
+/// `FOLD_CANDIDATES` entries, the smallest usable names bytewise (a listing's order is arbitrary, so it must not decide
+/// which): the variant swaps the case of the first ASCII letter. A variant that is itself an entry means two names
+/// differing by case coexist (`Some(false)`); both names resolving to one `Strong` identity is `Some(true)`; a variant
+/// that is not found is `Some(false)`; anything else (an error, a `Weak` or `Unavailable` identity) tries the next
+/// candidate, and with none left the answer is `None`: undecided, never a refusal.
+///
+/// Whether a variant is an entry is asked lazily (spec 6.4): the metadata outcome comes first, and a `NotFound` variant
+/// decides without a second read of the directory, since a listed name is always found.
+fn folds_ascii_case<D: DirHandle>(dir: &D, scan: &DirScan) -> Option<bool> {
+    let mut listed: Option<HashSet<OsString>> = None;
+    for name in &scan.candidates {
+        let variant = swap_first_letter(name);
+        // `Some(b)` decides; `None` goes on to the next candidate unless the variant is listed.
+        let outcome = (|| {
+            let entry = dir.metadata(OsStr::new(name)).ok()?;
+            let FileIdentity::Strong(id) = entry.identity else { return None };
+            match dir.metadata(OsStr::new(&variant)) {
+                Ok(found) => matches!(found.identity, FileIdentity::Strong(other) if other == id)
+                    .then_some(true),
+                Err(e) if e.source.kind() == ErrorKind::NotFound => Some(false),
+                Err(_) => None,
+            }
+        })();
+        if outcome == Some(false) {
+            return outcome;
+        }
+        if listed.is_none() {
+            // A failed second read leaves the answer undecided; an empty set could turn a coexisting pair into a
+            // false `Some(true)`.
+            listed = Some(listed_variants(dir, scan).ok()?);
+        }
+        if listed.as_ref().is_some_and(|set| set.contains(OsStr::new(&variant))) {
+            return Some(false);
+        }
+        if outcome.is_some() {
+            return outcome;
+        }
+    }
+    None
+}
+
+/// The second read of the fold scan: which of the candidates' variants are entries. It stops once every variant is
+/// found; an absent one cannot be known absent before the stream ends.
+fn listed_variants<D: DirHandle>(dir: &D, scan: &DirScan) -> flux_fs::Result<HashSet<OsString>> {
+    let wanted: HashSet<OsString> =
+        scan.candidates.iter().map(|n| OsString::from(swap_first_letter(n))).collect();
+    let mut found: HashSet<OsString> = HashSet::new();
+    dir.read_dir_each(&mut |entry| {
+        if wanted.contains(&entry.name) {
+            found.insert(entry.name);
+            if found.len() == wanted.len() {
+                return Ok(ControlFlow::Break(()));
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    })?;
+    Ok(found)
+}
+
+/// The slice implementation `folds_ascii_case` replaced, kept as the test oracle (the old function is the definition
+/// of correct).
+///
 /// Spec 4.2 step 2 (vi): whether `dir`, whose listing is `entries`, folds ASCII case. Read-only. It asks about at most
 /// `FOLD_CANDIDATES` entries, the smallest usable names bytewise (a listing's order is arbitrary, so it must not decide
 /// which): the variant swaps the case of the first ASCII letter. A variant that is itself an entry means two names
 /// differing by case coexist (`Some(false)`); both names resolving to one `Strong` identity is `Some(true)`; a variant
 /// that is not found is `Some(false)`; anything else (an error, a `Weak` or `Unavailable` identity) tries the next
 /// candidate, and with none left the answer is `None`: undecided, never a refusal.
-fn folds_ascii_case<D: DirHandle>(dir: &D, entries: &[DirEntry]) -> Option<bool> {
+#[cfg(test)]
+fn folds_ascii_case_of_slice<D: DirHandle>(dir: &D, entries: &[DirEntry]) -> Option<bool> {
     // A bounded max-heap keeps the smallest names without sorting the listing.
     let mut heap: BinaryHeap<&str> = BinaryHeap::with_capacity(FOLD_CANDIDATES + 1);
     for name in entries.iter().filter_map(fold_candidate) {
@@ -245,8 +346,17 @@ impl<'p, F: DestinationRoot> MultiPlace<'p, F> {
             }
             return Ok(());
         };
-        // One listing for every leftover scan; the scan is best-effort, as `dry_lock`'s.
-        let listing = dest.read_dir().ok();
+        // One pass for the fold candidates and every leftover scan; best-effort, as `dry_lock`'s.
+        let lock_names: Vec<OsString> = self
+            .roots
+            .iter()
+            .map(|root| {
+                let mut lock_name = root.name.clone();
+                lock_name.push(".flux-lock");
+                lock_name
+            })
+            .collect();
+        let listing = scan_dir(dest, &lock_names);
         // The fold-probe's answer, asked for at the first name with an ASCII-case twin before it.
         let mut folds: Option<Option<bool>> = None;
         let now = wall_time_ns();
@@ -280,7 +390,7 @@ impl<'p, F: DestinationRoot> MultiPlace<'p, F> {
             // A name whose twin is before it is the same lock file on a directory that folds ASCII case, as the real
             // `take` meets the first lock's file before it classifies anything.
             if let Some(t) = twins[i]
-                && *folds.get_or_insert_with(|| self.dry_fold(listing.as_deref())) == Some(true)
+                && *folds.get_or_insert_with(|| self.dry_fold(listing.as_ref())) == Some(true)
             {
                 return Err(self.twin_collision(i, t));
             }
@@ -327,11 +437,13 @@ impl<'p, F: DestinationRoot> MultiPlace<'p, F> {
             warnings.push(RunWarning::DryRunPrefixLocks { names: recorded });
             dry.owner_liveness = true;
         }
-        if let Some(entries) = &listing {
-            for root in &self.roots {
-                let mut lock_name = root.name.clone();
-                lock_name.push(".flux-lock");
-                broken_leftovers(entries, &lock_name, warnings);
+        if let Some(scan) = &listing {
+            for names in &scan.leftovers {
+                for name in names {
+                    warnings.push(RunWarning::DryRunBrokenLeftover {
+                        name: name.to_string_lossy().into_owned(),
+                    });
+                }
             }
         }
         self.check_targets_in(dest)
@@ -366,21 +478,21 @@ impl<'p, F: DestinationRoot> MultiPlace<'p, F> {
     /// DEST absent, from its parent's, read once; with DEST present but nothing in its listing to probe with (empty,
     /// unusable or failed), from its parent only if both are `Strong` on one volume: an existing DEST can be a mount
     /// point or carry its own case flag, and a decided answer from the wrong directory is a favourable guess.
-    fn dry_fold(&self, listing: Option<&[DirEntry]>) -> Option<bool> {
+    fn dry_fold(&self, listing: Option<&DirScan>) -> Option<bool> {
         let holder = self.tree.holder;
         let Some(dest) = self.tree.dest.as_ref() else {
-            return folds_ascii_case(holder, &holder.read_dir().ok()?);
+            return folds_ascii_case(holder, &scan_dir(holder, &[])?);
         };
-        if let Some(entries) = listing
-            && entries.iter().any(|e| fold_candidate(e).is_some())
+        if let Some(scan) = listing
+            && !scan.candidates.is_empty()
         {
-            return folds_ascii_case(dest, entries);
+            return folds_ascii_case(dest, scan);
         }
         // A filesystem root is its own holder: no parent.
         self.tree.name.as_ref()?;
         match (dest.identity().ok()?, holder.identity().ok()?) {
             (FileIdentity::Strong(d), FileIdentity::Strong(p)) if d.volume == p.volume => {
-                folds_ascii_case(holder, &holder.read_dir().ok()?)
+                folds_ascii_case(holder, &scan_dir(holder, &[])?)
             }
             _ => None,
         }
@@ -540,9 +652,10 @@ impl<F: DestinationRoot> Place<F::Dir> for MultiPlace<'_, F> {
         &self,
         priors: &[PriorOp],
         locked: &Locked<'_, F::Dir>,
+        scratch: Option<&ScratchSpace<'_>>,
         warnings: &mut Vec<RunWarning>,
     ) -> Result<Vec<String>, Fault> {
-        self.tree.sweep(priors, locked, warnings)
+        self.tree.sweep(priors, locked, scratch, warnings)
     }
 
     fn remove(&self, id: &str) -> Result<(), (PathBuf, FsError)> {
@@ -732,13 +845,26 @@ pub fn trees<F: DestinationRoot>(
             return ended_early(run);
         }
     };
+    // Created before any walk so it outlives them all; placed under the lock (or at once, for a dry run).
+    let scratch = ScratchSpace::unplaced(Thresholds::default(), cfg.scratch_dir.clone());
+    // A real copy opens an explicit `--scratch-dir` once, here, before DEST or the lock is touched; a dry run opens it
+    // at its first spill.
+    if !cfg.dry_run
+        && let Some(dir) = scratch.explicit()
+    {
+        match crate::scratch::open_explicit(fs, dir) {
+            Ok(opened) => scratch.place(opened, dir.to_path_buf()),
+            Err(e) => return aborted(run, out, CopyError::at(CopyStep::Resolve, e)),
+        }
+    }
     let mut plans = Vec::with_capacity(specs.len());
-    let mut inputs: Vec<RootInput<'_, F>> = Vec::with_capacity(specs.len());
+    let mut inputs: Vec<RootInput<'_, '_, F>> = Vec::with_capacity(specs.len());
     for spec in &specs {
         let target = dst_root.join(&spec.name);
         let (kind, identity) = match spec.kind {
             SourceKind::Folder => {
-                match prepare_source(fs, &spec.src, &target, MountPolicy::of(&opts)) {
+                match prepare_source(fs, &spec.src, &target, MountPolicy::of(&opts), Some(&scratch))
+                {
                     Ok(mut source) => {
                         source.events.set_selection(&opts.selection);
                         let identity = source.identity;
@@ -863,7 +989,9 @@ pub fn trees<F: DestinationRoot>(
         prefix: RefCell::new(None),
     };
     if cfg.dry_run {
-        return dry_trees(fs, run, out, place, &site, anchor, cfg, &opts, inputs, on_report);
+        return dry_trees(
+            fs, run, out, place, &site, anchor, &scratch, cfg, &opts, inputs, on_report,
+        );
     }
     let mut done: Vec<RootDone> = Vec::new();
     let run = drive(
@@ -875,6 +1003,7 @@ pub fn trees<F: DestinationRoot>(
         cfg,
         &opts,
         checkpoint_policy(cfg, opts.durability),
+        &scratch,
         &first.0,
         first.1,
         out,
@@ -934,25 +1063,40 @@ fn root_reports(plans: &[RootPlan], done: Vec<RootDone>, copy_ran: bool) -> Vec<
 /// pre-flight and containment warnings.
 // One input per piece of the run, as `dry_tree`'s.
 #[allow(clippy::too_many_arguments)]
-fn dry_trees<F: DestinationRoot>(
-    fs: &F,
+fn dry_trees<'h, F: DestinationRoot>(
+    fs: &'h F,
     mut run: Run<Result<TreeOutcome, TreeAbort>>,
     mut out: TreeOutcome,
     place: MultiPlace<'_, F>,
     site: &LockSite<'_, F::Dir>,
     anchor: FileIdentity,
+    scratch: &ScratchSpace<'h>,
     cfg: &RunConfig,
     opts: &CopyOptions,
-    inputs: Vec<RootInput<'_, F>>,
+    inputs: Vec<RootInput<'_, '_, F>>,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> MultiRun {
+    // A dry run holds no workspace: its scratch goes to the temporary directory, looked up only if a directory
+    // actually spills (spec 6.1).
+    let scratch_root = cfg.dry_temp_root.clone().unwrap_or_else(std::env::temp_dir);
+    let explicit = cfg.scratch_dir.clone();
+    scratch.place_deferred(move || temporary_home(fs, explicit.as_deref(), &scratch_root));
     let (dest_shown, operations_shown, absent) =
         (place.tree.dest_shown.clone(), place.tree.operations_shown(), place.tree.dest.is_none());
     let mut restart_preview = |priors: &[PriorOp], warnings: &mut Vec<RunWarning>| {
         if absent {
-            DryPrior::Restart { superseded: Vec::new(), partials_found: Vec::new(), states: 0 }
+            Ok(DryPrior::Restart { superseded: Vec::new(), partials_found: Vec::new(), states: 0 })
         } else {
-            dry_restart(fs, &dest_shown, &operations_shown, priors, warnings, &mut *on_report)
+            dry_restart(
+                fs,
+                &dest_shown,
+                &operations_shown,
+                priors,
+                Some(scratch),
+                warnings,
+                &mut *on_report,
+            )
+            .map_err(|e| failed(RunStep::State, &operations_shown, e))
         }
     };
     // Spec 4.6: a dry `--resume` walks against a repaired copy of the prior's store; the copy and the directory holding
@@ -1042,6 +1186,7 @@ fn dry_trees<F: DestinationRoot>(
         None => RootsDest::Planned(anchor),
     };
     let (done, walked) = copy_roots_at(&cx, dest, false, inputs, &mut out, on_report);
+    scratch.close();
     // Cut 12: the index file and its private directory go with the slot.
     if let Some(slot) = hardlink_slot {
         let failure = slot.failure();
@@ -1439,6 +1584,7 @@ mod trees_tests {
             dry_run: false,
             dry_temp_root: None,
             progress: None,
+            scratch_dir: None,
         }
     }
 
@@ -3472,8 +3618,9 @@ mod trees_tests {
             [RootStatus::Completed, RootStatus::Failed, RootStatus::NotStarted]
         );
 
-        // T12b: a source file of the second root that cannot be read (`read_dir` is made before the lock, in
-        // `prepare_source`, so it cannot fail mid-plan) is a counted failure, and the third root goes on.
+        // T12b: a source file of the second root that cannot be read (the root's listing is made when its copy begins,
+        // and a dry run starts it when its copy begins too, so a file's metadata is the failure left mid-plan) is a
+        // counted failure, and the third root goes on.
         let reference = dest_only();
         dry_names(&reference, &["a", "b", "f"]);
         let n = nth_of(&reference, "metadata", "/src/b/k");
@@ -4218,6 +4365,215 @@ mod trees_tests {
         ok(&real);
     }
 
+    /// `/p/dest` holding `names`, created with folding off (as `case_dest` does), each entry given identity mode `mode`
+    /// (0 the fake's default `Strong`, 1 `Unavailable`, 2 `Weak`), then folding set to `fold`.
+    fn scan_fixture(names: &[String], fold: bool, mode: u8) -> FaultFs {
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let fs = case_dest(false, &refs);
+        for (i, n) in names.iter().enumerate() {
+            let path = format!("/p/dest/{n}");
+            match mode {
+                1 => fs.set_identity(path, FileIdentity::Unavailable),
+                2 => fs.set_identity(
+                    path,
+                    FileIdentity::Weak(ObjectId { volume: 7, index: 5_000 + i as u128 }),
+                ),
+                _ => {}
+            }
+        }
+        fs.set_case_insensitive(fold);
+        fs
+    }
+
+    /// The new scan and the old slice function, on the same directory state.
+    fn both_answers(fs: &FaultFs) -> (Option<bool>, Option<bool>) {
+        let dir = fs.destination_root(Path::new("/p/dest")).unwrap();
+        let new = folds_ascii_case(&dir, &scan_dir(&dir, &[]).unwrap());
+        let old = folds_ascii_case_of_slice(&dir, &dir.read_dir().unwrap());
+        (new, old)
+    }
+
+    fn read_dir_calls(fs: &FaultFs) -> usize {
+        fs.calls().iter().filter(|c| c.starts_with("read_dir(")).count()
+    }
+
+    #[test]
+    fn the_lazy_fold_scan_agrees_with_the_slice_oracle_exhaustively() {
+        let universe = ["a", "A", "b", "B", "ab", "Ab", "1", "_", "c", "C"];
+        let mut compared = 0usize;
+        for subset in 0u32..1 << universe.len() {
+            let names: Vec<String> = universe
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| subset >> i & 1 == 1)
+                .map(|(_, n)| n.to_string())
+                .collect();
+            for fold in [false, true] {
+                for mode in 0u8..3 {
+                    let fs = scan_fixture(&names, fold, mode);
+                    let (new, old) = both_answers(&fs);
+                    assert_eq!(new, old, "names {names:?} fold {fold} mode {mode}");
+                    compared += 1;
+                }
+            }
+        }
+        assert_eq!(compared, 6_144, "directories compared");
+    }
+
+    #[test]
+    fn the_lazy_fold_scan_agrees_with_the_slice_oracle_on_larger_directories() {
+        const SEED: u64 = 0x5eed_0123_4567_89ab;
+        let mut state = SEED;
+        let mut next = |bound: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % bound
+        };
+        let mut compared = 0usize;
+        for case in 0..3_000 {
+            let count = next(41);
+            let mut names: Vec<String> = Vec::new();
+            for _ in 0..count {
+                let family = ["a", "b", "c", "d"][next(4) as usize];
+                let family = if next(2) == 0 { family.to_string() } else { family.to_uppercase() };
+                let name = format!("{family}{}", ["", "1", "2", "x"][next(4) as usize]);
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            let fold = next(2) == 1;
+            let mode = next(3) as u8;
+            let fs = scan_fixture(&names, fold, mode);
+            let (new, old) = both_answers(&fs);
+            assert_eq!(
+                new, old,
+                "seed {SEED:#x} case {case} names {names:?} fold {fold} mode {mode}"
+            );
+            compared += 1;
+        }
+        assert_eq!(compared, 3_000);
+    }
+
+    #[test]
+    fn a_directory_whose_small_names_have_no_twin_still_finds_the_twins_of_the_candidates() {
+        let mut names = Vec::new();
+        for i in 1..=8 {
+            names.push(format!("B{i}"));
+            names.push(format!("b{i}"));
+            names.push(format!("a{i}"));
+        }
+        let fs = scan_fixture(&names, false, 0);
+        let (new, old) = both_answers(&fs);
+        assert_eq!(old, Some(false));
+        assert_eq!(new, old);
+    }
+
+    #[test]
+    fn the_fold_scan_keeps_a_bounded_state() {
+        let names: Vec<String> = (0..10_000).map(|i| format!("f{i:05}")).collect();
+        let fs = scan_fixture(&names, false, 0);
+        let dir = fs.destination_root(Path::new("/p/dest")).unwrap();
+        let scan = scan_dir(&dir, &[]).unwrap();
+        assert!(scan.candidates.len() <= FOLD_CANDIDATES, "{}", scan.candidates.len());
+        assert_eq!(scan.candidates.len(), FOLD_CANDIDATES);
+        assert_eq!(scan.candidates[0], "f00000");
+    }
+
+    #[test]
+    fn a_directory_with_no_case_twin_is_read_once() {
+        let names: Vec<String> = ["a", "b", "c"].map(String::from).to_vec();
+        let fs = scan_fixture(&names, false, 0);
+        let dir = fs.destination_root(Path::new("/p/dest")).unwrap();
+        let base = read_dir_calls(&fs);
+        let scan = scan_dir(&dir, &[]).unwrap();
+        assert_eq!(folds_ascii_case(&dir, &scan), Some(false));
+        assert_eq!(read_dir_calls(&fs) - base, 1, "{:?}", fs.calls());
+    }
+
+    #[test]
+    fn a_directory_that_folds_is_read_twice_and_no_more() {
+        let names: Vec<String> = ["a", "b", "c"].map(String::from).to_vec();
+        let fs = scan_fixture(&names, true, 0);
+        let dir = fs.destination_root(Path::new("/p/dest")).unwrap();
+        let base = read_dir_calls(&fs);
+        let scan = scan_dir(&dir, &[]).unwrap();
+        assert_eq!(folds_ascii_case(&dir, &scan), Some(true));
+        assert_eq!(read_dir_calls(&fs) - base, 2, "{:?}", fs.calls());
+    }
+
+    #[test]
+    fn the_lazy_second_read_is_made_once_whatever_the_number_of_candidates() {
+        // `Unavailable` identities decide nothing, so every candidate consults the listed set: it is read once.
+        let names: Vec<String> = ["a", "b", "c", "d", "e"].map(String::from).to_vec();
+        let fs = scan_fixture(&names, true, 1);
+        let dir = fs.destination_root(Path::new("/p/dest")).unwrap();
+        let base = read_dir_calls(&fs);
+        let scan = scan_dir(&dir, &[]).unwrap();
+        assert_eq!(folds_ascii_case(&dir, &scan), None);
+        assert_eq!(read_dir_calls(&fs) - base, 2, "{:?}", fs.calls());
+    }
+
+    #[test]
+    fn a_failed_second_read_leaves_the_fold_undecided() {
+        // `a` and `A` coexist on a case-sensitive directory but share one `Strong` identity (hard links): the metadata
+        // part alone says `Some(true)`, and only the listed variant turns it into `Some(false)`. An empty set from a
+        // failed read 2 would give the false `Some(true)`.
+        let names: Vec<String> = ["a", "A"].map(String::from).to_vec();
+        let fixture = || {
+            let fs = scan_fixture(&names, false, 0);
+            let same = FileIdentity::Strong(ObjectId { volume: 3, index: 4_242 });
+            fs.set_identity("/p/dest/a", same);
+            fs.set_identity("/p/dest/A", same);
+            fs
+        };
+        let fs = fixture();
+        let dir = fs.destination_root(Path::new("/p/dest")).unwrap();
+        let oracle = folds_ascii_case_of_slice(&dir, &dir.read_dir().unwrap());
+        assert_eq!(oracle, Some(false));
+        let base = read_dir_calls(&fs);
+        let scan = scan_dir(&dir, &[]).unwrap();
+        assert_eq!(folds_ascii_case(&dir, &scan), oracle);
+        assert_eq!(read_dir_calls(&fs) - base, 2, "read 2 is reached: {:?}", fs.calls());
+
+        let fs = fixture();
+        let dir = fs.destination_root(Path::new("/p/dest")).unwrap();
+        // The first `read_dir` is the scan; the second is the lazy read.
+        fs.fail_nth("read_dir", 2, Code::IoError, ErrorKind::PermissionDenied);
+        let scan = scan_dir(&dir, &[]).expect("read 1 succeeds");
+        assert_eq!(folds_ascii_case(&dir, &scan), None);
+    }
+
+    #[test]
+    fn leftovers_are_kept_per_root_in_stream_order() {
+        use crate::run::dry_prior::broken_leftovers;
+        let mut names: Vec<String> =
+            ["a.flux-lock.broken.2", "b.flux-lock.broken.1", "a.flux-lock.broken.1", "c.flux-lock"]
+                .map(String::from)
+                .to_vec();
+        names.extend((0..5_000).map(|i| format!("u{i:05}")));
+        let fs = scan_fixture(&names, false, 0);
+        let dir = fs.destination_root(Path::new("/p/dest")).unwrap();
+        let locks: Vec<OsString> =
+            ["a", "b", "c"].map(|r| OsString::from(format!("{r}.flux-lock"))).to_vec();
+        let scan = scan_dir(&dir, &locks).unwrap();
+        let listing = dir.read_dir().unwrap();
+        for (lock, kept) in locks.iter().zip(&scan.leftovers) {
+            let mut w = Vec::new();
+            broken_leftovers(&listing, lock, &mut w);
+            let want: Vec<String> = w
+                .into_iter()
+                .map(|w| match w {
+                    RunWarning::DryRunBrokenLeftover { name } => name,
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            let got: Vec<String> = kept.iter().map(|n| n.to_string_lossy().into_owned()).collect();
+            assert_eq!(got, want, "{lock:?}");
+        }
+        assert_eq!(scan.leftovers.iter().map(Vec::len).sum::<usize>(), 3);
+    }
+
     #[test]
     fn the_fold_probe_decides_from_the_listing_of_a_directory() {
         // (1) DEST absent: the parent's entry decides.
@@ -4225,7 +4581,8 @@ mod trees_tests {
         let (_, code) = dry_refuses_as_real(&build, &CASE_NAMES);
         assert_eq!(code, LockCode::DestinationNamespaceCollision);
         let (_, log) = dry_with_calls(&build, &CASE_NAMES);
-        assert_eq!(parent_listings(&log), 2, "{log:?}");
+        // the lazy second read of the fold scan (spec 6.4)
+        assert_eq!(parent_listings(&log), 3, "{log:?}");
         // (2) folding off: the plan goes on, as the real run does.
         let build = with_parent_entry(false, None);
         real_proceeds(&build, &CASE_NAMES);
@@ -4254,7 +4611,8 @@ mod trees_tests {
         let (_, code) = dry_refuses_as_real(&build, &CASE_NAMES);
         assert_eq!(code, LockCode::DestinationNamespaceCollision);
         let (_, log) = dry_with_calls(&build, &CASE_NAMES);
-        assert_eq!(parent_listings(&log), 2, "{log:?}");
+        // the lazy second read of the fold scan (spec 6.4)
+        assert_eq!(parent_listings(&log), 3, "{log:?}");
         // (4b) the parent is on another volume: undecided (the real run refuses; the blind spot).
         let other_volume = || {
             let fs = with_parent_entry(true, Some(&["1", "2"]))();
@@ -4274,7 +4632,8 @@ mod trees_tests {
         let base = calls(&fs).len();
         let (dry, _) = dry_names(&fs, &CASE_NAMES);
         collides(&dry);
-        assert_eq!(parent_listings(&calls(&fs)[base..]), 2);
+        // the lazy second read of the fold scan (spec 6.4)
+        assert_eq!(parent_listings(&calls(&fs)[base..]), 3);
         let fs = build();
         fs.set_identity("/p", FileIdentity::Strong(ObjectId { volume: 99, index: 5 }));
         fs.fail_nth("read_dir", n, Code::IoError, ErrorKind::PermissionDenied);
@@ -4395,5 +4754,38 @@ mod trees_tests {
             &CASE_NAMES,
         );
         assert_eq!(code, LockCode::TargetLockUncertain);
+    }
+
+    #[test]
+    fn an_unlistable_second_root_stops_the_run_after_the_first_root() {
+        let fs = fake();
+        fs.fail_read_dir_of("/src/b", Code::PermissionDenied, ErrorKind::PermissionDenied);
+        let (r, _) = go(&fs, &["a", "b", "c"]);
+        assert!(r.run.stop.is_none(), "{:?}", r.run.stop);
+        assert_eq!(
+            statuses(&r),
+            [RootStatus::Completed, RootStatus::Failed, RootStatus::NotStarted]
+        );
+        assert!(
+            matches!(copy_of(&r), Err(a) if a.error.step == crate::copy::CopyStep::Source),
+            "{:?}",
+            copy_of(&r)
+        );
+    }
+
+    #[test]
+    fn several_sources_with_an_unusable_scratch_dir_stop_before_the_lock_and_touch_no_dest() {
+        let fs = fake();
+        let c = RunConfig { scratch_dir: Some(PathBuf::from("/nope")), ..cfg() };
+        let (r, got) = go_with(&fs, vec![spec("a"), spec("b")], &opts(), &c);
+        assert!(got.is_empty(), "{got:?}");
+        assert!(r.run.stop.is_none(), "{:?}", r.run.stop);
+        let Err(a) = copy_of(&r) else { panic!("the copy must abort") };
+        assert_eq!(a.error.step, CopyStep::Resolve);
+        assert!(a.error.cause.source.to_string().contains("/nope"), "{}", a.error.cause.source);
+        let log = calls(&fs);
+        assert!(!log.iter().any(|c| c.starts_with("create_lock(")), "{log:?}");
+        assert!(!fs.exists("/p/dest"), "DEST was not made");
+        assert!(!fs.exists(LOCK), "no lock file");
     }
 }

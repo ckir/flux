@@ -1069,6 +1069,15 @@ pub fn finish_retire<D: DirHandle>(operations: &D, name: &OsStr) -> flux_fs::Res
             Err(e) if e.source.kind() == ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
+        // A scratch file is normally nameless; the create-then-unlink fallback leaves `.flux-scratch-<hex>` if the
+        // process died between the two calls. Regular files with that prefix go; anything else is a stranger.
+        for entry in dir.read_dir()? {
+            if entry.file_type == flux_fs::FileType::File
+                && entry.name.to_str().is_some_and(|n| n.starts_with(".flux-scratch-"))
+            {
+                remove_if_present(&dir, &entry.name)?;
+            }
+        }
         // Closed before the directory is removed.
     }
     operations.remove_dir(name)
@@ -1591,6 +1600,58 @@ mod tests {
             assert!(fs.exists(format!("{path}/wal/{kept}")), "{kept} is a stranger");
         }
         assert!(!fs.exists(format!("{path}/{MANIFEST}")), "the flat known names still go first");
+    }
+
+    #[test]
+    fn retire_removes_a_scratch_crash_leftover() {
+        let (fs, d) = dest();
+        let ops = operations_dir(&d, Path::new("D")).unwrap();
+        let path = format!("/p/dest/.flux/operations/{}.removing", id(1));
+        fs.create_dir(Path::new(&path)).unwrap();
+        fs.write_file(format!("{path}/{MANIFEST}"), b"x");
+        fs.write_file(format!("{path}/.flux-scratch-00ab"), b"run bytes");
+        let removing = OsString::from(format!("{}.removing", id(1)));
+        finish_retire(&ops, &removing).unwrap();
+        assert!(!fs.exists(&path), "the leftover goes and so does the workspace");
+    }
+
+    #[test]
+    fn retire_keeps_a_stranger_beside_a_scratch_leftover() {
+        let (fs, d) = dest();
+        let ops = operations_dir(&d, Path::new("D")).unwrap();
+        let path = format!("/p/dest/.flux/operations/{}.removing", id(1));
+        fs.create_dir(Path::new(&path)).unwrap();
+        fs.write_file(format!("{path}/{MANIFEST}"), b"x");
+        fs.write_file(format!("{path}/.flux-scratch-00ab"), b"run bytes");
+        fs.write_file(format!("{path}/.flux-scratchy"), b"a stranger");
+        let removing = OsString::from(format!("{}.removing", id(1)));
+        let e = finish_retire(&ops, &removing).unwrap_err();
+        assert_eq!(e.source.kind(), ErrorKind::DirectoryNotEmpty);
+        assert!(!fs.exists(format!("{path}/.flux-scratch-00ab")), "the leftover is gone");
+        assert!(fs.exists(format!("{path}/.flux-scratchy")), "a stranger stays");
+        assert!(fs.exists(&path), "so the workspace stays");
+    }
+
+    #[test]
+    fn retire_keeps_a_symlink_and_a_directory_named_like_a_scratch_leftover() {
+        let (fs, d) = dest();
+        let ops = operations_dir(&d, Path::new("D")).unwrap();
+        let path = format!("/p/dest/.flux/operations/{}.removing", id(1));
+        fs.create_dir(Path::new(&path)).unwrap();
+        fs.write_file(format!("{path}/{MANIFEST}"), b"x");
+        fs.write_file(format!("{path}/.flux-scratch-link"), b"target");
+        fs.set_type(format!("{path}/.flux-scratch-link"), FileType::Symlink);
+        fs.create_dir(Path::new(&format!("{path}/.flux-scratch-dir"))).unwrap();
+        let removing = OsString::from(format!("{}.removing", id(1)));
+        let e = finish_retire(&ops, &removing).unwrap_err();
+        assert_eq!(e.source.kind(), ErrorKind::DirectoryNotEmpty);
+        for kept in [".flux-scratch-link", ".flux-scratch-dir"] {
+            assert!(
+                fs.exists(format!("{path}/{kept}")),
+                "{kept} is not a regular file: a stranger"
+            );
+        }
+        assert!(fs.exists(&path), "so the workspace stays");
     }
 
     #[test]

@@ -42,6 +42,7 @@ use crate::lock::site::NAME_LIMIT;
 use crate::lock::{LockCode, LockSite, Refusal, Released, check_capability};
 use crate::oplog::{self, Verb};
 use crate::prior::{check_control_plane, resumable_refusal};
+use crate::scratch::{ScratchSpace, Thresholds, temporary_home};
 use crate::state::{HARDLINK_INDEX, OpState, file_names_fit, identity_text, native_hex};
 use crate::tree::{
     RootIdentity, Shared, Source, TreeAbort, TreeFailure, TreeFailureCause, TreeOutcome,
@@ -54,7 +55,7 @@ use flux_fs::{
     LockCapability, OperationId, Outcome,
 };
 pub use multi::{MultiRun, RootReport, trees};
-use place::{FilePlace, Place, TreePlace, locate_tree};
+use place::{FilePlace, Place, TreePlace, locate_tree, place_scratch};
 pub(crate) use roots::plan_roots;
 pub use roots::{SourceKind, SourceSpec, source_cap};
 
@@ -102,6 +103,8 @@ pub struct RunConfig {
     pub dry_temp_root: Option<PathBuf>,
     /// The live counters a display samples; `None` outside the CLI's terminal case.
     pub progress: Option<std::sync::Arc<crate::progress::Progress>>,
+    /// `--scratch-dir`: where a bounded listing spills; `None` uses the spec 6.1 chain.
+    pub scratch_dir: Option<PathBuf>,
 }
 
 /// §101's heartbeat interval: 5 s.
@@ -123,6 +126,7 @@ impl std::fmt::Debug for RunConfig {
             .field("dry_run", &self.dry_run)
             .field("dry_temp_root", &self.dry_temp_root)
             .field("progress", &self.progress.is_some())
+            .field("scratch_dir", &self.scratch_dir)
             .finish()
     }
 }
@@ -311,6 +315,31 @@ pub(crate) fn tree_with<F: DestinationRoot>(
     on_report: &mut dyn FnMut(TreeFailure),
     policy: CheckpointPolicy,
 ) -> Run<Result<TreeOutcome, TreeAbort>> {
+    tree_with_thresholds(
+        fs,
+        src_root,
+        dst_root,
+        opts,
+        cfg,
+        on_report,
+        policy,
+        Thresholds::default(),
+    )
+}
+
+/// `tree_with` with the listing thresholds given: the test seam for a small spill (`RunConfig` is public, so no test
+/// field goes on it).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn tree_with_thresholds<F: DestinationRoot>(
+    fs: &F,
+    src_root: &Path,
+    dst_root: &Path,
+    opts: &CopyOptions,
+    cfg: &RunConfig,
+    on_report: &mut dyn FnMut(TreeFailure),
+    policy: CheckpointPolicy,
+    thresholds: Thresholds,
+) -> Run<Result<TreeOutcome, TreeAbort>> {
     let mut run = Run {
         copy: None,
         stop: None,
@@ -324,13 +353,30 @@ pub(crate) fn tree_with<F: DestinationRoot>(
         CopyOptions { operation_id: OperationId::new(cfg.operation_id.as_str()), ..opts.clone() };
     let mut out = TreeOutcome { progress: cfg.progress.clone(), ..TreeOutcome::default() };
     // B1: the source side, then DEST and the identity pre-flight, before anything is created.
-    let mut source = match prepare_source(fs, src_root, dst_root, MountPolicy::of(&opts)) {
-        Ok(s) => s,
-        Err(error) => {
-            run.copy = Some(Err(TreeAbort { error, outcome: out }));
-            return run;
+    // Created before the walk so it outlives it; placed under the lock (or at once, for a dry run).
+    let scratch = ScratchSpace::unplaced(thresholds, cfg.scratch_dir.clone());
+    // A real copy opens an explicit `--scratch-dir` once, here, before DEST or the lock is touched (opening creates
+    // nothing); a dry run opens it at its first spill.
+    if !cfg.dry_run
+        && let Some(dir) = scratch.explicit()
+    {
+        match crate::scratch::open_explicit(fs, dir) {
+            Ok(opened) => scratch.place(opened, dir.to_path_buf()),
+            Err(e) => {
+                let error = CopyError::at(CopyStep::Resolve, e);
+                run.copy = Some(Err(TreeAbort { error, outcome: out }));
+                return run;
+            }
         }
-    };
+    }
+    let mut source =
+        match prepare_source(fs, src_root, dst_root, MountPolicy::of(&opts), Some(&scratch)) {
+            Ok(s) => s,
+            Err(error) => {
+                run.copy = Some(Err(TreeAbort { error, outcome: out }));
+                return run;
+            }
+        };
     source.events.set_selection(&opts.selection);
     let located = match locate_tree(fs, src_root, dst_root, source.identity, opts.safety, &mut out)
     {
@@ -383,7 +429,9 @@ pub(crate) fn tree_with<F: DestinationRoot>(
     };
     // Cut 11a: a dry run plans the walk and touches nothing: no lock, no state, no claim store, no WAL, no finish.
     if cfg.dry_run {
-        return dry_tree(run, &mut place, &site, capability, source, cfg, &opts, on_report, out);
+        return dry_tree(
+            fs, run, &mut place, &site, capability, source, &scratch, cfg, &opts, on_report, out,
+        );
     }
     drive(
         fs,
@@ -394,6 +442,7 @@ pub(crate) fn tree_with<F: DestinationRoot>(
         cfg,
         &opts,
         policy,
+        &scratch,
         src_root,
         source.identity,
         out,
@@ -407,6 +456,15 @@ pub(crate) fn tree_with<F: DestinationRoot>(
         },
         |_, _| {},
     )
+}
+
+/// Closes the scratch space when `drive` returns by any path.
+struct CloseOnDrop<'a, 'h>(&'a ScratchSpace<'h>);
+
+impl Drop for CloseOnDrop<'_, '_> {
+    fn drop(&mut self) {
+        self.0.close();
+    }
 }
 
 /// A place that is a tree's DEST, possibly with more around it (the prefix locks of several roots): what `drive` reads
@@ -440,6 +498,7 @@ fn drive<'p, F, P>(
     cfg: &RunConfig,
     opts: &CopyOptions,
     policy: CheckpointPolicy,
+    scratch: &ScratchSpace<'_>,
     src_root: &Path,
     src_identity: FileIdentity,
     mut out: TreeOutcome,
@@ -456,8 +515,20 @@ where
     F: DestinationRoot + 'p,
     P: TreeAt<'p, F>,
 {
+    // Every exit closes the scratch (a `--restart` sweep inside `open_operation` may have placed it before a later
+    // step failed), releasing the workspace handle it holds. The explicit close after the walk stays: it must come
+    // before `finish`.
+    let _closes_scratch = CloseOnDrop(scratch);
     // Steps 3-5 (and `--restart`): the lock, then this operation's state and the record naming it.
-    let locked = match open_operation(site, capability, &mut *place, cfg, opts, &mut run.warnings) {
+    let locked = match open_operation(
+        site,
+        capability,
+        &mut *place,
+        cfg,
+        opts,
+        Some(scratch),
+        &mut run.warnings,
+    ) {
         Ok(l) => l,
         Err(e) => {
             // `create` may have taken locks of its own before a later step of the opening failed.
@@ -474,6 +545,11 @@ where
     // Cut 12: the hardlink slot (a handle on the workspace; the index file is created on first use) and the second
     // handle on DEST the anchor's directory is opened from (plan rulings 8, 9).
     let workspace_id = locked.state.operation_id.clone();
+    // The scratch goes in this operation's workspace (a `--restart` sweep inside `open_operation` already placed it;
+    // this is idempotent). A failure stops the run before the walk.
+    let scratch_failed = place_scratch(fs, place.tree_place(), &workspace_id, scratch)
+        .err()
+        .map(|e| CopyError::at(CopyStep::Resolve, e));
     let (hardlink_slot, anchor_root, mut slot_warned) = if opts.hardlinks
         == flux_fs::Hardlinks::Copy
     {
@@ -564,10 +640,12 @@ where
         &guard,
         &beat,
     );
-    let mut stopped_early = None;
+    let mut stopped_early = scratch_failed;
     match opened {
         Ok(c) => *ckpt.borrow_mut() = c,
-        Err(error) => stopped_early = Some(error),
+        Err(error) => {
+            stopped_early.get_or_insert(error);
+        }
     }
     // The store stays open past the walk, for the final sync; it is dropped before `finish` removes the file.
     let claims = place.tree_place_mut().claims.take().map(std::cell::RefCell::new);
@@ -604,6 +682,9 @@ where
         };
         walk(&cx, &mut *place, &mut out, &mut report)
     };
+    // No scratch handle may be open when `finish` removes the workspace (Windows refuses to remove a directory holding
+    // a delete-pending file), and the WAL thread ends after this.
+    scratch.close();
     let mut result = match walked {
         Ok(()) => Ok(out),
         Err(error) => Err(TreeAbort { error, outcome: out }),
@@ -798,14 +879,14 @@ pub(crate) fn file_with<F: DestinationRoot>(
         return dry_file(run, fs, &place, &site, capability, src, cfg, &opts);
     }
     // Steps 3-5.
-    let locked = match open_operation(&site, capability, &mut place, cfg, &opts, &mut run.warnings)
-    {
-        Ok(l) => l,
-        Err(e) => {
-            run.stop = Some(e);
-            return run;
-        }
-    };
+    let locked =
+        match open_operation(&site, capability, &mut place, cfg, &opts, None, &mut run.warnings) {
+            Ok(l) => l,
+            Err(e) => {
+                run.stop = Some(e);
+                return run;
+            }
+        };
     run.resumed = locked.resumed.clone();
     let opts = CopyOptions { operation_id: OperationId::new(&locked.state.operation_id), ..opts };
     // The one file's size is the expected total, unless a resume makes the figure unreliable or the file is empty.
@@ -1306,6 +1387,11 @@ fn dry_prior_notes(scan: &crate::prior::Scan, warnings: &mut Vec<RunWarning>) ->
 type ResumePreview<'a> = dyn FnMut(&crate::prior::PriorOp, &mut DryRun, &mut Vec<RunWarning>) -> Result<DryPrior, RunError>
     + 'a;
 
+/// Spec 3.5: the dry `--restart` preview of the superseded priors: its `DryPrior`, or the failure of the sweep's walk
+/// (a fatal scratch error), which ends the preview.
+type RestartPreview<'a> =
+    dyn FnMut(&[crate::prior::PriorOp], &mut Vec<RunWarning>) -> Result<DryPrior, RunError> + 'a;
+
 /// Cut 18: what a place with more to create than the workspace previews where the real run creates it.
 type CreatePreview<'a> = dyn FnMut(&mut DryRun, &mut Vec<RunWarning>) -> Result<(), RunError> + 'a;
 
@@ -1329,7 +1415,7 @@ fn dry_start<D: DirHandle, P: Place<D>>(
     capability: LockCapability,
     place: &P,
     cfg: &RunConfig,
-    restart_preview: &mut dyn FnMut(&[crate::prior::PriorOp], &mut Vec<RunWarning>) -> DryPrior,
+    restart_preview: &mut RestartPreview<'_>,
     resume_preview: &mut ResumePreview<'_>,
     create_preview: &mut CreatePreview<'_>,
     warnings: &mut Vec<RunWarning>,
@@ -1370,7 +1456,11 @@ fn dry_start<D: DirHandle, P: Place<D>>(
         if let Err(e) = create_preview(&mut dry, warnings) {
             return DryStart::Stop(e, dry);
         }
-        dry.prior = Some(restart_preview(&scan.resumable, warnings));
+        match restart_preview(&scan.resumable, warnings) {
+            Ok(p) => dry.prior = Some(p),
+            // A fatal walk error in the preview: the listing is incomplete, so nothing is reported as superseded.
+            Err(e) => return DryStart::Stop(e, dry),
+        }
     } else if scan.resumable.is_empty() {
         if let Err(e) = create_preview(&mut dry, warnings) {
             return DryStart::Stop(e, dry);
@@ -1423,26 +1513,42 @@ pub(crate) fn dry_hardlink_slot<F: DestinationRoot>(
 /// Cut 11a: the dry branch of `tree_with`. Reads DEST's prior operations for the notes, then plans the walk over a
 /// claim store that stores nothing; the lock, the workspace, the WAL and `finish` are never reached.
 #[allow(clippy::too_many_arguments)]
-fn dry_tree<F: DestinationRoot>(
+fn dry_tree<'h, F: DestinationRoot>(
+    fs: &'h F,
     mut run: Run<Result<TreeOutcome, TreeAbort>>,
     place: &mut TreePlace<'_, F>,
     site: &LockSite<'_, F::Dir>,
     capability: LockCapability,
-    source: Source<'_, F>,
+    source: Source<'_, '_, F>,
+    scratch: &ScratchSpace<'h>,
     cfg: &RunConfig,
     opts: &CopyOptions,
     on_report: &mut dyn FnMut(TreeFailure),
     mut out: TreeOutcome,
 ) -> Run<Result<TreeOutcome, TreeAbort>> {
+    // A dry run holds no workspace: its scratch goes to the temporary directory, looked up only if a directory
+    // actually spills (spec 6.1: small runs never touch the location).
+    let scratch_root = cfg.dry_temp_root.clone().unwrap_or_else(std::env::temp_dir);
+    let explicit = cfg.scratch_dir.clone();
+    scratch.place_deferred(move || temporary_home(fs, explicit.as_deref(), &scratch_root));
     // Spec 3.5: DEST absent means nothing to supersede and no walk.
     let (dest_shown, operations_shown, absent_dest) =
         (place.dest_shown.clone(), place.operations_shown(), place.dest.is_none());
     let place_fs = place.fs;
     let mut restart_preview = |priors: &[crate::prior::PriorOp], warnings: &mut Vec<RunWarning>| {
         if absent_dest {
-            DryPrior::Restart { superseded: Vec::new(), partials_found: Vec::new(), states: 0 }
+            Ok(DryPrior::Restart { superseded: Vec::new(), partials_found: Vec::new(), states: 0 })
         } else {
-            dry_restart(place_fs, &dest_shown, &operations_shown, priors, warnings, &mut *on_report)
+            dry_restart(
+                place_fs,
+                &dest_shown,
+                &operations_shown,
+                priors,
+                Some(scratch),
+                warnings,
+                &mut *on_report,
+            )
+            .map_err(|e| session::failed(RunStep::State, &operations_shown, e))
         }
     };
     // Spec 3.4: a dry `--resume` of one resumable prior walks against a repaired copy of its store; the copy and the
@@ -1544,6 +1650,7 @@ fn dry_tree<F: DestinationRoot>(
             Err(CopyError::at(CopyStep::Resolve, e))
         }
     };
+    scratch.close();
     // Cut 12: the index file and its private directory go with the slot.
     if let Some(slot) = hardlink_slot {
         let failure = slot.failure();
@@ -1594,14 +1701,14 @@ fn dry_file<F: DestinationRoot>(
                 partials_found.push(PathBuf::from(name));
             }
         }
-        DryPrior::Restart {
+        Ok(DryPrior::Restart {
             superseded: priors
                 .iter()
                 .map(|p| (p.state.operation_id.clone(), p.state.state))
                 .collect(),
             partials_found,
             states: priors.len() as u64,
-        }
+        })
     };
     let mut prior_id: Option<String> = None;
     let mut resume_preview =

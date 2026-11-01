@@ -1,0 +1,112 @@
+name: Build PR Binary
+
+# Builds the `flux` binary from a pull request's head commit and attaches it to the run as an
+# artifact, for trying a change on a machine that does not have the toolchain.
+#
+# Manual only: `gh workflow run build-pr-binary.yml -f pr=148`, or Actions -> Build PR Binary ->
+# Run workflow. GitHub lists a `workflow_dispatch` workflow only once the file exists on the default
+# branch, so this does nothing until it has been merged to main.
+#
+# The same five targets, the same toolchain and the same command as release.yml, so the artifact is
+# the binary a release of that commit would ship (a release build, `--locked`).
+#
+# It builds `refs/pull/<n>/head`, the PR's own tip, not the merge with main: the binary is what the
+# author wrote, and a PR with a conflict still builds. The artifact name carries the short sha, so
+# two builds of one PR before and after a push cannot be mixed up.
+#
+# A pull request from a fork runs the fork's build scripts on a GitHub runner. The job has read-only
+# repository access and uses no secrets, and only someone with write access can start it.
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Pull request number, e.g. 148"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            cross: true
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    steps:
+      # The input goes into a ref name, so it must be digits and nothing else.
+      - name: Check the pull request number
+        shell: bash
+        env:
+          PR: ${{ inputs.pr }}
+        run: |
+          case "$PR" in
+            ''|*[!0-9]*) echo "::error::pr must be a pull request number, got '$PR'"; exit 1 ;;
+          esac
+
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/pull/${{ inputs.pr }}/head
+
+      - name: Name the build
+        id: build
+        shell: bash
+        run: |
+          sha="$(git rev-parse --short=7 HEAD)"
+          echo "name=flux-pr${{ inputs.pr }}-${sha}-${{ matrix.target }}" >> "$GITHUB_OUTPUT"
+          echo "Building pull request ${{ inputs.pr }} at ${sha}"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cross linker
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} --package flux-cli --bin flux
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          tar -czf "${{ steps.build.outputs.name }}.tar.gz" -C "target/${{ matrix.target }}/release" flux
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/flux.exe" -DestinationPath "${{ steps.build.outputs.name }}.zip"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.build.outputs.name }}
+          path: ${{ steps.build.outputs.name }}.*
+          if-no-files-found: error
+          retention-days: 14

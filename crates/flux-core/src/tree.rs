@@ -21,8 +21,9 @@ use crate::dry_run::{PlannedAction, PlannedEntry, PlannedObject, SkipReason};
 use crate::hardlinks::{Candidacy, anchor_parent, candidacy, shown, strong};
 use crate::names::{NameIndex, Resolved};
 use crate::oplog::{self, Verb};
+use crate::scratch::{ScratchSpace, Thresholds, temporary_home};
 use crate::state::{FLUX_DIR, RESERVED_DIRS, identity_text, native_hex};
-use crate::walk::{DEFAULT_MAX_DEPTH, MountPolicy, Walk, WalkEvent, WalkOptions, walk_with};
+use crate::walk::{DEFAULT_MAX_DEPTH, MountPolicy, Walk, WalkEvent, WalkOptions, walk_unstarted};
 use flux_fs::{
     ClaimKey, ClaimOutcome, ClaimRecord, ClaimStatus, ClaimStore, Code, CopyOptions,
     DestinationRoot, DirHandle, Durability, ExistingPolicy, FileIdentity, FileSystem, FileType,
@@ -465,23 +466,26 @@ pub fn copy_tree<F: DestinationRoot>(
 }
 
 /// The source side of a tree copy, checked before anything at the destination is touched.
-pub(crate) struct Source<'a, F: FileSystem> {
-    pub(crate) events: Walk<'a, F>,
+pub(crate) struct Source<'a, 'h, F: FileSystem> {
+    pub(crate) events: Walk<'a, 'h, F>,
     pub(crate) identity: FileIdentity,
 }
 
 /// Steps 1-2 of `copy_tree`, which touch no destination: the source root and its identity, and the lexical floor. The
 /// run (cut 7a Part 3b, B1) calls this before it takes the destination's lock, so a mistyped source creates nothing.
-pub(crate) fn prepare_source<'a, F: FileSystem>(
+pub(crate) fn prepare_source<'a, 'h, F: FileSystem>(
     fs: &'a F,
     src_root: &'a Path,
     dst_root: &Path,
     mounts: MountPolicy,
-) -> std::result::Result<Source<'a, F>, CopyError> {
-    // 1. The source root. `walk` refuses a missing or non-directory root: the whole
-    //    operation failing, before any destination call.
-    let events = walk_with(fs, src_root, WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts })
-        .map_err(|e| CopyError::at(CopyStep::Source, e))?;
+    scratch: Option<&'a ScratchSpace<'h>>,
+) -> std::result::Result<Source<'a, 'h, F>, CopyError> {
+    // 1. The source root. `walk_unstarted` refuses a missing or non-directory root: the whole
+    //    operation failing, before any destination call. The root is NOT listed here: `copy_tree_frames` starts the
+    //    walk under the lock, so a root that spills finds its scratch placed.
+    let events =
+        walk_unstarted(fs, src_root, WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts }, scratch)
+            .map_err(|e| CopyError::at(CopyStep::Source, e))?;
     let identity = fs.metadata(src_root).map_err(|e| CopyError::at(CopyStep::Source, e))?.identity;
 
     // 2. The lexical floor, before any destination call (§129's own example, `/data`
@@ -684,7 +688,13 @@ fn run_tree<F: DestinationRoot>(
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<(), CopyError> {
-    let mut source = prepare_source(fs, src_root, dst_root, MountPolicy::of(opts))?;
+    // The lockless library copy has no workspace: its scratch goes to the temporary directory (spec 6.1). A home that
+    // cannot be found surfaces only if a directory actually spills.
+    let scratch = ScratchSpace::unplaced(Thresholds::default(), None);
+    // Looked up (and made, if need be) only if a directory actually spills.
+    let temp_root = std::env::temp_dir();
+    scratch.place_deferred(move || temporary_home(fs, None, &temp_root));
+    let mut source = prepare_source(fs, src_root, dst_root, MountPolicy::of(opts), Some(&scratch))?;
     source.events.set_selection(&opts.selection);
 
     // 3-5. Resolve the destination, compare it with the source, create the root.
@@ -743,7 +753,9 @@ fn run_tree<F: DestinationRoot>(
         hardlinks: None,
         anchor_root: None,
     };
-    copy_tree_at(&cx, source.events, root, false, out, on_report).1
+    let result = copy_tree_at(&cx, source.events, root, false, out, on_report).1;
+    scratch.close();
+    result
 }
 
 /// Step 6 of `copy_tree`: the walk, writing through `root` and only below it, and `root` handed back with the result
@@ -756,7 +768,7 @@ fn run_tree<F: DestinationRoot>(
 /// (cut 7b).
 pub(crate) fn copy_tree_at<F: DestinationRoot>(
     cx: &Shared<'_, F>,
-    events: Walk<'_, F>,
+    events: Walk<'_, '_, F>,
     root: F::Dir,
     root_created: bool,
     out: &mut TreeOutcome,
@@ -793,14 +805,14 @@ pub enum RootStatus {
 }
 
 /// One root of a several-source run, ready to copy.
-pub(crate) enum RootInput<'a, F: FileSystem> {
+pub(crate) enum RootInput<'a, 'h, F: FileSystem> {
     /// A directory: `DEST/<name>` is made (or merged into) and the source tree walks into it.
-    Folder { name: OsString, src_root: PathBuf, source: Source<'a, F> },
+    Folder { name: OsString, src_root: PathBuf, source: Source<'a, 'h, F> },
     /// A file: copied to `DEST/<name>` through the per-file path of a tree, with DEST as the parent directory.
     File { name: OsString, src_parent: PathBuf, identity: FileIdentity },
 }
 
-impl<F: FileSystem> RootInput<'_, F> {
+impl<F: FileSystem> RootInput<'_, '_, F> {
     fn name(&self) -> &OsStr {
         match self {
             RootInput::Folder { name, .. } | RootInput::File { name, .. } => name,
@@ -828,7 +840,7 @@ pub(crate) fn copy_roots_at<F: DestinationRoot>(
     base: &Shared<'_, F>,
     dest: RootsDest<'_, F::Dir>,
     dest_created: bool,
-    roots: Vec<RootInput<'_, F>>,
+    roots: Vec<RootInput<'_, '_, F>>,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> (Vec<RootDone>, std::result::Result<(), CopyError>) {
@@ -889,6 +901,20 @@ pub(crate) fn copy_roots_at<F: DestinationRoot>(
     (done, abort.map_or(Ok(()), Err))
 }
 
+/// The walk's tick (`tick_entries` entries read or merged): `beat_and_guard`, with a failure kept whole in `stored` and
+/// a stand-in with its code and message handed to the walk (an `FsError` is not `Clone`; the walk only needs to know the
+/// tick failed).
+fn tick_beat_and_guard<F: DestinationRoot>(
+    cx: &Shared<'_, F>,
+    stored: &mut Option<CopyError>,
+) -> std::result::Result<(), FsError> {
+    beat_and_guard(cx).map_err(|e| {
+        let stand_in = FsError::new(e.code(), std::io::Error::other(e.cause.source.to_string()));
+        *stored = Some(e);
+        stand_in
+    })
+}
+
 /// `beat`, then `guard`, as `walk_into` runs them before a directory; `copy_roots_at` runs them before each root.
 fn beat_and_guard<F: DestinationRoot>(base: &Shared<'_, F>) -> std::result::Result<(), CopyError> {
     (base.beat)().map_err(|e| CopyError::at(CopyStep::Heartbeat, e))?;
@@ -909,7 +935,7 @@ fn dry_folder_root<F: DestinationRoot>(
     dest: &RootsDest<'_, F::Dir>,
     name: &OsStr,
     src_root: &Path,
-    source: Source<'_, F>,
+    source: Source<'_, '_, F>,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<(), CopyError> {
@@ -953,7 +979,7 @@ fn folder_root<F: DestinationRoot>(
     dest: &RootsDest<'_, F::Dir>,
     name: &OsStr,
     src_root: &Path,
-    source: Source<'_, F>,
+    source: Source<'_, '_, F>,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<(), CopyError> {
@@ -1096,13 +1122,28 @@ impl RootIdentity {
 /// frame is `fresh` and holds no handle). The root handle is handed back as it came.
 pub(crate) fn copy_tree_frames<F: DestinationRoot>(
     cx: &Shared<'_, F>,
-    mut events: Walk<'_, F>,
+    mut events: Walk<'_, '_, F>,
     root: Option<F::Dir>,
     root_identity: RootIdentity,
     root_created: bool,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> (Option<F::Dir>, std::result::Result<(), CopyError>) {
+    // The walk lists its root here, under the run's lock and with the scratch placed, so an unlistable source root
+    // fails after the lock (a stored tick failure wins over the walk's stand-in for it).
+    let mut stored = None;
+    let started = {
+        let mut tick = || tick_beat_and_guard(cx, &mut stored);
+        events.start(&mut tick)
+    };
+    if let Err(e) = started {
+        let error = match (e.fatal, stored.take()) {
+            (_, Some(tick_error)) => tick_error,
+            (true, None) => CopyError::at(CopyStep::Resolve, e.cause),
+            (false, None) => CopyError::at(CopyStep::Source, e.cause),
+        };
+        return (root, Err(error));
+    }
     let state = match root_state(cx, root.as_ref(), root_identity, root_created, out) {
         Ok(state) => state,
         Err(e) => return (root, Err(e)),
@@ -1188,7 +1229,7 @@ fn drain_mode(walked: &std::result::Result<(), CopyError>) -> DrainMode {
 /// `copy_tree_at`'s loop. Every `?` here is an abort.
 fn walk_into<F: DestinationRoot>(
     cx: &Shared<'_, F>,
-    events: &mut Walk<'_, F>,
+    events: &mut Walk<'_, '_, F>,
     root_identity: RootIdentity,
     stack: &mut Vec<Frame<F::Dir>>,
     out: &mut TreeOutcome,
@@ -1196,10 +1237,23 @@ fn walk_into<F: DestinationRoot>(
 ) -> std::result::Result<(), CopyError> {
     // 6. The walk. Every target is published by `copy_one`, which picks the publish primitive per target: no-replace
     //    for a new name and for any directory that cannot key claims (§241.5), replace only under a claim (cut 8b).
-    for item in events {
+    let mut stored: Option<CopyError> = None;
+    loop {
+        let next = {
+            let mut tick = || tick_beat_and_guard(cx, &mut stored);
+            events.next_with(&mut tick)
+        };
+        let Some(item) = next else { break };
         let live = matches!(stack.last(), Some(Frame::Live { .. }));
         let event = match item {
             Ok(event) => event,
+            // A failed tick or a scratch error ends the walk and the copy: the stored tick failure if there is one,
+            // else the scratch error, which belongs to no copy step.
+            Err(e) if e.fatal => {
+                return Err(stored
+                    .take()
+                    .unwrap_or_else(|| CopyError::at(CopyStep::Resolve, e.cause)));
+            }
             // Under a skipped subtree the walk still reads; its errors there belong to
             // a failure already reported once.
             Err(e) => {
@@ -5975,7 +6029,8 @@ mod tests {
         seed: impl FnOnce(&mut crate::fault_fs::FakeClaimStore, ObjectId),
     ) -> (std::result::Result<(), CopyError>, TreeOutcome, Vec<TreeFailure>) {
         let source =
-            prepare_source(fs, Path::new("/src"), Path::new("/dst"), MountPolicy::Cross).unwrap();
+            prepare_source(fs, Path::new("/src"), Path::new("/dst"), MountPolicy::Cross, None)
+                .unwrap();
         if !fs.exists(Path::new("/dst")) {
             fs.create_dir(Path::new("/dst")).unwrap();
         }
@@ -6999,7 +7054,8 @@ mod tests {
         guard: &Guard<'_>,
     ) -> (std::result::Result<(), CopyError>, TreeOutcome) {
         let source =
-            prepare_source(fs, Path::new("/src"), Path::new("/dst"), MountPolicy::Cross).unwrap();
+            prepare_source(fs, Path::new("/src"), Path::new("/dst"), MountPolicy::Cross, None)
+                .unwrap();
         fs.create_dir(Path::new("/dst")).unwrap();
         let root = fs.destination_root(Path::new("/dst")).unwrap();
         let o = opts();
@@ -7087,7 +7143,8 @@ mod tests {
     fn a_failed_heartbeat_aborts_the_whole_tree() {
         let fs = tree();
         let source =
-            prepare_source(&fs, Path::new("/src"), Path::new("/dst"), MountPolicy::Cross).unwrap();
+            prepare_source(&fs, Path::new("/src"), Path::new("/dst"), MountPolicy::Cross, None)
+                .unwrap();
         fs.create_dir(Path::new("/dst")).unwrap();
         let root = fs.destination_root(Path::new("/dst")).unwrap();
         let o = opts();
@@ -7133,7 +7190,8 @@ mod tests {
     fn a_heartbeat_failure_inside_a_file_aborts_the_whole_tree() {
         let fs = tree();
         let source =
-            prepare_source(&fs, Path::new("/src"), Path::new("/dst"), MountPolicy::Cross).unwrap();
+            prepare_source(&fs, Path::new("/src"), Path::new("/dst"), MountPolicy::Cross, None)
+                .unwrap();
         fs.create_dir(Path::new("/dst")).unwrap();
         let root = fs.destination_root(Path::new("/dst")).unwrap();
         let o = opts();
@@ -7180,7 +7238,8 @@ mod tests {
         let (r, _) = guarded(&fs, &unguarded);
         r.unwrap();
         let source =
-            prepare_source(&fs, Path::new("/src"), Path::new("/dst"), MountPolicy::Cross).unwrap();
+            prepare_source(&fs, Path::new("/src"), Path::new("/dst"), MountPolicy::Cross, None)
+                .unwrap();
         let root = fs.destination_root(Path::new("/dst")).unwrap();
         let o = opts();
         let cx = Shared {
@@ -7315,7 +7374,8 @@ mod tests {
         verify: flux_fs::VerifyLevel,
     ) -> (std::result::Result<(), CopyError>, TreeOutcome, Vec<TreeFailure>) {
         let source =
-            prepare_source(fs, Path::new("/src"), Path::new("/dst"), MountPolicy::Cross).unwrap();
+            prepare_source(fs, Path::new("/src"), Path::new("/dst"), MountPolicy::Cross, None)
+                .unwrap();
         if !fs.exists(Path::new("/dst")) {
             fs.create_dir(Path::new("/dst")).unwrap();
         }
@@ -9324,7 +9384,8 @@ mod tests {
     ) -> (std::result::Result<TreeOutcome, TreeAbort>, Vec<TreeFailure>) {
         DRY_BASE.set(fs.calls().len());
         let source =
-            prepare_source(fs, Path::new(src), Path::new("/dst"), MountPolicy::of(o)).unwrap();
+            prepare_source(fs, Path::new(src), Path::new("/dst"), MountPolicy::of(o), None)
+                .unwrap();
         let null = std::cell::RefCell::new(NullClaimStore);
         let cx = Shared {
             fs,
@@ -9863,7 +9924,8 @@ mod tests {
         root_created: bool,
     ) -> (TreeOutcome, Vec<TreeFailure>) {
         let source =
-            prepare_source(fs, Path::new("/src"), Path::new("/dst"), MountPolicy::Cross).unwrap();
+            prepare_source(fs, Path::new("/src"), Path::new("/dst"), MountPolicy::Cross, None)
+                .unwrap();
         if !fs.exists(Path::new("/dst")) {
             fs.create_dir(Path::new("/dst")).unwrap();
         }
@@ -10149,7 +10211,7 @@ mod tests {
             .zip(&paths)
             .map(|((name, _, is_file), path)| {
                 let source =
-                    prepare_source(fs, path, Path::new("/dst"), MountPolicy::Cross).unwrap();
+                    prepare_source(fs, path, Path::new("/dst"), MountPolicy::Cross, None).unwrap();
                 let name = OsString::from(name);
                 if *is_file {
                     RootInput::File { name, src_parent: path.clone(), identity: source.identity }

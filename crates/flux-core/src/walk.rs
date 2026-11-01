@@ -6,10 +6,13 @@
 
 //! The ordered directory walk (§7.2, §9, §149.4).
 
+use crate::scratch::{Region, ScratchSpace, Thresholds};
+use crate::spill::{MergeReader, RunSpan, cascade, sort_entries, write_run};
 use flux_fs::{
     Code, DirEntry, FileIdentity, FileSystem, FileType, FsError, MountRoot, ObjectId, Result,
     Selection, Verdict,
 };
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
 /// Chosen to sit BELOW the `PATH_MAX`-implied bound of roughly 370 levels rather
@@ -93,20 +96,49 @@ enum MountNote {
     Unknown,
 }
 
-/// One failed entry. NOT terminal: the walk reports it, skips that subtree, and
-/// continues with the next sibling.
+/// One failed entry. NOT terminal unless `fatal`: the walk reports it, skips that
+/// subtree, and continues with the next sibling.
 #[derive(Debug)]
 pub struct WalkError {
     /// Relative to the walk root, like every path in a `WalkEvent`.
     pub path: PathBuf,
     pub cause: FsError,
+    /// A consumer that sees `fatal` must stop the operation: the cause is a failed tick or a scratch
+    /// error, and the walk yields nothing after it.
+    pub fatal: bool,
+}
+
+/// Called every `tick_entries` entries read, written or merged; an `Err` is fatal to the walk.
+pub type Tick<'t> = dyn FnMut() -> std::result::Result<(), FsError> + 't;
+
+/// The entries of one directory, in order.
+enum Entries<'a, 'h> {
+    Inline(std::vec::IntoIter<DirEntry>),
+    Spilled(MergeReader<'a, 'h>),
+}
+
+impl Iterator for Entries<'_, '_> {
+    type Item = std::result::Result<DirEntry, FsError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Entries::Inline(it) => it.next().map(Ok),
+            Entries::Spilled(m) => m.next(),
+        }
+    }
+}
+
+/// Why a listing failed: its own error is reported and skipped, a scratch or tick error ends the walk.
+enum ListError {
+    Listing(FsError),
+    Fatal(FsError),
 }
 
 /// One directory being enumerated.
-struct Frame {
+struct Frame<'a, 'h> {
     /// Relative to the walk root. Empty for the root frame.
     rel: PathBuf,
-    entries: std::vec::IntoIter<DirEntry>,
+    entries: Entries<'a, 'h>,
     /// Whether this frame pushed onto `ancestors`, so the pop stays balanced when
     /// the identity was not `Strong` and nothing was pushed.
     pushed_ancestor: bool,
@@ -117,13 +149,14 @@ struct Frame {
 }
 
 /// Borrows the filesystem for the life of the walk; holds the explicit stack, the
-/// ancestor set, and the root it makes paths relative to.
-pub struct Walk<'a, F: FileSystem> {
+/// ancestor set, and the root it makes paths relative to. `'h` is the scratch space's own lifetime
+/// (it may outlive the walk; `ScratchSpace` is invariant in it, so it cannot share `'a`).
+pub struct Walk<'a, 'h, F: FileSystem> {
     fs: &'a F,
     root: PathBuf,
     max_depth: usize,
     mounts: MountPolicy,
-    stack: Vec<Frame>,
+    stack: Vec<Frame<'a, 'h>>,
     /// The `ObjectId`s of the directories on the CURRENT path -- not a global
     /// visited set, which would grow with the total number of directories and is
     /// forbidden by spec line 997. An ancestor set is bounded by depth and is
@@ -136,13 +169,25 @@ pub struct Walk<'a, F: FileSystem> {
     selection: Option<&'a Selection>,
     /// Entries a pattern removed (never those `--no-recursive` skipped).
     excluded: u64,
+    /// `None` never spills.
+    scratch: Option<&'a ScratchSpace<'h>>,
+    owner: u64,
+    /// Whether the root was listed (or its listing failed).
+    started: bool,
+    /// The root's identity pushed onto `ancestors`; the root frame inherits it at `start`.
+    root_pushed_ancestor: bool,
+    /// After a fatal error, or a root that could not be listed: nothing more is yielded.
+    done: bool,
+    spilled: u64,
+    /// Entries pulled from spilled frames, for the tick.
+    pulled: u64,
 }
 
 // Manual, not derived: `#[derive(Debug)]` on a generic struct adds a `F: Debug`
 // bound, and the fakes this walk is tested against (e.g. `FaultFs`) do not
 // implement it. `Result::unwrap_err` requires the `Ok` side to be `Debug`, which
 // `walk()`'s tests need, so this exists to satisfy that without constraining `F`.
-impl<'a, F: FileSystem> std::fmt::Debug for Walk<'a, F> {
+impl<F: FileSystem> std::fmt::Debug for Walk<'_, '_, F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Walk")
             .field("root", &self.root)
@@ -150,6 +195,14 @@ impl<'a, F: FileSystem> std::fmt::Debug for Walk<'a, F> {
             .field("stack_depth", &self.stack.len())
             .field("ancestors_depth", &self.ancestors.len())
             .finish()
+    }
+}
+
+// A `Vec` drops front to back, which would release a parent's scratch region before its child's. Regions must
+// drop strictly last-in first-out, so frames are always released by popping.
+impl<F: FileSystem> Drop for Walk<'_, '_, F> {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -186,8 +239,13 @@ fn is_one_component(name: &std::ffi::OsStr) -> bool {
 /// `root` must name a directory. The walk yields NO event for the root itself --
 /// its first event is the root's first child -- because the root is not part of the
 /// tree being copied INTO the destination, it IS the destination mapping.
-pub fn walk<'a, F: FileSystem>(fs: &'a F, root: &Path) -> Result<Walk<'a, F>> {
-    walk_with(fs, root, WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts: MountPolicy::Cross })
+pub fn walk<'a, F: FileSystem>(fs: &'a F, root: &Path) -> Result<Walk<'a, 'a, F>> {
+    walk_with(
+        fs,
+        root,
+        WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts: MountPolicy::Cross },
+        None,
+    )
 }
 
 /// As `walk`, with the depth cap chosen explicitly.
@@ -195,17 +253,32 @@ pub fn walk_with_depth<'a, F: FileSystem>(
     fs: &'a F,
     root: &Path,
     max_depth: usize,
-) -> Result<Walk<'a, F>> {
-    walk_with(fs, root, WalkOptions { max_depth, mounts: MountPolicy::Cross })
+) -> Result<Walk<'a, 'a, F>> {
+    walk_with(fs, root, WalkOptions { max_depth, mounts: MountPolicy::Cross }, None)
 }
 
 /// As `walk`, with the depth cap and the mount policy chosen explicitly. The root
-/// is never asked whether it is a mount: the caller chose it.
-pub fn walk_with<'a, F: FileSystem>(
+/// is never asked whether it is a mount: the caller chose it. EAGER: the root is
+/// listed before this returns, and a listing error is the `Err`. `None` never spills.
+pub fn walk_with<'a, 'h, F: FileSystem>(
     fs: &'a F,
     root: &Path,
     options: WalkOptions,
-) -> Result<Walk<'a, F>> {
+    scratch: Option<&'a ScratchSpace<'h>>,
+) -> Result<Walk<'a, 'h, F>> {
+    let mut walk = walk_unstarted(fs, root, options, scratch)?;
+    walk.start(&mut || Ok(())).map_err(|e| e.cause)?;
+    Ok(walk)
+}
+
+/// The metadata and directory checks and the ancestor push of `walk_with`, with no listing: `start` (or the
+/// first `next_with`) lists the root.
+pub fn walk_unstarted<'a, 'h, F: FileSystem>(
+    fs: &'a F,
+    root: &Path,
+    options: WalkOptions,
+    scratch: Option<&'a ScratchSpace<'h>>,
+) -> Result<Walk<'a, 'h, F>> {
     let WalkOptions { max_depth, mounts } = options;
     // Fallible BEFORE anything is yielded: a missing root, or a root that is not a
     // directory, is a failure of the whole operation rather than a per-entry error,
@@ -217,7 +290,6 @@ pub fn walk_with<'a, F: FileSystem>(
             std::io::Error::other("walk root is not a directory"),
         ));
     }
-    let entries = sorted(fs.read_dir(root)?);
 
     // The root goes into the ancestor set even though no event is emitted for it.
     // Load-bearing, not tidy: the measured bind-mount case is `mount --bind a a/b`,
@@ -237,16 +309,17 @@ pub fn walk_with<'a, F: FileSystem>(
         root: root.to_path_buf(),
         max_depth,
         mounts,
-        stack: vec![Frame {
-            rel: PathBuf::new(),
-            entries: entries.into_iter(),
-            pushed_ancestor,
-            emit_end: false,
-            mount: None,
-        }],
+        stack: Vec::new(),
         ancestors,
         selection: None,
         excluded: 0,
+        scratch,
+        owner: scratch.map_or(0, ScratchSpace::next_owner),
+        started: false,
+        root_pushed_ancestor: pushed_ancestor,
+        done: false,
+        spilled: 0,
+        pulled: 0,
     })
 }
 
@@ -267,12 +340,62 @@ pub fn walk_with<'a, F: FileSystem>(
 /// the "scanner blocks/awaits" rather than accumulating paths. A consumer that stops
 /// pulling IS the backpressure, so Phase 3's bounded queue sits between this
 /// iterator and the workers without the walker changing.
-impl<'a, F: FileSystem> Iterator for Walk<'a, F> {
+impl<F: FileSystem> Iterator for Walk<'_, '_, F> {
     type Item = std::result::Result<WalkEvent, WalkError>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        self.next_with(&mut || Ok(()))
+    }
+}
+
+impl<'a, 'h, F: FileSystem> Walk<'a, 'h, F> {
+    /// Lists the root. Idempotent: a started walk returns `Ok(())`. The error has an empty `path`; after it the
+    /// walk yields nothing.
+    pub fn start(&mut self, tick: &mut Tick<'_>) -> std::result::Result<(), WalkError> {
+        if self.started {
+            return Ok(());
+        }
+        self.started = true;
+        let root = self.root.clone();
+        match self.list_sorted(&root, tick) {
+            Ok(entries) => {
+                if matches!(entries, Entries::Spilled(_)) {
+                    self.spilled += 1;
+                }
+                self.stack.push(Frame {
+                    rel: PathBuf::new(),
+                    entries,
+                    pushed_ancestor: self.root_pushed_ancestor,
+                    emit_end: false,
+                    mount: None,
+                });
+                Ok(())
+            }
+            Err(e) => {
+                let (cause, fatal) = match e {
+                    ListError::Listing(c) => (c, false),
+                    ListError::Fatal(c) => (c, true),
+                };
+                if self.root_pushed_ancestor {
+                    self.ancestors.pop();
+                }
+                self.done = true;
+                Err(WalkError { path: PathBuf::new(), cause, fatal })
+            }
+        }
+    }
+
+    /// As `next`, calling `tick` every `tick_entries` entries read, written or merged. An unstarted walk is
+    /// started first and its start error is the first item.
+    pub fn next_with(
+        &mut self,
+        tick: &mut Tick<'_>,
+    ) -> Option<std::result::Result<WalkEvent, WalkError>> {
+        if let Err(e) = self.start(tick) {
+            return Some(Err(e));
+        }
         loop {
-            if self.stack.is_empty() {
+            if self.done || self.stack.is_empty() {
                 return None;
             }
             // A mount note is yielded once, right after the `Dir` event `enter`
@@ -292,12 +415,28 @@ impl<'a, F: FileSystem> Iterator for Walk<'a, F> {
             // unborrowed, so the borrow has to end here.
             let taken = {
                 let frame = self.stack.last_mut().expect("stack checked non-empty");
-                frame.entries.next()
+                let spilled = matches!(frame.entries, Entries::Spilled(_));
+                (frame.entries.next(), spilled)
             };
+            if taken.1 && matches!(taken.0, Some(Ok(_))) {
+                self.pulled += 1;
+                let every = self.tick_entries() as u64;
+                if every > 0
+                    && self.pulled.is_multiple_of(every)
+                    && let Err(cause) = tick()
+                {
+                    let rel = self.stack.last().map(|f| f.rel.clone()).unwrap_or_default();
+                    return Some(Err(self.fatal(rel, cause)));
+                }
+            }
 
-            let step = match taken {
+            let step = match taken.0 {
                 None => None,
-                Some(e) => {
+                Some(Err(cause)) => {
+                    let rel = self.stack.last().map(|f| f.rel.clone()).unwrap_or_default();
+                    return Some(Err(self.fatal(rel, cause)));
+                }
+                Some(Ok(e)) => {
                     if !is_one_component(&e.name) {
                         // PANIC, not an `Err` item. A real filesystem CANNOT produce
                         // this: neither Linux nor Windows permits a separator inside a
@@ -320,7 +459,7 @@ impl<'a, F: FileSystem> Iterator for Walk<'a, F> {
                         // `[profile.release]` sets `panic = "abort"`, so a library
                         // consumer unwinds by default and this path is live for them.
                         let rel = self.stack.last().map(|f| f.rel.clone()).unwrap_or_default();
-                        self.stack.clear();
+                        self.release();
                         panic!(
                             "FileSystem::read_dir returned an entry name that is not a \
                              single component: {:?} in {:?}. A name must be one bare \
@@ -351,7 +490,7 @@ impl<'a, F: FileSystem> Iterator for Walk<'a, F> {
                 Some((path, FileType::File)) => return Some(Ok(WalkEvent::File { path })),
                 Some((path, FileType::Symlink)) => return Some(Ok(WalkEvent::Symlink { path })),
                 Some((path, FileType::Other)) => return Some(Ok(WalkEvent::Other { path })),
-                Some((path, FileType::Dir)) => return Some(self.enter(path)),
+                Some((path, FileType::Dir)) => return Some(self.enter(path, tick)),
                 None => {
                     // This directory is exhausted. Unwind it, keeping the ancestor
                     // set balanced, and close it post-order.
@@ -367,9 +506,27 @@ impl<'a, F: FileSystem> Iterator for Walk<'a, F> {
             }
         }
     }
-}
+    /// Pops every frame, last in first out, keeping the ancestor set balanced.
+    fn release(&mut self) {
+        while let Some(frame) = self.stack.pop() {
+            if frame.pushed_ancestor {
+                self.ancestors.pop();
+            }
+        }
+    }
 
-impl<'a, F: FileSystem> Walk<'a, F> {
+    /// Ends the walk with a fatal error for `path`.
+    fn fatal(&mut self, path: PathBuf, cause: FsError) -> WalkError {
+        self.release();
+        self.done = true;
+        WalkError { path, cause, fatal: true }
+    }
+
+    fn tick_entries(&self) -> usize {
+        self.scratch
+            .map_or_else(|| Thresholds::default().tick_entries, |s| s.thresholds().tick_entries)
+    }
+
     /// Filter every entry below the root through `selection`. The root itself is
     /// never filtered.
     pub fn set_selection(&mut self, selection: &'a Selection) {
@@ -382,10 +539,62 @@ impl<'a, F: FileSystem> Walk<'a, F> {
         self.excluded
     }
 
+    /// How many directories this walk spilled to the scratch space.
+    pub fn spilled_directories(&self) -> u64 {
+        self.spilled
+    }
+
+    /// Lists `dir` sorted by name: in memory when it has at most `inline_entries` entries (or there is no scratch
+    /// space), otherwise as sorted runs in a region of the scratch space read back by a k-way merge (spec 6.2).
+    fn list_sorted(
+        &self,
+        dir: &Path,
+        tick: &mut Tick<'_>,
+    ) -> std::result::Result<Entries<'a, 'h>, ListError> {
+        let t = self.scratch.map_or_else(Thresholds::default, |s| s.thresholds());
+        let mut l = Listing {
+            space: self.scratch,
+            owner: self.owner,
+            t,
+            buf: Vec::new(),
+            runs: Vec::new(),
+            region: None,
+            read: 0,
+            total: 0,
+        };
+        let mut failed: Option<FsError> = None;
+        let listed = self.fs.read_dir_each(dir, &mut |e| match l.push(e, tick) {
+            Ok(()) => Ok(ControlFlow::Continue(())),
+            Err(x) => {
+                failed = Some(x);
+                Ok(ControlFlow::Break(()))
+            }
+        });
+        if let Some(x) = failed {
+            return Err(ListError::Fatal(x));
+        }
+        listed.map_err(ListError::Listing)?;
+        let Some(space) = l.space.filter(|_| !l.runs.is_empty() || l.buf.len() > t.inline_entries)
+        else {
+            return Ok(Entries::Inline(sorted(l.buf).into_iter()));
+        };
+        l.flush().map_err(ListError::Fatal)?;
+        let entries = l.total;
+        let runs = cascade(space, std::mem::take(&mut l.runs), &mut |_| tick())
+            .map_err(ListError::Fatal)?;
+        tracing::debug!(entries, runs = runs.len(), "listing spilled");
+        let region = l.region.take().expect("a spilled listing holds a region");
+        MergeReader::new(space, runs, region).map(Entries::Spilled).map_err(ListError::Fatal)
+    }
+
     /// Descend into `rel`, or refuse it. On `Ok` a frame has been pushed and the
     /// pre-order `Dir` event is returned; on `Err` nothing was pushed, the subtree
-    /// is skipped, and the walk continues with the next sibling.
-    fn enter(&mut self, rel: PathBuf) -> std::result::Result<WalkEvent, WalkError> {
+    /// is skipped, and the walk continues with the next sibling (unless the error is fatal).
+    fn enter(
+        &mut self,
+        rel: PathBuf,
+        tick: &mut Tick<'_>,
+    ) -> std::result::Result<WalkEvent, WalkError> {
         // The cap runs at EVERY identity strength, and is the only guard that does.
         // `stack.len()` counts frames, and the root frame is one, so a child of the
         // root is depth 1.
@@ -397,6 +606,7 @@ impl<'a, F: FileSystem> Walk<'a, F> {
         // the TESTS that pin this check; the check itself cannot wait for them.
         if self.stack.len() > self.max_depth {
             return Err(WalkError {
+                fatal: false,
                 path: rel,
                 cause: FsError::new(
                     Code::IoError,
@@ -412,7 +622,7 @@ impl<'a, F: FileSystem> Walk<'a, F> {
 
         let m = match self.fs.metadata(&abs) {
             Ok(m) => m,
-            Err(cause) => return Err(WalkError { path: rel, cause }),
+            Err(cause) => return Err(WalkError { path: rel, cause, fatal: false }),
         };
 
         // §149.4. `read_dir` typed this entry `Dir`; if `metadata` disagrees, the
@@ -425,6 +635,7 @@ impl<'a, F: FileSystem> Walk<'a, F> {
         // for walker TOCTOU. Do not let this comment claim more than that.
         if m.file_type != FileType::Dir {
             return Err(WalkError {
+                fatal: false,
                 path: rel,
                 cause: FsError::new(
                     Code::DirectoryChangedDuringScan,
@@ -441,11 +652,11 @@ impl<'a, F: FileSystem> Walk<'a, F> {
         if self.mounts == MountPolicy::Stay {
             let parent = abs.parent().expect("a descendant has a parent");
             match self.fs.mount_root(&abs, parent) {
-                Err(cause) => return Err(WalkError { path: rel, cause }),
+                Err(cause) => return Err(WalkError { path: rel, cause, fatal: false }),
                 Ok(MountRoot::Yes) => {
                     self.stack.push(Frame {
                         rel: rel.clone(),
-                        entries: Vec::new().into_iter(),
+                        entries: Entries::Inline(Vec::new().into_iter()),
                         pushed_ancestor: false,
                         emit_end: true,
                         mount: Some(MountNote::Skipped),
@@ -466,6 +677,7 @@ impl<'a, F: FileSystem> Walk<'a, F> {
         if let FileIdentity::Strong(id) = m.identity {
             if self.ancestors.contains(&id) {
                 return Err(WalkError {
+                    fatal: false,
                     path: rel,
                     cause: FsError::new(
                         Code::IoError,
@@ -482,25 +694,76 @@ impl<'a, F: FileSystem> Walk<'a, F> {
             pushed_ancestor = true;
         }
 
-        let entries = match self.fs.read_dir(&abs) {
-            Ok(v) => sorted(v),
-            Err(cause) => {
+        let entries = match self.list_sorted(&abs, tick) {
+            Ok(v) => v,
+            Err(e) => {
                 // Balance the set: this frame is never pushed, so nothing will pop.
                 if pushed_ancestor {
                     self.ancestors.pop();
                 }
-                return Err(WalkError { path: rel, cause });
+                return Err(match e {
+                    ListError::Listing(cause) => WalkError { path: rel, cause, fatal: false },
+                    ListError::Fatal(cause) => self.fatal(rel, cause),
+                });
             }
         };
+        if matches!(entries, Entries::Spilled(_)) {
+            self.spilled += 1;
+        }
 
         self.stack.push(Frame {
             rel: rel.clone(),
-            entries: entries.into_iter(),
+            entries,
             pushed_ancestor,
             emit_end: true,
             mount: note,
         });
         Ok(WalkEvent::Dir { path: rel, identity: m.identity })
+    }
+}
+
+/// The state of one directory listing while the stream is drained.
+struct Listing<'a, 'h> {
+    space: Option<&'a ScratchSpace<'h>>,
+    owner: u64,
+    t: Thresholds,
+    buf: Vec<DirEntry>,
+    runs: Vec<RunSpan>,
+    region: Option<Region<'a, 'h>>,
+    read: usize,
+    total: u64,
+}
+
+impl Listing<'_, '_> {
+    /// Takes one entry; a full buffer is written as a run first (only when another entry arrives, so a directory
+    /// of exactly `inline_entries` never spills even when that equals `run_entries`).
+    fn push(&mut self, e: DirEntry, tick: &mut Tick<'_>) -> std::result::Result<(), FsError> {
+        if self.space.is_some() && self.buf.len() >= self.t.run_entries {
+            self.flush()?;
+        }
+        self.buf.push(e);
+        self.read += 1;
+        if self.t.tick_entries > 0 && self.read.is_multiple_of(self.t.tick_entries) {
+            tick()?;
+        }
+        Ok(())
+    }
+
+    /// Writes the buffer, sorted, as one run of the directory's region.
+    fn flush(&mut self) -> std::result::Result<(), FsError> {
+        let Some(space) = self.space else { return Ok(()) };
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        if self.region.is_none() {
+            self.region = Some(space.begin(self.owner)?);
+        }
+        sort_entries(&mut self.buf);
+        let run = write_run(space, &self.buf)?;
+        self.total += run.count;
+        self.runs.push(run);
+        self.buf.clear();
+        Ok(())
     }
 }
 
@@ -606,18 +869,23 @@ mod tests {
     }
 
     fn paths_with(fs: &FaultFs, policy: MountPolicy) -> Vec<String> {
-        walk_with(fs, Path::new("/r"), WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts: policy })
-            .unwrap()
-            .map(|r| match r.unwrap() {
-                WalkEvent::Dir { path, .. } => format!("D {}", rel(&path)),
-                WalkEvent::File { path } => format!("F {}", rel(&path)),
-                WalkEvent::Symlink { path } => format!("L {}", rel(&path)),
-                WalkEvent::Other { path } => format!("O {}", rel(&path)),
-                WalkEvent::DirEnd { path } => format!("E {}", rel(&path)),
-                WalkEvent::MountSkipped { path } => format!("M {}", rel(&path)),
-                WalkEvent::MountUnknown { path } => format!("U {}", rel(&path)),
-            })
-            .collect()
+        walk_with(
+            fs,
+            Path::new("/r"),
+            WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts: policy },
+            None,
+        )
+        .unwrap()
+        .map(|r| match r.unwrap() {
+            WalkEvent::Dir { path, .. } => format!("D {}", rel(&path)),
+            WalkEvent::File { path } => format!("F {}", rel(&path)),
+            WalkEvent::Symlink { path } => format!("L {}", rel(&path)),
+            WalkEvent::Other { path } => format!("O {}", rel(&path)),
+            WalkEvent::DirEnd { path } => format!("E {}", rel(&path)),
+            WalkEvent::MountSkipped { path } => format!("M {}", rel(&path)),
+            WalkEvent::MountUnknown { path } => format!("U {}", rel(&path)),
+        })
+        .collect()
     }
 
     #[test]
@@ -832,7 +1100,7 @@ mod tests {
         let mut events = Vec::new();
         let mut errors = Vec::new();
         let opts = WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts: MountPolicy::Stay };
-        for item in walk_with(&fs, Path::new("/r"), opts).unwrap() {
+        for item in walk_with(&fs, Path::new("/r"), opts, None).unwrap() {
             match item {
                 Ok(WalkEvent::Dir { path, .. }) => events.push(format!("D {}", rel(&path))),
                 Ok(WalkEvent::File { path }) => events.push(format!("F {}", rel(&path))),
@@ -849,7 +1117,7 @@ mod tests {
         let mut dirs = Vec::new();
         let mut errors = Vec::new();
         let opts = WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts: MountPolicy::Cross };
-        for item in walk_with(&fs, Path::new("/r"), opts).unwrap() {
+        for item in walk_with(&fs, Path::new("/r"), opts, None).unwrap() {
             match item {
                 Ok(WalkEvent::Dir { path, .. }) => dirs.push(rel(&path)),
                 Err(e) => errors.push(rel(&e.path)),
@@ -886,7 +1154,7 @@ mod tests {
         let mut errors = Vec::new();
         let mut events = Vec::new();
         let opts = WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts: MountPolicy::Stay };
-        for item in walk_with(&fs, Path::new("/r"), opts).unwrap() {
+        for item in walk_with(&fs, Path::new("/r"), opts, None).unwrap() {
             match item {
                 Ok(WalkEvent::Dir { path, .. }) => events.push(format!("D {}", rel(&path))),
                 Ok(WalkEvent::File { path }) => events.push(format!("F {}", rel(&path))),
@@ -920,7 +1188,7 @@ mod tests {
         let mut events = Vec::new();
         let mut errors = Vec::new();
         let opts = WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts: MountPolicy::Stay };
-        for item in walk_with(&fs, Path::new("/r"), opts).unwrap() {
+        for item in walk_with(&fs, Path::new("/r"), opts, None).unwrap() {
             match item {
                 Ok(WalkEvent::Dir { path, .. }) => events.push(format!("D {}", rel(&path))),
                 Ok(WalkEvent::File { path }) => events.push(format!("F {}", rel(&path))),
@@ -947,7 +1215,7 @@ mod tests {
         let mut events = Vec::new();
         let mut errors = Vec::new();
         let opts = WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts: MountPolicy::Stay };
-        for item in walk_with(&fs, Path::new("/r"), opts).unwrap() {
+        for item in walk_with(&fs, Path::new("/r"), opts, None).unwrap() {
             match item {
                 Ok(WalkEvent::Dir { path, .. }) => events.push(format!("D {}", rel(&path))),
                 Ok(WalkEvent::MountUnknown { path }) => events.push(format!("U {}", rel(&path))),
@@ -968,7 +1236,7 @@ mod tests {
         fs.set_mount_root("/r/a/b", flux_fs::MountRoot::Yes);
         let opts = WalkOptions { max_depth: 1, mounts: MountPolicy::Stay };
         let errors: Vec<WalkError> =
-            walk_with(&fs, Path::new("/r"), opts).unwrap().filter_map(|i| i.err()).collect();
+            walk_with(&fs, Path::new("/r"), opts, None).unwrap().filter_map(|i| i.err()).collect();
         assert_eq!(errors.len(), 1, "got {errors:?}");
         assert_eq!(rel(&errors[0].path), "a/b");
         let msg =
@@ -1200,7 +1468,9 @@ mod tests {
             // exhausted one.
             vec![("/etc/shadow", FileType::File), ("good.txt", FileType::File)]
                 .into_iter()
-                .map(|(n, file_type)| Ok(DirEntry { name: std::ffi::OsString::from(n), file_type }))
+                .map(|(n, file_type)| {
+                    Ok(DirEntry { name: std::ffi::OsString::from(n), file_type, ino: None })
+                })
                 .collect()
         }
 
@@ -1422,7 +1692,8 @@ mod tests {
         max_depth: usize,
         mounts: MountPolicy,
     ) -> (Vec<String>, u64) {
-        let mut walk = walk_with(fs, Path::new("/r"), WalkOptions { max_depth, mounts }).unwrap();
+        let mut walk =
+            walk_with(fs, Path::new("/r"), WalkOptions { max_depth, mounts }, None).unwrap();
         walk.set_selection(selection);
         let mut out = Vec::new();
         for item in walk.by_ref() {
@@ -1642,5 +1913,332 @@ mod tests {
             ]
         );
         assert_eq!(n, 1);
+    }
+
+    // ---- spilled listings (bounded listing, plan 2 task 4) ----
+
+    fn spilled(fs: &FaultFs, t: Thresholds) -> ScratchSpace<'static> {
+        use flux_fs::DestinationRoot;
+        fs.create_dir(Path::new("/scratch")).unwrap();
+        let home = fs.destination_root(Path::new("/scratch")).unwrap();
+        let space = ScratchSpace::unplaced(t, None);
+        space.place(home, PathBuf::from("/scratch"));
+        space
+    }
+
+    fn small() -> Thresholds {
+        Thresholds::new(4, 8, 2, 16, 3).unwrap()
+    }
+
+    fn creations(fs: &FaultFs) -> usize {
+        fs.calls().iter().filter(|c| c.starts_with("create_scratch(")).count()
+    }
+
+    fn render(item: &WalkEvent) -> String {
+        match item {
+            WalkEvent::Dir { path, .. } => format!("D {}", rel(path)),
+            WalkEvent::File { path } => format!("F {}", rel(path)),
+            WalkEvent::Symlink { path } => format!("L {}", rel(path)),
+            WalkEvent::Other { path } => format!("O {}", rel(path)),
+            WalkEvent::DirEnd { path } => format!("E {}", rel(path)),
+            WalkEvent::MountSkipped { path } => format!("M {}", rel(path)),
+            WalkEvent::MountUnknown { path } => format!("U {}", rel(path)),
+        }
+    }
+
+    fn spilled_paths(fs: &FaultFs, space: &ScratchSpace<'_>) -> Vec<String> {
+        let opts = WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts: MountPolicy::Cross };
+        walk_with(fs, Path::new("/r"), opts, Some(space))
+            .unwrap()
+            .map(|r| render(&r.unwrap()))
+            .collect()
+    }
+
+    fn files(fs: &FaultFs, dir: &str, prefix: &str, n: usize) {
+        for i in 0..n {
+            fs.write_file(format!("{dir}/{prefix}{i:03}"), b"");
+        }
+    }
+
+    fn opts() -> WalkOptions {
+        WalkOptions { max_depth: DEFAULT_MAX_DEPTH, mounts: MountPolicy::Cross }
+    }
+
+    #[test]
+    fn a_spilled_walk_yields_the_same_events_as_an_inline_walk() {
+        let fs = component_order_tree();
+        for (d, n) in [("/r/d0", 0), ("/r/d9", 9), ("/r/d40", 40)] {
+            fs.create_dir(Path::new(d)).unwrap();
+            files(&fs, d, "f", n);
+        }
+        let want = paths(&fs);
+        let space = spilled(&fs, small());
+        let mut walk = walk_with(&fs, Path::new("/r"), opts(), Some(&space)).unwrap();
+        let got: Vec<String> = walk.by_ref().map(|r| render(&r.unwrap())).collect();
+        assert_eq!(got, want);
+        assert_eq!(creations(&fs), 1, "{:?}", fs.calls());
+        // /r (6 entries), d9 and d40 spilled; /r/a (2 entries) and d0 did not.
+        assert_eq!(walk.spilled_directories(), 3);
+    }
+
+    #[test]
+    fn a_directory_of_exactly_inline_entries_never_spills() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/r")).unwrap();
+        files(&fs, "/r", "f", 4);
+        let space = spilled(&fs, small());
+        let mut walk = walk_with(&fs, Path::new("/r"), opts(), Some(&space)).unwrap();
+        assert_eq!(walk.by_ref().count(), 4);
+        assert_eq!(creations(&fs), 0, "{:?}", fs.calls());
+        assert_eq!(walk.spilled_directories(), 0);
+    }
+
+    #[test]
+    fn a_child_spill_does_not_disturb_the_parents_merge() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/r")).unwrap();
+        fs.create_dir(Path::new("/r/m")).unwrap();
+        files(&fs, "/r", "a", 10);
+        files(&fs, "/r", "z", 10);
+        files(&fs, "/r/m", "f", 20);
+        let want = paths(&fs);
+        let space = spilled(&fs, small());
+        assert_eq!(spilled_paths(&fs, &space), want);
+        assert_eq!(space.len(), 0);
+    }
+
+    #[test]
+    fn the_run_file_is_empty_after_a_walk_ends_and_after_it_is_dropped_early() {
+        let fs = component_order_tree();
+        fs.create_dir(Path::new("/r/d40")).unwrap();
+        files(&fs, "/r/d40", "f", 40);
+        // Five root entries, so the root itself spills and its runs are live during the early drop.
+        files(&fs, "/r", "g", 2);
+        let space = spilled(&fs, small());
+        let n = spilled_paths(&fs, &space).len();
+        assert_eq!((space.len(), space.physical_len()), (0, 0));
+        {
+            let mut walk = walk_with(&fs, Path::new("/r"), opts(), Some(&space)).unwrap();
+            for _ in 0..5 {
+                assert!(walk.next().unwrap().is_ok());
+            }
+            assert!(space.len() > 0, "the root's runs are live while the walk is open");
+        }
+        assert_eq!((space.len(), space.physical_len()), (0, 0));
+        assert!(n > 5);
+    }
+
+    #[test]
+    fn a_scratch_write_failure_is_fatal_and_ends_the_walk() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/r")).unwrap();
+        fs.create_dir(Path::new("/r/big")).unwrap();
+        files(&fs, "/r/big", "f", 40);
+        let space = spilled(&fs, small());
+        space.fail_writes_after(2);
+        {
+            let mut walk = walk_with(&fs, Path::new("/r"), opts(), Some(&space)).unwrap();
+            let mut seen_fatal = false;
+            for item in walk.by_ref() {
+                assert!(!seen_fatal, "no item follows a fatal error");
+                if let Err(e) = item {
+                    assert!(e.fatal);
+                    assert_eq!(e.cause.code, Code::DiskFull);
+                    seen_fatal = true;
+                    break;
+                }
+            }
+            assert!(seen_fatal);
+            assert!(walk.next().is_none());
+            assert!(walk.next().is_none());
+        }
+        assert_eq!((space.len(), space.physical_len()), (0, 0));
+    }
+
+    fn big_root(n: usize) -> FaultFs {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/r")).unwrap();
+        files(&fs, "/r", "f", n);
+        fs
+    }
+
+    #[test]
+    fn a_failing_tick_is_fatal() {
+        let fs = big_root(40);
+        let t = Thresholds::new(4, 64, 2, 16, 8).unwrap();
+        let space = spilled(&fs, t);
+        let mut walk = walk_unstarted(&fs, Path::new("/r"), opts(), Some(&space)).unwrap();
+        let mut calls = 0;
+        let mut tick = || {
+            calls += 1;
+            if calls == 2 {
+                Err(FsError::new(Code::TargetLockBusy, std::io::Error::other("beat lapsed")))
+            } else {
+                Ok(())
+            }
+        };
+        let first = walk.next_with(&mut tick).expect("an item");
+        let e = first.unwrap_err();
+        assert!(e.fatal);
+        assert_eq!(e.cause.code, Code::TargetLockBusy);
+        assert!(walk.next_with(&mut tick).is_none());
+        assert!(walk.next_with(&mut tick).is_none());
+        drop(walk);
+        assert_eq!(space.len(), 0);
+    }
+
+    #[test]
+    fn the_tick_runs_at_least_once_per_tick_entries() {
+        // 100 entries, tick every 8: the read phase alone gives 12 ticks, so the bound is on the ticks AFTER it.
+        let fs = big_root(100);
+        let t = Thresholds::new(4, 32, 2, 16, 8).unwrap();
+        let space = spilled(&fs, t);
+        let mut walk = walk_unstarted(&fs, Path::new("/r"), opts(), Some(&space)).unwrap();
+        let calls = std::cell::Cell::new(0u32);
+        let mut tick = || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
+        walk.start(&mut tick).unwrap();
+        let after_start = calls.get();
+        // 12 read ticks, then the cascade (100 entries merged: 12 ticks plus one at the end of the pass).
+        assert!(after_start >= 12 + 12, "the cascade must tick as it merges; got {after_start}");
+        let mut n = 0;
+        while let Some(item) = walk.next_with(&mut tick) {
+            item.unwrap();
+            n += 1;
+        }
+        assert_eq!(n, 100);
+        let pulled = calls.get() - after_start;
+        assert!(pulled >= 12, "the streaming merge must tick as it yields; got {pulled}");
+    }
+
+    /// 40 entries in one root, runs of 8, fan-in 2 (so a two-pass cascade), tick every 8.
+    fn merge_fixture() -> (FaultFs, Thresholds) {
+        (big_root(40), Thresholds::new(4, 8, 2, 16, 8).unwrap())
+    }
+
+    /// The tick calls a passing run makes: `(by the end of start, in total)`.
+    fn passing_tick_cadence() -> (u32, u32) {
+        let (fs, t) = merge_fixture();
+        let space = spilled(&fs, t);
+        let mut walk = walk_unstarted(&fs, Path::new("/r"), opts(), Some(&space)).unwrap();
+        let calls = std::cell::Cell::new(0u32);
+        let mut tick = || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
+        walk.start(&mut tick).unwrap();
+        let after_start = calls.get();
+        while let Some(item) = walk.next_with(&mut tick) {
+            item.unwrap();
+        }
+        (after_start, calls.get())
+    }
+
+    /// Runs the merge fixture with a tick that fails on call number `fail_at`; returns the Ok items before the
+    /// error and the error, after checking nothing follows it and the run file is empty once the walk is dropped.
+    fn walk_with_tick_failing_at(fail_at: u32) -> (usize, WalkError) {
+        let (fs, t) = merge_fixture();
+        let space = spilled(&fs, t);
+        let mut walk = walk_unstarted(&fs, Path::new("/r"), opts(), Some(&space)).unwrap();
+        let mut calls = 0;
+        let mut tick = || {
+            calls += 1;
+            if calls == fail_at {
+                Err(FsError::new(Code::TargetLockBusy, std::io::Error::other("beat lapsed")))
+            } else {
+                Ok(())
+            }
+        };
+        let mut oks = 0;
+        let err = loop {
+            match walk.next_with(&mut tick).expect("the walk must yield the fatal error") {
+                Ok(_) => oks += 1,
+                Err(e) => break e,
+            }
+        };
+        assert!(walk.next_with(&mut tick).is_none());
+        assert!(walk.next_with(&mut tick).is_none());
+        drop(walk);
+        assert_eq!((space.len(), space.physical_len()), (0, 0));
+        (oks, err)
+    }
+
+    #[test]
+    fn a_tick_that_fails_during_the_cascade_is_fatal() {
+        // 40 entries / 8 = 5 read ticks, then the cascade: pass 1 merges 32 entries (4 ticks + 1), pass 2 another
+        // 32 (4 + 1); then 40 / 8 = 5 pull ticks.
+        assert_eq!(passing_tick_cadence(), (15, 20));
+        // Call 6 is the first tick of the cascade.
+        let (oks, e) = walk_with_tick_failing_at(6);
+        assert_eq!(oks, 0, "the root was never listed");
+        assert!(e.fatal);
+        assert_eq!(e.cause.code, Code::TargetLockBusy);
+    }
+
+    #[test]
+    fn a_tick_that_fails_during_the_streaming_merge_is_fatal() {
+        let (after_start, total) = passing_tick_cadence();
+        assert!(total > after_start);
+        // The first pull-side tick comes with the 8th entry, before it is yielded.
+        let (oks, e) = walk_with_tick_failing_at(after_start + 1);
+        assert_eq!(oks, 7);
+        assert!(e.fatal);
+        assert_eq!(e.cause.code, Code::TargetLockBusy);
+    }
+
+    #[test]
+    fn a_read_failure_in_the_merge_is_one_fatal_error_for_that_directory() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/r")).unwrap();
+        fs.create_dir(Path::new("/r/big")).unwrap();
+        files(&fs, "/r/big", "f", 40);
+        // Five runs, fan-in 8: no cascade, so the first five reads are the merge's initial heads.
+        let space = spilled(&fs, Thresholds::new(4, 8, 8, 16, 1000).unwrap());
+        space.fail_reads_after(5);
+        {
+            let mut walk = walk_with(&fs, Path::new("/r"), opts(), Some(&space)).unwrap();
+            let mut errors = Vec::new();
+            let mut after_error = 0;
+            for item in walk.by_ref() {
+                match item {
+                    Err(e) => errors.push(e),
+                    Ok(_) if !errors.is_empty() => after_error += 1,
+                    Ok(_) => {}
+                }
+            }
+            assert_eq!(errors.len(), 1);
+            assert_eq!(after_error, 0);
+            assert!(errors[0].fatal);
+            assert_eq!(rel(&errors[0].path), "big");
+            assert!(walk.next().is_none());
+            assert!(walk.next().is_none());
+        }
+        assert_eq!((space.len(), space.physical_len()), (0, 0));
+    }
+
+    #[test]
+    fn an_unstarted_walk_lists_nothing_until_started() {
+        let fs = big_root(3);
+        let reads = |fs: &FaultFs| fs.calls().iter().filter(|c| c.starts_with("read_dir(")).count();
+        let mut walk = walk_unstarted(&fs, Path::new("/r"), opts(), None).unwrap();
+        assert_eq!(reads(&fs), 0);
+        walk.start(&mut || Ok(())).unwrap();
+        assert_eq!(reads(&fs), 1);
+        walk.start(&mut || Ok(())).unwrap();
+        assert_eq!(reads(&fs), 1);
+        assert_eq!(walk.count(), 3);
+    }
+
+    #[test]
+    fn an_unstarted_walk_whose_root_cannot_be_listed_fails_at_start() {
+        let fs = big_root(3);
+        fs.fail_nth("read_dir", 1, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+        let mut walk = walk_unstarted(&fs, Path::new("/r"), opts(), None).unwrap();
+        let e = walk.start(&mut || Ok(())).unwrap_err();
+        assert!(e.path.as_os_str().is_empty());
+        assert!(!e.fatal);
+        assert_eq!(e.cause.code, Code::PermissionDenied);
     }
 }

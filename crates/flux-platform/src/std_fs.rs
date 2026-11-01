@@ -17,6 +17,7 @@ use flux_fs::{
 };
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::ops::ControlFlow;
 use std::path::Path;
 #[cfg(unix)]
 use std::time::Duration;
@@ -661,13 +662,29 @@ impl FileSystem for StdFileSystem {
 
     fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>> {
         let mut out = Vec::new();
+        self.read_dir_each(path, &mut |e| {
+            out.push(e);
+            Ok(ControlFlow::Continue(()))
+        })?;
+        Ok(out)
+    }
+
+    fn read_dir_each(
+        &self,
+        path: &Path,
+        visit: &mut dyn FnMut(DirEntry) -> Result<ControlFlow<()>>,
+    ) -> Result<()> {
         for entry in std::fs::read_dir(path).map_err(FsError::from_io)? {
             let entry = entry.map_err(FsError::from_io)?;
             // `DirEntry::file_type` does NOT follow a symlink, and on Windows the
             // reparse tag arrives in `wfd.dwReserved0` as part of the enumeration
             // itself, so this costs no extra syscall there.
             let t = entry.file_type().map_err(FsError::from_io)?;
-            out.push(DirEntry {
+            #[cfg(unix)]
+            let ino = Some(std::os::unix::fs::DirEntryExt::ino(&entry));
+            #[cfg(not(unix))]
+            let ino = None;
+            let visited = visit(DirEntry {
                 name: entry.file_name(),
                 file_type: if t.is_symlink() {
                     FileType::Symlink
@@ -678,9 +695,13 @@ impl FileSystem for StdFileSystem {
                 } else {
                     FileType::Other
                 },
-            });
+                ino,
+            })?;
+            if visited.is_break() {
+                return Ok(());
+            }
         }
-        Ok(out)
+        Ok(())
     }
 
     fn create_dir(&self, path: &Path) -> Result<()> {
