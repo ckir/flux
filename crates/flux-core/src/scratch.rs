@@ -841,6 +841,11 @@ mod tests {
         assert_eq!(cache_candidates_from(os(""), os(""), None), Vec::<PathBuf>::new());
         assert_eq!(cache_candidates_from(None, os("home"), None), Vec::<PathBuf>::new());
     }
+    /// Where the scratch file goes for a home chosen by the search: on Windows into its `flux-scratch` subdirectory.
+    fn chosen(home: &str) -> PathBuf {
+        if cfg!(windows) { Path::new(home).join("flux-scratch") } else { PathBuf::from(home) }
+    }
+
     fn home_fs() -> FaultFs {
         use flux_fs::FileSystem;
         let fs = FaultFs::new();
@@ -859,14 +864,14 @@ mod tests {
             temporary_home_from(&fs, Some(Path::new("/mine")), Path::new("/tmp"), &caches).unwrap();
         assert_eq!(shown, Path::new("/mine"), "explicit wins with no memory check");
         let (_, shown) = temporary_home_from(&fs, None, Path::new("/tmp"), &caches).unwrap();
-        assert_eq!(shown, Path::new("/tmp"));
+        assert_eq!(shown, chosen("/tmp"));
         fs.set_memory_backed("/tmp", Some(true));
         let (_, shown) = temporary_home_from(&fs, None, Path::new("/tmp"), &caches).unwrap();
-        assert_eq!(shown, Path::new("/cache"));
+        assert_eq!(shown, chosen("/cache"));
         // An unknown answer is not "memory-backed".
         fs.set_memory_backed("/tmp", None);
         let (_, shown) = temporary_home_from(&fs, None, Path::new("/tmp"), &caches).unwrap();
-        assert_eq!(shown, Path::new("/tmp"));
+        assert_eq!(shown, chosen("/tmp"));
     }
 
     #[test]
@@ -889,7 +894,7 @@ mod tests {
         fs.set_memory_backed("/tmp", Some(true));
         let caches = [PathBuf::from("/cache/sub")];
         let (_, shown) = temporary_home_from(&fs, None, Path::new("/tmp"), &caches).unwrap();
-        assert_eq!(shown, Path::new("/cache/sub"));
+        assert_eq!(shown, chosen("/cache/sub"));
         assert!(fs.exists("/cache/sub"), "made because it was absent");
         fs.set_memory_backed("/cache/sub", Some(true));
         let Err(e) = temporary_home_from(&fs, None, Path::new("/tmp"), &caches) else {
