@@ -425,6 +425,29 @@ Method: a counting global allocator (the pattern of `dry_run_memory.rs`), a flat
 
 Criterion: `peak_2m <= peak_1m + 1 MiB` (met: the difference is 6,888 B) and `LIVE` back at its baseline (met: 0 B, tolerance 64 KiB). One run; the allocation counts are deterministic and do not depend on machine load. Not mutation-tested: the test was not run against a deliberately leaking or non-cascading walk (each run takes about ten minutes); the non-vacuity of the pieces it relies on is covered by the unit tests of plan 2 (Tasks 3 and 4).
 
-### GATE-A and GATE-X: NOT RUN
+### GATE-A and GATE-X: release binary, peak RSS
 
-The release-binary gates (GATE-A at 500,000, 1,000,000 and 2,000,000 entries for `--dry-run`, a fresh `copy` and `verify`, flat and `--dirs 1`; GATE-X at 10,000,000 entries) need the owner's go-ahead for fixtures of that size and an idle machine; they are recorded as open in `TODO.md` and the plan's ledger. Windows CI has not run (no push without the owner's go-ahead): the Windows branches are compile-checked only.
+Binary: release build of `feat/bounded-listing` at `7fb94df` (`~/.cache/flux-c23-target/release/flux`). Fixtures: `benches/phase3/make_tree.py` zero-byte trees, flat (`flux-rss-flat-N`) and one created subdirectory holding every entry (`flux-rss-one-N`, `--dirs 1`), N = 500,000, 1,000,000, 2,000,000, plus a flat 10,000,000. Method: `/usr/bin/time -v` "Maximum resident set size" (KiB), two runs each; `Anonymous` from `/proc/<pid>/smaps_rollup`, the sample with the largest `Rss` of a 50 ms sampler (it can miss a short peak, so it is a breakdown, not the peak). `--dry-run` (DEST absent), a fresh `copy` (DEST removed before each run), and `verify` over the freshly copied identical tree, all at `-vv`; the "listing spilled" lines on stderr were counted (stdout to `/dev/null`, stderr through a counting pipe). Peak RSS is not a timing; no wall-clock figure is claimed. Background load was NOT controlled (a browser at about 30% of a core and the review peer were running; the box had been idle of my own work); the field check found no stale measurement process and a probe (`yes`) read 100%.
+
+Peak RSS, KiB, two runs each:
+
+| Case | 500,000 | 1,000,000 | 2,000,000 | Slope 1M to 2M |
+|---|---|---|---|---|
+| flat, `--dry-run` | 29068, 29468 | 29300, 29548 | 29176, 29576 | -0.05 B/entry |
+| flat, fresh `copy` | 30340, 30264 | 30260, 30320 | 30260, 30040 | -0.14 B/entry |
+| flat, `verify` | 29384, 29668 | 29268, 29460 | 29424, 29668 | +0.19 B/entry |
+| one dir, `--dry-run` | 28452, 29468 | 28920, 29696 | 29260, 29572 | +0.11 B/entry |
+| one dir, fresh `copy` | 30312, 30336 | 30452, 30168 | 30348, 30376 | +0.05 B/entry |
+| one dir, `verify` | 29592, 29724 | 29476, 29608 | 29692, 29512 | +0.06 B/entry |
+
+Before this plan (`Cut 23 baseline` above, `main` at `c286819`): `--dry-run` grew by about 76 B/entry, a copy onto a pre-existing destination by 614, `verify` by 144. Now every slope is inside the run-to-run spread (up to about 1 MiB between two runs of one cell), so the figures are "flat", not "fractionally positive". Criterion: slope at most 5 B/entry (met in all six rows).
+
+`Anonymous` at the sampled peak, KiB (two runs): dry-run 24880/24884 (500k), 24876/24876 (1M), 24876/24876 (2M); copy 24976/24980, 24976/24980, 24980/24980; verify 24892/24892, 24924/24920, 24988/24988; the one-dir rows are within 20 KiB of these. The anonymous slope 1M to 2M is 0 to 0.07 B/entry (at most 1 B required: met). The file-backed part is the binary and the shared libraries (`Rss` minus `Anonymous` is about 4.6 to 5 MiB, constant).
+
+Spill counts: every `--dry-run` and `copy` run reported one "listing spilled" line (`entries=1000000 runs=4` at 1M), every `verify` run two (one per side), so the threshold was crossed in every cell; at N = 500,000 and above the production constants (8,192 inline, 262,144 per run) apply.
+
+GATE-X (one `--dry-run` over the flat 10,000,000-entry fixture): peak RSS 29216 and 29072 KiB against 29176 and 29576 KiB at 2,000,000 (the difference is at most 0.5 MiB; the criterion is within 64 MiB: met); the `-vv` line reads `listing spilled entries=10000000 runs=39`, the 39 runs the spec predicts (10,000,000 / 262,144 rounded up).
+
+A first attempt at this run was discarded: it took `ru_maxrss` from `wait4` inside a Python driver, and a forked child's peak includes the driver's own memory (the driver grew while deleting a 2,000,000-entry destination), so its figures climbed with N for a reason unrelated to the program; it also captured `-vv` stderr to a file that exhausted the `/tmp` user quota. The figures above come from `/usr/bin/time -v` around the binary (a small parent process), with stderr counted through a pipe.
+
+Not measured: GATE-B and GATE-D (plan 3 and plan 1), a destination above the threshold (structure B), Windows, any timing. Windows CI has not run (no push without the owner's go-ahead): the Windows branches are compile-checked only.
