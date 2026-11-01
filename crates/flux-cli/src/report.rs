@@ -712,7 +712,6 @@ pub fn stop_lines(e: &RunError) -> Vec<String> {
             let mut v = vec![format!("{}: {}", refusal.code.as_str(), refusal.detail)];
             if let Some(h) = &refusal.holder {
                 v.push(format!("  holder owner_instance_id: {}", h.owner_instance_id));
-                v.push(format!("  holder boot_session_id: {}", h.boot_session_id));
                 v.push(format!(
                     "  holder last_heartbeat_wall_time: {}",
                     h.last_heartbeat_wall_time
@@ -817,7 +816,7 @@ pub fn run_warning_line(w: &RunWarning) -> String {
         RunWarning::DryRunLockRecord {
             operation_id,
             owner_instance_id,
-            boot_session_id,
+            boot_session_id: _,
             heartbeat_age_secs,
             workspace_path,
         } => {
@@ -826,7 +825,7 @@ pub fn run_warning_line(w: &RunWarning) -> String {
                 None => "in the future".to_string(),
             };
             format!(
-                "note: a lock record for operation {operation_id} exists (owner instance {owner_instance_id}, boot session {boot_session_id}, last heartbeat {age}, workspace {workspace_path}); a real run tries the OS lock: if it is held, TARGET_LOCK_BUSY; if not, the preview below applies, and this exit code reflects that case"
+                "note: a lock record for operation {operation_id} exists (owner instance {owner_instance_id}, last heartbeat {age}, workspace {workspace_path}); a real run tries the OS lock: if it is held, TARGET_LOCK_BUSY; if not, the preview below applies, and this exit code reflects that case"
             )
         }
         RunWarning::DryRunLockTakeover { why } => format!(
@@ -1613,7 +1612,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_prints_its_code_and_detail_then_one_line_per_holder_field() {
+    fn a_refusal_prints_its_code_and_detail_without_exposing_boot_session_id() {
         let e = RunError::Refused {
             refusal: Box::new(Refusal {
                 code: LockCode::TargetLockBusy,
@@ -1629,7 +1628,6 @@ mod tests {
             vec![
                 "TARGET_LOCK_BUSY: /p/d.flux-lock: another run holds the lock; wait for it to finish".to_string(),
                 format!("  holder owner_instance_id: {}", "2".repeat(32)),
-                "  holder boot_session_id: boot".to_string(),
                 "  holder last_heartbeat_wall_time: 7".to_string(),
                 "  holder workspace_path: operations/x".to_string(),
             ]
@@ -2351,21 +2349,21 @@ mod tests {
                 RunWarning::DryRunLockRecord {
                     operation_id: id(),
                     owner_instance_id: "o".into(),
-                    boot_session_id: "b".into(),
+                    boot_session_id: "sensitive-boot-id".into(),
                     heartbeat_age_secs: Some(7),
                     workspace_path: "none".into(),
                 },
-                "note: a lock record for operation abc exists (owner instance o, boot session b, last heartbeat 7 s ago, workspace none); a real run tries the OS lock: if it is held, TARGET_LOCK_BUSY; if not, the preview below applies, and this exit code reflects that case",
+                "note: a lock record for operation abc exists (owner instance o, last heartbeat 7 s ago, workspace none); a real run tries the OS lock: if it is held, TARGET_LOCK_BUSY; if not, the preview below applies, and this exit code reflects that case",
             ),
             (
                 RunWarning::DryRunLockRecord {
                     operation_id: id(),
                     owner_instance_id: "o".into(),
-                    boot_session_id: "b".into(),
+                    boot_session_id: "sensitive-boot-id".into(),
                     heartbeat_age_secs: None,
                     workspace_path: "none".into(),
                 },
-                "note: a lock record for operation abc exists (owner instance o, boot session b, last heartbeat in the future, workspace none); a real run tries the OS lock: if it is held, TARGET_LOCK_BUSY; if not, the preview below applies, and this exit code reflects that case",
+                "note: a lock record for operation abc exists (owner instance o, last heartbeat in the future, workspace none); a real run tries the OS lock: if it is held, TARGET_LOCK_BUSY; if not, the preview below applies, and this exit code reflects that case",
             ),
             (
                 RunWarning::DryRunLockTakeover { why: "torn".into() },

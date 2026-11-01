@@ -273,7 +273,7 @@ mod tests {
             assert_eq!(
                 &bytes[at..at + 2],
                 &(field.len() as u16).to_le_bytes(),
-                "length of {field}"
+                "field length mismatch"
             );
             assert_eq!(&bytes[at + 2..at + 2 + field.len()], field.as_bytes());
             at += 2 + field.len();
