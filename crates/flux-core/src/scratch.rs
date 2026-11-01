@@ -388,7 +388,8 @@ impl<'h> ScratchSpace<'h> {
 }
 
 /// A span of the file from `start` to its end at the time it is dropped; dropping truncates the file back to
-/// `start`. Regions nest like a stack.
+/// `start`, unless `start` is above the file's current end (a parent region already dropped and cut the file below
+/// it): then the file is left alone, since a truncate would pad it with zeros. Regions nest like a stack.
 pub(crate) struct Region<'s, 'h> {
     space: &'s ScratchSpace<'h>,
     start: u64,

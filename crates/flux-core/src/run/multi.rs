@@ -847,6 +847,16 @@ pub fn trees<F: DestinationRoot>(
     };
     // Created before any walk so it outlives them all; placed under the lock (or at once, for a dry run).
     let scratch = ScratchSpace::unplaced(Thresholds::default(), cfg.scratch_dir.clone());
+    // A real copy opens an explicit `--scratch-dir` once, here, before DEST or the lock is touched; a dry run opens it
+    // at its first spill.
+    if !cfg.dry_run
+        && let Some(dir) = scratch.explicit()
+    {
+        match crate::scratch::open_explicit(fs, dir) {
+            Ok(opened) => scratch.place(opened, dir.to_path_buf()),
+            Err(e) => return aborted(run, out, CopyError::at(CopyStep::Resolve, e)),
+        }
+    }
     let mut plans = Vec::with_capacity(specs.len());
     let mut inputs: Vec<RootInput<'_, '_, F>> = Vec::with_capacity(specs.len());
     for spec in &specs {
@@ -4761,5 +4771,21 @@ mod trees_tests {
             "{:?}",
             copy_of(&r)
         );
+    }
+
+    #[test]
+    fn several_sources_with_an_unusable_scratch_dir_stop_before_the_lock_and_touch_no_dest() {
+        let fs = fake();
+        let c = RunConfig { scratch_dir: Some(PathBuf::from("/nope")), ..cfg() };
+        let (r, got) = go_with(&fs, vec![spec("a"), spec("b")], &opts(), &c);
+        assert!(got.is_empty(), "{got:?}");
+        assert!(r.run.stop.is_none(), "{:?}", r.run.stop);
+        let Err(a) = copy_of(&r) else { panic!("the copy must abort") };
+        assert_eq!(a.error.step, CopyStep::Resolve);
+        assert!(a.error.cause.source.to_string().contains("/nope"), "{}", a.error.cause.source);
+        let log = calls(&fs);
+        assert!(!log.iter().any(|c| c.starts_with("create_lock(")), "{log:?}");
+        assert!(!fs.exists("/p/dest"), "DEST was not made");
+        assert!(!fs.exists(LOCK), "no lock file");
     }
 }

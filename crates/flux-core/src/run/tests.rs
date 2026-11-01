@@ -11923,6 +11923,23 @@ fn a_hardlink_group_straddling_run_boundaries_keeps_its_canonical_member() {
 }
 
 #[test]
+fn a_real_copy_with_an_unusable_scratch_dir_stops_before_the_lock_and_touches_no_dest() {
+    let fs = fake();
+    let c = RunConfig { scratch_dir: Some(PathBuf::from("/nope")), ..cfg() };
+    let (r, got) = run_tree(&fs, &c);
+    assert!(got.is_empty(), "{got:?}");
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    let a = aborted(&r);
+    assert_eq!(a.error.step, CopyStep::Resolve);
+    assert!(a.error.cause.source.to_string().contains("/nope"), "{}", a.error.cause.source);
+    let log = calls(&fs);
+    assert!(!log.iter().any(|c| c.starts_with("create_lock(")), "{log:?}");
+    assert!(!log.iter().any(|c| c.starts_with("create_dir(") && c.contains("dest")), "{log:?}");
+    assert!(!fs.exists("/p/dest"), "DEST was not made");
+    assert!(!fs.exists("/p/dest.flux-lock"), "no lock file");
+}
+
+#[test]
 fn a_dry_run_that_never_spills_creates_no_scratch() {
     let fs = fake();
     let (r, _) = run_tree(&fs, &RunConfig { dry_run: true, ..cfg() });
@@ -11949,12 +11966,17 @@ fn scratch_homes(fs: &FaultFs) -> Vec<String> {
         .collect()
 }
 
+/// Where a dry run's scratch file goes for the temporary root `/t`: on Windows into its `flux-scratch` subdirectory.
+fn expected_temporary_home() -> &'static str {
+    if cfg!(windows) { "/t/flux-scratch" } else { "/t" }
+}
+
 #[test]
 fn a_dry_run_that_spills_keeps_its_scratch_in_the_temporary_directory_and_never_in_dest() {
     let fs = dry_spill_fs();
     let (r, _) = run_tree_small(&fs, &dry_in_t(), spilling());
     assert!(r.stop.is_none(), "{:?}", r.stop);
-    assert_eq!(scratch_homes(&fs), ["/t"], "{:?}", calls(&fs));
+    assert_eq!(scratch_homes(&fs), [expected_temporary_home()], "{:?}", calls(&fs));
     assert!(!fs.exists("/p/dest"), "a dry run makes no DEST");
 }
 

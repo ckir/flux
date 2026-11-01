@@ -713,6 +713,10 @@ fn walk_checked<F: DestinationRoot>(
         match Side::new(fs, dst, opts.mounts, false, filter, &opts.selection, Some(&scratch_b)) {
             Ok(b) => b,
             Err(e) => {
+                // A fatal error the source side holds must not be lost to the destination's unreadable root.
+                if let Some(error) = a.fatal.take() {
+                    return Err(VerifyError::Failed { error });
+                }
                 root_unreadable(out, &format!("{DESTINATION}{}", e.source), e.code);
                 return Ok(());
             }
@@ -2878,6 +2882,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_held_source_fatal_is_not_lost_to_an_unreadable_destination_root() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/scratch")).unwrap();
+        tree(&fs, "/s", &[], &[]);
+        tree(&fs, "/d", &[], &[]);
+        identical_files(&fs, "", 40);
+        fs.fail_read_dir_of("/d", Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+        let (rows, result) = run_spilling(&fs, small_thresholds(), &|a, _| a.fail_writes_after(2));
+        assert!(matches!(result, Err(VerifyError::Failed { .. })), "{rows:?} {result:?}");
     }
 
     #[test]

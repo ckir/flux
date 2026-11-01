@@ -355,6 +355,20 @@ pub(crate) fn tree_with_thresholds<F: DestinationRoot>(
     // B1: the source side, then DEST and the identity pre-flight, before anything is created.
     // Created before the walk so it outlives it; placed under the lock (or at once, for a dry run).
     let scratch = ScratchSpace::unplaced(thresholds, cfg.scratch_dir.clone());
+    // A real copy opens an explicit `--scratch-dir` once, here, before DEST or the lock is touched (opening creates
+    // nothing); a dry run opens it at its first spill.
+    if !cfg.dry_run
+        && let Some(dir) = scratch.explicit()
+    {
+        match crate::scratch::open_explicit(fs, dir) {
+            Ok(opened) => scratch.place(opened, dir.to_path_buf()),
+            Err(e) => {
+                let error = CopyError::at(CopyStep::Resolve, e);
+                run.copy = Some(Err(TreeAbort { error, outcome: out }));
+                return run;
+            }
+        }
+    }
     let mut source =
         match prepare_source(fs, src_root, dst_root, MountPolicy::of(&opts), Some(&scratch)) {
             Ok(s) => s,

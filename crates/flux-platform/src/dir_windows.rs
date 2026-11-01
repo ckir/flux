@@ -1033,8 +1033,10 @@ fn open_file_at(p: &OwnedHandle, n: &OsStr, disposition: u32) -> Result<File> {
 }
 
 /// A file in `p` that deletes itself when its last handle closes. `FILE_DELETE_ON_CLOSE` needs `DELETE` access, and
-/// leaving `FILE_SHARE_DELETE` out of the share mode means nothing else can open it for deletion, so the name is gone
-/// when this handle drops, including when the process dies. Created exclusively (`FILE_CREATE`) under a random name,
+/// the share mode is 0, so no other process can open it at all (not for reading, writing or deletion: another process
+/// with access to the directory cannot read or alter the spilled listing, and a walk that meets the name cannot open
+/// it), and the name is gone when this handle drops, including when the process dies. The 24-hour sweep only queries
+/// attributes, which sharing does not restrict. Created exclusively (`FILE_CREATE`) under a random name,
 /// retried on a collision, and never through a reparse point (`FILE_OPEN_REPARSE_POINT`).
 fn create_scratch_at(p: &OwnedHandle) -> Result<File> {
     use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
@@ -1062,7 +1064,8 @@ fn create_scratch_at(p: &OwnedHandle) -> Result<File> {
                 &raw mut iosb,
                 std::ptr::null(),
                 0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                // No sharing: this handle is the only one.
+                0,
                 FILE_CREATE,
                 FILE_NON_DIRECTORY_FILE
                     | FILE_OPEN_REPARSE_POINT

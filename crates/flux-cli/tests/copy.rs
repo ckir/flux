@@ -1315,6 +1315,23 @@ fn scratch_dir_is_used_by_a_spilling_copy() {
 }
 
 #[test]
+fn a_real_copy_with_an_unusable_scratch_dir_creates_nothing() {
+    let d = TempDir::new().unwrap();
+    let src = tree_in(d.path());
+    let dst = d.path().join("dst");
+    let missing = d.path().join("missing");
+    let out =
+        flux().arg("copy").arg(&src).arg(&dst).arg("--scratch-dir").arg(&missing).output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains(missing.to_str().unwrap()), "{}", stderr(&out));
+    assert!(!dst.exists(), "DEST was not made");
+    assert!(!missing.exists());
+    let out = flux().arg("copy").arg(&src).arg(&dst).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(dst.join("sub").join("b").exists());
+}
+
+#[test]
 fn a_dry_run_that_does_not_spill_ignores_an_unusable_scratch_dir() {
     let d = TempDir::new().unwrap();
     let src = tree_in(d.path());

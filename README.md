@@ -96,8 +96,10 @@ A directory of more than 8,192 entries is sorted on disk, not in memory, so the 
 The spill is a nameless temporary file: for a real copy it sits in the operation's workspace under `DEST/.flux`; for
 `--dry-run` and `verify` it goes to the system temporary directory, or to the user cache directory when the temporary
 directory is memory-backed (`tmpfs`). `--scratch-dir PATH` (on `copy` and `verify`) chooses the place instead and is
-never refused as memory-backed. Only a run that actually spills touches the location. A scratch write error stops the
-whole run (exit 1); it is never reported as one skipped directory.
+never refused as memory-backed. A real copy opens an explicit `--scratch-dir` once, before it takes the lock (opening
+creates nothing; a path that cannot be opened exits 1 and leaves DEST untouched); `--dry-run` and `verify` touch it only
+when a directory actually spills, and the default locations are found at the first spill. A scratch write error stops
+the whole run (exit 1); it is never reported as one skipped directory.
 
 ### Verification
 
