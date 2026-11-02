@@ -12476,3 +12476,45 @@ fn the_dry_run_builds_the_index_in_its_temporary_scratch() {
     assert_eq!(dest_bytes(&fs, 6)[0].as_deref(), Some(&b"old 0"[..]));
     assert!(!fs.exists("/p/dest/.flux"), "a dry run makes no workspace");
 }
+
+/// `/src/h_dir` of six files over a `/p/dest/h_dir` of six files: the child directory's index is store-backed.
+fn hybrid_child() -> FaultFs {
+    let fs = FaultFs::new();
+    for d in ["/src", "/src/h_dir", "/p", "/p/dest", "/p/dest/h_dir"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    for i in 0..6 {
+        fs.write_file(format!("/src/h_dir/f{i}"), b"new");
+        fs.write_file(format!("/p/dest/h_dir/f{i}"), b"old");
+    }
+    fs
+}
+
+#[test]
+fn a_poisoned_hybrid_child_index_aborts_naming_that_directory() {
+    use crate::store::faults;
+    // The source lists inline, so only the child's index meets the poison; `commit_every 1` makes the last
+    // publication's own commit the one that fails, so the directory's `retire` is the first to see it.
+    let t = || {
+        crate::scratch::Thresholds::new(16, 16, 2, 16, 3)
+            .unwrap()
+            .with_index(4, 2, 4, 1 << 20, 1, 128)
+            .unwrap()
+    };
+    let k = on_a_fresh_thread(move || {
+        let fs = hybrid_child();
+        ok(&run_tree_small(&fs, &cfg(), t()).0);
+        faults::commits_at_first_retire()
+    });
+    assert!(k > 0);
+    faults::arm_commit_failure(k);
+    let fs = hybrid_child();
+    let (r, got) = run_tree_small(&fs, &cfg(), t());
+    let a = aborted(&r);
+    assert_eq!(a.error.step, CopyStep::Resolve, "{a:?}");
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(faults::commits_at_first_retire(), 0, "the poison came before any store retire");
+    let message = a.error.cause.source.to_string();
+    assert!(message.contains("h_dir"), "names the directory: {message}");
+    assert!(message.contains("injected commit failure"), "keeps the store's cause: {message}");
+}

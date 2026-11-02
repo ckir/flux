@@ -1209,9 +1209,9 @@ pub(crate) fn copy_tree_frames<F: DestinationRoot>(
                     names.retire(&mut tick)
                 };
                 if let Err(e) = retired {
-                    return Err(stored
-                        .take()
-                        .unwrap_or_else(|| CopyError::at(CopyStep::Resolve, e)));
+                    return Err(stored.take().unwrap_or_else(|| {
+                        CopyError::at(CopyStep::Resolve, at_path(Path::new(""), e))
+                    }));
                 }
                 match scratch.and_then(|s| s.poison_error()) {
                     // The root's own path is empty, in the walk and in the tree's names for it.
@@ -1503,9 +1503,10 @@ fn walk_into<'s, 'h, F: DestinationRoot>(
                         names.retire(&mut tick)
                     };
                     if let Err(e) = retired {
-                        return Err(stored
-                            .take()
-                            .unwrap_or_else(|| CopyError::at(CopyStep::Resolve, e)));
+                        // A poisoned index fails its retire first: name the directory, as the check below does.
+                        return Err(stored.take().unwrap_or_else(|| {
+                            CopyError::at(CopyStep::Resolve, at_path(&path, e))
+                        }));
                     }
                     if let Some(e) = scratch.and_then(|s| s.poison_error()) {
                         return Err(CopyError::at(CopyStep::Resolve, at_path(&path, e)));

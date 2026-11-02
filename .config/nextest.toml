@@ -4,3 +4,13 @@
 [[profile.default.overrides]]
 filter = 'test(/^wal::/) | test(/^checkpoint::/)'
 slow-timeout = { period = "10s", terminate-after = 3 }
+
+# The tests that create hundreds of thousands of files share one test group, so they never run at the same time: two of
+# them at once (600,000 + 300,000 files) exhaust the inodes of a 1,048,576-inode tmpfs `/tmp`, and unrelated tests then
+# fail with ENOSPC.
+[test-groups.many-files]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'binary(walk_spill_std_fs) | binary(walk_cascade_memory) | (binary(copy) & test(a_300k_entry_destination))'
+test-group = 'many-files'
