@@ -9,6 +9,7 @@
 
 use flux_fs::{Code, DestinationRoot, DirHandle, FsError};
 use std::cell::{Cell, Ref, RefCell};
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -265,6 +266,7 @@ pub struct ScratchSpace<'h> {
     owners: Cell<u64>,
     #[allow(dead_code)] // read by `next_ordinal`, first used by plan 3, task 5
     ordinals: Cell<u64>,
+    cache: RefCell<BlockCache>,
     #[cfg(test)]
     writes_before_failure: Cell<Option<u64>>,
     #[cfg(test)]
@@ -285,6 +287,7 @@ impl<'h> ScratchSpace<'h> {
             poison: Rc::new(Poison::new()),
             owners: Cell::new(0),
             ordinals: Cell::new(0),
+            cache: RefCell::new(BlockCache::new(thresholds.index_cache_blocks)),
             #[cfg(test)]
             writes_before_failure: Cell::new(None),
             #[cfg(test)]
@@ -417,6 +420,51 @@ impl<'h> ScratchSpace<'h> {
     /// The logical end of the lane's file.
     pub(crate) fn len(&self, lane: Lane) -> u64 {
         self.lane(lane).end.get()
+    }
+
+    /// `len` bytes of `lane` at `offset`, through the block cache. A `len` above `index_block` (an oversized frame) is
+    /// read uncached. Short files are an error: an index block never ends early.
+    pub(crate) fn read_block(
+        &self,
+        lane: Lane,
+        offset: u64,
+        len: usize,
+    ) -> Result<Rc<[u8]>, FsError> {
+        self.check_usable()?;
+        let cached = len <= self.thresholds.index_block;
+        if cached && let Some(hit) = self.cache.borrow_mut().get(lane, offset) {
+            return Ok(hit);
+        }
+        let mut buf = vec![0u8; len];
+        let got = self.read_at(lane, offset, &mut buf)?;
+        if got < len {
+            return Err(fatal("an index block ends before its recorded length"));
+        }
+        let data: Rc<[u8]> = Rc::from(buf);
+        let mut cache = self.cache.borrow_mut();
+        cache.misses += 1;
+        if cached {
+            cache.insert(lane, offset, Rc::clone(&data));
+        }
+        Ok(data)
+    }
+
+    /// Drops every cached block of `lane` that reaches `start` or beyond. Called by `truncate`, so a truncated region
+    /// is never served to the family built at the same offsets next.
+    pub(crate) fn invalidate_from(&self, lane: Lane, start: u64) {
+        self.cache.borrow_mut().invalidate_from(lane, start);
+    }
+
+    /// Blocks read from the file (cache misses and uncached reads) since the space was made.
+    // Read by tests so far; the later index tasks report it.
+    #[allow(dead_code)]
+    pub(crate) fn cache_misses(&self) -> u64 {
+        self.cache.borrow().misses
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_cache_misses(&self) {
+        self.cache.borrow_mut().misses = 0;
     }
 
     /// A fresh anonymous file from the home, for a family's cascade passes: not a lane and not tracked; the caller
@@ -612,7 +660,7 @@ impl<'h> ScratchSpace<'h> {
 
     /// Cuts the lane's file back to `start`. A failure poisons the space.
     pub(crate) fn truncate(&self, lane: Lane, start: u64) {
-        // Task 3: invalidate the block cache here
+        self.invalidate_from(lane, start);
         #[cfg(test)]
         if self.truncate_fails.replace(false) {
             self.poison(fatal("a truncate failed"));
@@ -625,6 +673,72 @@ impl<'h> ScratchSpace<'h> {
                 FsError::classify(&e),
                 std::io::Error::new(e.kind(), format!("a truncate failed: {e}")),
             ));
+        }
+    }
+}
+
+/// One cached block.
+struct Slot {
+    lane: Lane,
+    offset: u64,
+    data: Rc<[u8]>,
+    /// Set by a hit, cleared by the clock hand passing over.
+    referenced: bool,
+}
+
+/// A fixed number of index blocks with clock (second chance) eviction, keyed by lane and offset.
+pub(crate) struct BlockCache {
+    slots: Vec<Option<Slot>>,
+    map: HashMap<(Lane, u64), usize>,
+    hand: usize,
+    capacity: usize,
+    misses: u64,
+}
+
+impl BlockCache {
+    fn new(capacity: usize) -> BlockCache {
+        BlockCache { slots: Vec::new(), map: HashMap::new(), hand: 0, capacity, misses: 0 }
+    }
+
+    fn get(&mut self, lane: Lane, offset: u64) -> Option<Rc<[u8]>> {
+        let i = *self.map.get(&(lane, offset))?;
+        let slot = self.slots[i].as_mut()?;
+        slot.referenced = true;
+        Some(Rc::clone(&slot.data))
+    }
+
+    fn insert(&mut self, lane: Lane, offset: u64, data: Rc<[u8]>) {
+        let slot = Slot { lane, offset, data, referenced: false };
+        let index = if self.slots.len() < self.capacity {
+            self.slots.push(None);
+            self.slots.len() - 1
+        } else {
+            loop {
+                let i = self.hand;
+                self.hand = (self.hand + 1) % self.slots.len();
+                match &mut self.slots[i] {
+                    None => break i,
+                    Some(s) if s.referenced => s.referenced = false,
+                    Some(s) => {
+                        self.map.remove(&(s.lane, s.offset));
+                        break i;
+                    }
+                }
+            }
+        };
+        self.map.insert((lane, offset), index);
+        self.slots[index] = Some(slot);
+    }
+
+    fn invalidate_from(&mut self, lane: Lane, start: u64) {
+        for cell in &mut self.slots {
+            if let Some(s) = cell
+                && s.lane == lane
+                && s.offset + s.data.len() as u64 > start
+            {
+                self.map.remove(&(s.lane, s.offset));
+                *cell = None;
+            }
         }
     }
 }
@@ -942,6 +1056,46 @@ mod tests {
         let err = space.begin(Lane::Walk, 2).err().expect("refused");
         assert!(err.to_string().contains("shared by two walks"), "{err}");
         drop(first);
+    }
+
+    #[test]
+    fn lane_file_creates_the_lanes_file_and_a_closed_space_refuses_it() {
+        let fs = FaultFs::new();
+        let space = placed(&fs);
+        assert_eq!(creations(&fs), 0);
+        drop(space.lane_file(Lane::Inodes).unwrap_or_else(|e| panic!("{e}")));
+        assert_eq!(creations(&fs), 1, "{:?}", fs.calls());
+        drop(space.lane_file(Lane::Inodes).unwrap_or_else(|e| panic!("{e}")));
+        assert_eq!(creations(&fs), 1, "the second call reuses the file");
+        space.close();
+        let err = space.lane_file(Lane::Inodes).expect_err("refused");
+        assert!(err.to_string().contains("closed"), "{err}");
+        let err = space.lane_file(Lane::Names).expect_err("refused");
+        assert!(err.to_string().contains("closed"), "{err}");
+    }
+
+    #[test]
+    fn set_end_only_raises_the_lanes_end() {
+        let fs = FaultFs::new();
+        let space = placed(&fs);
+        space.set_end(Lane::Names, 10);
+        assert_eq!(space.len(Lane::Names), 10);
+        space.set_end(Lane::Names, 4);
+        assert_eq!(space.len(Lane::Names), 10, "never lowered");
+        space.set_end(Lane::Names, 12);
+        assert_eq!((space.len(Lane::Names), space.len(Lane::Walk)), (12, 0));
+    }
+
+    #[test]
+    fn a_closed_space_refuses_a_region_on_an_index_lane() {
+        let fs = FaultFs::new();
+        let space = placed(&fs);
+        drop(space.begin(Lane::Names, INDEX_OWNER).ok().unwrap());
+        space.close();
+        for lane in [Lane::Names, Lane::Inodes, Lane::Identity] {
+            let err = space.begin(lane, INDEX_OWNER).err().expect("refused");
+            assert!(err.to_string().contains("closed"), "{err}");
+        }
     }
 
     #[test]

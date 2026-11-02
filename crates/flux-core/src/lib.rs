@@ -12,6 +12,7 @@ pub mod copy;
 pub mod dry_run;
 pub(crate) mod hardlinks;
 pub mod ids;
+mod index;
 pub mod lock;
 mod names;
 pub mod oplog;
