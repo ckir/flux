@@ -14,9 +14,6 @@
 //! `B / 8` bytes of the first record's key then name (the CAPPED key), `u64` LE offset and `u32` LE length of what it
 //! points at. The top level is one block.
 
-// Read by the index tasks that follow (plan 3, tasks 4-8); unused until they land.
-#![allow(dead_code)]
-
 use crate::scratch::{
     INDEX_OWNER, Lane, Region, ScratchSpace, Thresholds, read_fully_at, write_all_at,
 };
@@ -60,6 +57,8 @@ pub(crate) struct FamilyMeta {
     pub end: u64,
     pub data_end: u64,
     pub levels: Vec<u64>,
+    // Read by the tests; the hybrid index reports counts from its own bookkeeping.
+    #[allow(dead_code)]
     pub count: u64,
 }
 

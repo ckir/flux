@@ -404,7 +404,7 @@ impl WeakIdentityWarnings {
 /// `next` emits `DirEnd` for every such frame, so this stack cannot drift from the walk.
 // `Skipped` is a marker on a stack that holds one frame per directory DEPTH; the size of `Live` costs nothing there.
 #[allow(clippy::large_enum_variant)]
-enum Frame<D: DirHandle> {
+enum Frame<'s, 'h, D: DirHandle> {
     Live {
         /// `None` only in dry mode: a directory that does not exist yet. Such a frame is `fresh` and holds no batch.
         dir: Option<D>,
@@ -416,7 +416,7 @@ enum Frame<D: DirHandle> {
         created: HashSet<ObjectId>,
         /// Cut 8b: this directory's names (its listing, the identity table, who wrote which spelling), dropped with the
         /// frame. A directory this run created has an empty listing.
-        names: NameIndex,
+        names: NameIndex<'s, 'h>,
         /// Cut 8b: the directory's `Strong` identity when the run has a claim store, the key every claim under it is
         /// made with; `None` for a copy without claims and for a directory whose identity is not `Strong`
         /// (`replace_degraded`), where every target is planned as new and an existing file is a collision.
@@ -847,7 +847,7 @@ pub(crate) fn copy_roots_at<F: DestinationRoot>(
     let mut done = Vec::with_capacity(roots.len());
     let mut abort: Option<CopyError> = None;
     // The DEST-level state the file roots share (one frame's worth), made at the first file root.
-    let mut files: Option<RootState> = None;
+    let mut files: Option<RootState<'_, '_>> = None;
     for root in roots {
         let name = root.name().to_os_string();
         if abort.is_some() {
@@ -1019,7 +1019,7 @@ fn file_root<F: DestinationRoot>(
     base: &Shared<'_, F>,
     dest: &RootsDest<'_, F::Dir>,
     dest_created: bool,
-    state: &mut Option<RootState>,
+    state: &mut Option<RootState<'_, '_>>,
     name: &OsStr,
     src_parent: &Path,
     identity: FileIdentity,
@@ -1174,21 +1174,21 @@ pub(crate) fn copy_tree_frames<F: DestinationRoot>(
 /// What a root frame is made of: the names of the directory (listed once when it pre-exists), the identity claims
 /// under it are keyed with, and whether this run created it. Shared by `copy_tree_frames` and the file roots of
 /// `copy_roots_at`, which keep their DEST-level state without a frame because DEST is borrowed, not owned.
-struct RootState {
-    names: NameIndex,
+struct RootState<'s, 'h> {
+    names: NameIndex<'s, 'h>,
     claim_parent: Option<ObjectId>,
     fresh: bool,
 }
 
 /// `copy_tree_frames`' set-up of its root frame, unchanged: `root` is `None` for a dry run's directory that does not
 /// exist yet. An `Err` is an abort.
-fn root_state<F: DestinationRoot>(
+fn root_state<'s, 'h, F: DestinationRoot>(
     cx: &Shared<'_, F>,
     root: Option<&F::Dir>,
     root_identity: RootIdentity,
     root_created: bool,
     out: &mut TreeOutcome,
-) -> std::result::Result<RootState, CopyError> {
+) -> std::result::Result<RootState<'s, 'h>, CopyError> {
     let claim_parent = match (cx.claims, root_identity.inner()) {
         (None, _) => None,
         (Some(_), FileIdentity::Strong(id)) => Some(id),
@@ -1207,8 +1207,8 @@ fn root_state<F: DestinationRoot>(
     // A pre-existing root is listed once; a root this run made (or, dry, one that does not exist) is `fresh` and needs
     // no listing.
     let fresh = root_created || root.is_none();
-    let names = NameIndex::for_dir(fresh, root.filter(|_| claim_parent.is_some()))
-        .map_err(|e| CopyError::at(CopyStep::Resolve, e))?;
+    let names = NameIndex::for_dir(fresh, root.filter(|_| claim_parent.is_some()), None, None)
+        .map_err(|e| CopyError::at(CopyStep::Resolve, e.into_fs()))?;
     Ok(RootState { names, claim_parent, fresh })
 }
 
@@ -1231,7 +1231,7 @@ fn walk_into<F: DestinationRoot>(
     cx: &Shared<'_, F>,
     events: &mut Walk<'_, '_, F>,
     root_identity: RootIdentity,
-    stack: &mut Vec<Frame<F::Dir>>,
+    stack: &mut Vec<Frame<'_, '_, F::Dir>>,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<(), CopyError> {
@@ -1447,7 +1447,7 @@ fn walk_into<F: DestinationRoot>(
 /// the real listing, as live's do.
 fn dry_top_level_flux<F: DestinationRoot>(
     cx: &Shared<'_, F>,
-    stack: &[Frame<F::Dir>],
+    stack: &[Frame<'_, '_, F::Dir>],
     path: &Path,
 ) -> bool {
     // A root of several sources has a prefix: its `.flux` is below `DEST/<name>`, not DEST's control directory.
@@ -1477,7 +1477,7 @@ fn dry_top_level_flux<F: DestinationRoot>(
 /// means `copy_one` resolves a directory entry (`DESTINATION_ERROR`); DEST absent means a fresh root plans it New and
 /// the identity gate refuses it (`SAFETY_REJECTED`). Counted in `failures.copy` as live's is; no `Planned` record.
 fn dry_flux_entry_failure<D: DirHandle>(
-    stack: &[Frame<D>],
+    stack: &[Frame<'_, '_, D>],
     path: PathBuf,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
@@ -1489,7 +1489,7 @@ fn dry_flux_entry_failure<D: DirHandle>(
 }
 
 /// Cut 9e: the writers held open across the stack, one per pending entry of every live frame.
-fn pending_total<D: DirHandle>(stack: &[Frame<D>]) -> usize {
+fn pending_total<D: DirHandle>(stack: &[Frame<'_, '_, D>]) -> usize {
     stack
         .iter()
         .map(|f| match f {
@@ -1527,8 +1527,8 @@ fn reserved_conflict() -> FsError {
 /// a directory that is absent, or sits under a frame with no directory, becomes a planned child with no handle.
 // The signature is the plan's: ten inputs, each a distinct piece of walk state.
 #[allow(clippy::too_many_arguments)]
-fn enter_dir<D: DirHandle>(
-    stack: &mut [Frame<D>],
+fn enter_dir<'s, 'h, D: DirHandle>(
+    stack: &mut [Frame<'s, 'h, D>],
     path: &Path,
     identity: FileIdentity,
     root_identity: RootIdentity,
@@ -1539,7 +1539,7 @@ fn enter_dir<D: DirHandle>(
     prefix: Option<&OsStr>,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
-) -> std::result::Result<Frame<D>, CopyError> {
+) -> std::result::Result<Frame<'s, 'h, D>, CopyError> {
     // The dynamic half of §129 / §149.6: a directory reached mid-walk that IS the
     // destination root means the source reached it by an alias. Checked before
     // anything is created for it. A planned root exists nowhere, so nothing equals it.
@@ -1733,10 +1733,12 @@ fn enter_dir<D: DirHandle>(
     let names = match NameIndex::for_dir(
         !pre_existing,
         child.as_ref().filter(|_| claim_parent.is_some()),
+        None,
+        None,
     ) {
         Ok(names) => names,
         Err(e) => {
-            report(out, on_report, path.to_path_buf(), TreeFailureCause::CreateDir(e));
+            report(out, on_report, path.to_path_buf(), TreeFailureCause::CreateDir(e.into_fs()));
             return Ok(Frame::Skipped);
         }
     };
@@ -1862,7 +1864,7 @@ fn hardlink_degradation<F: DestinationRoot>(
 fn copy_one<F: DestinationRoot>(
     cx: &Shared<'_, F>,
     parent: Option<&F::Dir>,
-    names: &mut NameIndex,
+    names: &mut NameIndex<'_, '_>,
     batch: &mut Batch<F::Writer>,
     claim_parent: Option<ObjectId>,
     fresh: bool,
@@ -1978,7 +1980,7 @@ fn copy_one<F: DestinationRoot>(
         Ok(Ok(Resolved::Absent))
     } else {
         let Some(parent) = parent else { unreachable!("a planned directory is fresh") };
-        names.resolve(parent, name)
+        names.resolve(parent, name, &mut || Ok(()))
     };
     let plan = match resolved {
         Err(e) => {
@@ -2004,17 +2006,29 @@ fn copy_one<F: DestinationRoot>(
         Ok(Ok(Resolved::Entry { stored, meta })) => {
             // §241.5: an entry another target of this run already published (even if its claim was not recorded)
             // is that target's. Refused before any policy decision, without consulting or writing the store.
-            if names.owner(&stored).is_some_and(|t| t != &target) {
-                let e = CopyError::at(
-                    CopyStep::Claim,
-                    FsError::new(
-                        Code::DestinationNamespaceCollision,
-                        std::io::Error::other(
-                            "another target of this operation already wrote that destination entry",
+            match names.owner(&stored) {
+                Err(e) => {
+                    report(
+                        out,
+                        on_report,
+                        path,
+                        TreeFailureCause::Copy(CopyError::at(CopyStep::Resolve, e)),
+                    );
+                    return Ok(());
+                }
+                Ok(Some(t)) if t != target => {
+                    let e = CopyError::at(
+                        CopyStep::Claim,
+                        FsError::new(
+                            Code::DestinationNamespaceCollision,
+                            std::io::Error::other(
+                                "another target of this operation already wrote that destination entry",
+                            ),
                         ),
-                    ),
-                );
-                return finish_copy(cx.key_prefix, path, Err(e), out, on_report);
+                    );
+                    return finish_copy(cx.key_prefix, path, Err(e), out, on_report);
+                }
+                _ => {}
             }
             // Cut 9a: `--resume`. The branch mutates nothing at the destination, so it neither beats nor guards.
             if cx.resume {
@@ -2468,7 +2482,7 @@ fn record_new<C: ClaimStore + ?Sized>(
     key: &ClaimKey,
     target: &FluxPathKey,
     strict: bool,
-    names: &mut NameIndex,
+    names: &mut NameIndex<'_, '_>,
     name: &OsStr,
     identity: FileIdentity,
     path: &Path,
@@ -2503,7 +2517,7 @@ fn record_replace<C: ClaimStore + ?Sized>(
     target: &FluxPathKey,
     strict: bool,
     replaced: FileIdentity,
-    names: &mut NameIndex,
+    names: &mut NameIndex<'_, '_>,
     identity: FileIdentity,
     path: &Path,
     out: &mut TreeOutcome,
@@ -2838,7 +2852,7 @@ enum LinkStep {
 fn link_member<F: DestinationRoot>(
     cx: &Shared<'_, F>,
     parent: &F::Dir,
-    names: &mut NameIndex,
+    names: &mut NameIndex<'_, '_>,
     batch: &mut Batch<F::Writer>,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
@@ -3005,7 +3019,7 @@ fn link_member<F: DestinationRoot>(
 fn link_one<F: DestinationRoot>(
     cx: &Shared<'_, F>,
     parent: Option<&F::Dir>,
-    names: &mut NameIndex,
+    names: &mut NameIndex<'_, '_>,
     batch: &mut Batch<F::Writer>,
     claim_parent: Option<ObjectId>,
     fresh: bool,
@@ -3117,7 +3131,7 @@ fn link_one<F: DestinationRoot>(
         Ok(Ok(Resolved::Absent))
     } else {
         let Some(parent) = parent else { unreachable!("a planned directory is fresh") };
-        names.resolve(parent, name)
+        names.resolve(parent, name, &mut || Ok(()))
     };
     let plan = match resolved {
         Err(e) => {
@@ -3143,17 +3157,29 @@ fn link_one<F: DestinationRoot>(
             // An entry is resolved only under a directory that exists.
             let Some(parent) = parent else { unreachable!("a planned directory is fresh") };
             // §241.5, before any policy decision.
-            if names.owner(&stored).is_some_and(|t| t != &target) {
-                let e = CopyError::at(
-                    CopyStep::Claim,
-                    FsError::new(
-                        Code::DestinationNamespaceCollision,
-                        std::io::Error::other(
-                            "another target of this operation already wrote that destination entry",
+            match names.owner(&stored) {
+                Err(e) => {
+                    report(
+                        out,
+                        on_report,
+                        path,
+                        TreeFailureCause::Copy(CopyError::at(CopyStep::Resolve, e)),
+                    );
+                    return Ok(());
+                }
+                Ok(Some(t)) if t != target => {
+                    let e = CopyError::at(
+                        CopyStep::Claim,
+                        FsError::new(
+                            Code::DestinationNamespaceCollision,
+                            std::io::Error::other(
+                                "another target of this operation already wrote that destination entry",
+                            ),
                         ),
-                    ),
-                );
-                return finish_copy(cx.key_prefix, path, Err(e), out, on_report);
+                    );
+                    return finish_copy(cx.key_prefix, path, Err(e), out, on_report);
+                }
+                _ => {}
             }
             // `--resume` (spec 3.4). The branch mutates nothing at the destination, so it neither beats nor guards.
             if cx.resume {
@@ -3416,7 +3442,7 @@ fn link_one<F: DestinationRoot>(
 fn publish_link<F: DestinationRoot>(
     cx: &Shared<'_, F>,
     parent: &F::Dir,
-    names: &mut NameIndex,
+    names: &mut NameIndex<'_, '_>,
     batch: &mut Batch<F::Writer>,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
@@ -3773,7 +3799,7 @@ fn same_link<D: DirHandle>(parent: &D, stored: &std::ffi::OsStr, link: &flux_fs:
 fn stage_into_batch<F: DestinationRoot>(
     cx: &Shared<'_, F>,
     parent: &F::Dir,
-    names: &mut NameIndex,
+    names: &mut NameIndex<'_, '_>,
     batch: &mut Batch<F::Writer>,
     src: &Path,
     path: PathBuf,
@@ -3871,7 +3897,7 @@ fn stage_into_batch<F: DestinationRoot>(
 fn flush_batch<F: DestinationRoot>(
     cx: &Shared<'_, F>,
     parent: &F::Dir,
-    names: &mut NameIndex,
+    names: &mut NameIndex<'_, '_>,
     batch: &mut Batch<F::Writer>,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
@@ -4283,7 +4309,7 @@ enum DrainMode {
 /// rounds 5 and 6).
 fn drain_batches<F: DestinationRoot>(
     cx: &Shared<'_, F>,
-    stack: &mut [Frame<F::Dir>],
+    stack: &mut [Frame<'_, '_, F::Dir>],
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
     walk_failed: bool,
@@ -4307,7 +4333,7 @@ fn drain_batches<F: DestinationRoot>(
 fn drain_one<F: DestinationRoot>(
     cx: &Shared<'_, F>,
     dir: &F::Dir,
-    names: &mut NameIndex,
+    names: &mut NameIndex<'_, '_>,
     batch: &mut Batch<F::Writer>,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
