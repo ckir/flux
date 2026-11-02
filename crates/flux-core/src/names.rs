@@ -372,8 +372,6 @@ impl<'s, 'h> NameIndex<'s, 'h> {
 
     /// Whether the scratch space this index spills into is unusable (the tree asks after a failed `resolve` or
     /// `owner`).
-    // Asked by the tree once the index is wired to the scratch space (plan 3, task 6).
-    #[allow(dead_code)]
     pub(crate) fn is_poisoned(&self) -> bool {
         let site = match &self.form {
             Form::Inline(i) => i.site,
@@ -446,8 +444,6 @@ impl<'s, 'h> NameIndex<'s, 'h> {
 
     /// Ends the index: a hybrid one drops its families (their regions truncate the lanes, the cache is invalidated)
     /// and removes its rows from the store; an inline one has nothing to release.
-    // Called by the tree when a frame is popped (plan 3, task 6).
-    #[allow(dead_code)]
     pub(crate) fn retire(self, tick: &mut Tick<'_>) -> Result<(), FsError> {
         match self.form {
             Form::Inline(_) => Ok(()),

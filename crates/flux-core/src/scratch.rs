@@ -169,13 +169,10 @@ fn fatal(message: impl Into<String>) -> FsError {
 
 /// The owner every index lane's regions are taken with: index frames nest in stack order and no two walks share a
 /// lane, so the one-active-walk check does not apply to them.
-// Read by the index tasks that follow (plan 3, tasks 2-4); unused until they land.
-#[allow(dead_code)]
 pub(crate) const INDEX_OWNER: u64 = u64::MAX;
 
 /// One anonymous file of the space, with its own logical end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(dead_code)] // the index lanes are first used by plan 3, tasks 2-4
 pub(crate) enum Lane {
     Walk,
     Names,
@@ -266,7 +263,6 @@ pub struct ScratchSpace<'h> {
     poison: Rc<Poison>,
     store: RefCell<Option<Store>>,
     owners: Cell<u64>,
-    #[allow(dead_code)] // read by `next_ordinal`, first used by plan 3, task 5
     ordinals: Cell<u64>,
     cache: RefCell<BlockCache>,
     #[cfg(test)]
@@ -316,8 +312,6 @@ impl<'h> ScratchSpace<'h> {
     }
 
     /// The tier 2 key of a directory with no Strong identity: 1, 2, 3, ...
-    // Read by the index tasks that follow (plan 3, tasks 2-4); unused until they land.
-    #[allow(dead_code)]
     pub(crate) fn next_ordinal(&self) -> u64 {
         let n = self.ordinals.get() + 1;
         self.ordinals.set(n);
@@ -459,8 +453,8 @@ impl<'h> ScratchSpace<'h> {
     }
 
     /// Blocks read from the file (cache misses and uncached reads) since the space was made.
-    // Read by tests so far; the later index tasks report it.
-    #[allow(dead_code)]
+    // Read only by tests so far; no non-test caller reports it yet.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn cache_misses(&self) -> u64 {
         self.cache.borrow().misses
     }
@@ -472,8 +466,6 @@ impl<'h> ScratchSpace<'h> {
 
     /// A fresh anonymous file from the home, for a family's cascade passes: not a lane and not tracked; the caller
     /// drops it. A deferred home is resolved first, exactly as `ensure_open` does.
-    // Read by the index tasks that follow (plan 3, tasks 2-4); unused until they land.
-    #[allow(dead_code)]
     pub(crate) fn transient(&self) -> Result<File, FsError> {
         self.check_usable()?;
         self.resolve_home();
@@ -498,8 +490,6 @@ impl<'h> ScratchSpace<'h> {
 
     /// The tier-2 store, created on first use over an unlinked file of its own. Any error is poisoned and returned;
     /// on a poisoned space the poison error comes back and nothing is touched.
-    // Read by the index tasks that follow (plan 3, tasks 5-8); unused until they land.
-    #[allow(dead_code)]
     pub(crate) fn store(&self) -> Result<RefMut<'_, Store>, FsError> {
         self.check_usable()?;
         let mut slot = self
@@ -534,8 +524,6 @@ impl<'h> ScratchSpace<'h> {
 
     /// Makes the store's final commit, if a store exists: a run that is otherwise ending successfully calls it
     /// before `close()`. Its error is the fatal scratch error.
-    // Read by the index tasks that follow (plan 3, tasks 5-8); unused until they land.
-    #[allow(dead_code)]
     pub(crate) fn finish_store(&self) -> Result<(), FsError> {
         self.check_usable()?;
         match self.store.try_borrow_mut() {
@@ -553,8 +541,6 @@ impl<'h> ScratchSpace<'h> {
     /// INVARIANT: while the returned `Ref` is held no call may take `borrow_mut` on that lane's backing (`ensure_open`
     /// does). The tick the listing thread calls while waiting is the beat-and-guard closure, which touches the lock
     /// file, never the scratch space.
-    // Read by the index tasks that follow (plan 3, tasks 2-4); unused until they land.
-    #[allow(dead_code)]
     pub(crate) fn lane_file(&self, lane: Lane) -> Result<Ref<'_, File>, FsError> {
         self.check_usable()?;
         self.ensure_open(lane)?;
@@ -567,8 +553,6 @@ impl<'h> ScratchSpace<'h> {
 
     /// Raises the lane's logical end to `end` (never lowers it): the listing thread calls it after joining the
     /// workers that wrote the lane through `lane_file`.
-    // Read by the index tasks that follow (plan 3, tasks 2-4); unused until they land.
-    #[allow(dead_code)]
     pub(crate) fn set_end(&self, lane: Lane, end: u64) {
         let state = self.lane(lane);
         if end > state.end.get() {
