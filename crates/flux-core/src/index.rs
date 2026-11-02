@@ -17,7 +17,9 @@
 // Read by the index tasks that follow (plan 3, tasks 4-8); unused until they land.
 #![allow(dead_code)]
 
-use crate::scratch::{INDEX_OWNER, Lane, Region, ScratchSpace, Thresholds, write_all_at};
+use crate::scratch::{
+    INDEX_OWNER, Lane, Region, ScratchSpace, Thresholds, read_fully_at, write_all_at,
+};
 use crate::spill::{
     Keyed, Merger, RunSpan, Sink, Source, cascade_pass, decode, encode, os_name, passes_for,
     sort_keyed, write_run,
@@ -298,7 +300,13 @@ impl PendingRuns {
         }
         let mut merger =
             Merger::new(Source::File(files[cur]), k, th.merge_buffer, &runs).map_err(classify)?;
-        let mut packer = Packer::new(lane_file, self.lane, k, th.index_block, start);
+        // The file no run is being read from: the other one after a cascade, else the tail of the only one.
+        let (spill, spill_at) = match self.second {
+            Some(_) => (files[1 - cur], ends[1 - cur].get()),
+            None => (files[0], ends[0].get()),
+        };
+        let mut packer =
+            Packer::new(lane_file, spill, spill_at, self.lane, k, th.index_block, start);
         let mut items = 0u64;
         while let Some(item) = merger.next_entry().map_err(classify)? {
             if th.tick_entries > 0 && items.is_multiple_of(th.tick_entries as u64) {
@@ -424,6 +432,21 @@ fn pack_level(entries: &[u8], b: usize) -> Result<Packed, FsError> {
     Ok((blocks, firsts))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The most bytes of level-0 entries (or of the blocks built from them) the packer held at once, on this thread.
+    static L0_RESIDENT_HIGH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Records `n` resident level-0 bytes (tests read the high-water mark).
+#[cfg(test)]
+fn note_resident(n: usize) {
+    L0_RESIDENT_HIGH.with(|h| h.set(h.get().max(n)));
+}
+
+#[cfg(not(test))]
+fn note_resident(_n: usize) {}
+
 /// Writes the packed layout of a sorted stream of items at `start` in a lane's file.
 struct Packer<'f> {
     file: &'f File,
@@ -440,14 +463,27 @@ struct Packer<'f> {
     frame_count: usize,
     first_key: Vec<u8>,
     record: Vec<u8>,
-    level0: Vec<u8>,
+    /// A transient file no run is being read from, which holds the level-0 entries until the data is written.
+    spill: &'f File,
+    spill_start: u64,
+    /// Entries not yet written to `spill`, from `spill_at`; at most one block's worth plus one entry.
+    spill_buf: Vec<u8>,
+    spill_at: u64,
     count: u64,
 }
 
 impl<'f> Packer<'f> {
     const FLUSH: usize = 64 * 1024;
 
-    fn new(file: &'f File, lane: Lane, k: usize, b: usize, start: u64) -> Self {
+    fn new(
+        file: &'f File,
+        spill: &'f File,
+        spill_at: u64,
+        lane: Lane,
+        k: usize,
+        b: usize,
+        start: u64,
+    ) -> Self {
         Packer {
             file,
             lane,
@@ -461,7 +497,10 @@ impl<'f> Packer<'f> {
             frame_count: 0,
             first_key: Vec::new(),
             record: Vec::new(),
-            level0: Vec::new(),
+            spill,
+            spill_start: spill_at,
+            spill_buf: Vec::new(),
+            spill_at,
             count: 0,
         }
     }
@@ -475,6 +514,15 @@ impl<'f> Packer<'f> {
             let out = std::mem::take(&mut self.out);
             self.write(self.out_at, &out)?;
             self.out_at += out.len() as u64;
+        }
+        Ok(())
+    }
+
+    fn flush_spill(&mut self) -> Result<(), FsError> {
+        if !self.spill_buf.is_empty() {
+            write_all_at(self.spill, &self.spill_buf, self.spill_at).map_err(FsError::from_io)?;
+            self.spill_at += self.spill_buf.len() as u64;
+            self.spill_buf.clear();
         }
         Ok(())
     }
@@ -515,7 +563,11 @@ impl<'f> Packer<'f> {
         self.out[at..at + 2].copy_from_slice(&(self.frame_count as u16).to_le_bytes());
         self.out[at + 2..at + total].copy_from_slice(&self.frame);
         let len = u32::try_from(size).map_err(|_| fatal("an index frame is too long"))?;
-        put_entry(&mut self.level0, &self.first_key, self.pos, len);
+        put_entry(&mut self.spill_buf, &self.first_key, self.pos, len);
+        note_resident(self.spill_buf.len());
+        if self.spill_buf.len() >= self.b {
+            self.flush_spill()?;
+        }
         self.pos += size as u64;
         self.frame.clear();
         self.frame_count = 0;
@@ -525,31 +577,115 @@ impl<'f> Packer<'f> {
         Ok(())
     }
 
+    /// Packs level 0 by reading the spilled entries back in bounded chunks and writing each block straight to the
+    /// lane at `offset`. Returns the number of blocks and the entries of level 1 (one per block).
+    ///
+    /// MEMORY: level 0 is never resident (a read chunk of four blocks and one block of body). Level 1 and above are
+    /// built in memory: level 1 is about one entry per `B / (entry size)` level-0 entries, i.e. about 1/100 of
+    /// level 0, so it is O(frames / 100) and below the 1 B per entry the spec allows for every realistic family.
+    fn pack_level0(&mut self, offset: u64) -> Result<(usize, Vec<u8>), FsError> {
+        let b = self.b;
+        let chunk = 4 * b;
+        let spill_end = self.spill_at;
+        let mut read_at = self.spill_start;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut pos = 0usize;
+        let mut body: Vec<u8> = Vec::new();
+        let mut count = 0u16;
+        let mut first: Vec<u8> = Vec::new();
+        let mut blocks = 0usize;
+        let mut upper: Vec<u8> = Vec::new();
+        let mut block = vec![0u8; b];
+        loop {
+            // The next whole entry, refilling the chunk when it is cut off.
+            let next = match entry_at(&buf, pos) {
+                Ok((_, _, _, next)) => Some(next),
+                Err(_) if read_at < spill_end => None,
+                Err(_) if pos >= buf.len() => break,
+                Err(e) => return Err(e),
+            };
+            let Some(next) = next else {
+                buf.drain(..pos);
+                pos = 0;
+                let want = (spill_end - read_at).min(chunk as u64) as usize;
+                let old = buf.len();
+                buf.resize(old + want, 0);
+                let got = read_fully_at(self.spill, &mut buf[old..], read_at)
+                    .map_err(FsError::from_io)?;
+                if got < want {
+                    return Err(fatal("the index level-0 spill ends early"));
+                }
+                read_at += want as u64;
+                note_resident(buf.len() + body.len());
+                continue;
+            };
+            let size = next - pos;
+            if count > 0 && 2 + body.len() + size > b {
+                self.write_block(&mut block, &body, count, offset + (blocks * b) as u64)?;
+                blocks += 1;
+                body.clear();
+                count = 0;
+            }
+            if count == 0 {
+                let (key, _, _, _) = entry_at(&buf, pos)?;
+                first.clear();
+                first.extend_from_slice(key);
+                put_entry(&mut upper, &first, offset + (blocks * b) as u64, b as u32);
+            }
+            body.extend_from_slice(&buf[pos..next]);
+            count += 1;
+            pos = next;
+        }
+        if count > 0 {
+            self.write_block(&mut block, &body, count, offset + (blocks * b) as u64)?;
+            blocks += 1;
+        }
+        Ok((blocks, upper))
+    }
+
+    fn write_block(
+        &self,
+        block: &mut [u8],
+        body: &[u8],
+        count: u16,
+        at: u64,
+    ) -> Result<(), FsError> {
+        block.fill(0);
+        block[..2].copy_from_slice(&count.to_le_bytes());
+        block[2..2 + body.len()].copy_from_slice(body);
+        write_all_at(self.file, block, at).map_err(FsError::from_io)
+    }
+
     fn finish(mut self) -> Result<FamilyMeta, FsError> {
         self.flush_frame()?;
         self.flush_out()?;
+        self.flush_spill()?;
         if self.count == 0 {
             return Err(fatal("an index family holds no records"));
         }
         let data_end = self.pos;
         let b = self.b;
-        let mut levels = Vec::new();
-        let mut entries = std::mem::take(&mut self.level0);
-        let mut offset = data_end;
-        let end = loop {
-            levels.push(offset);
-            let (blocks, firsts) = pack_level(&entries, b)?;
-            self.write(offset, &blocks)?;
-            if firsts.len() == 1 {
-                break offset + b as u64;
+        let mut levels = vec![data_end];
+        let (blocks, mut entries) = self.pack_level0(data_end)?;
+        let mut offset = data_end + (blocks * b) as u64;
+        let end = if blocks == 1 {
+            offset
+        } else {
+            loop {
+                levels.push(offset);
+                let (packed, firsts) = pack_level(&entries, b)?;
+                self.write(offset, &packed)?;
+                if firsts.len() == 1 {
+                    break offset + b as u64;
+                }
+                let mut upper = Vec::new();
+                for (j, (from, to)) in firsts.iter().enumerate() {
+                    let (key, _, _, _) = entry_at(&entries[*from..*to], 0)?;
+                    put_entry(&mut upper, key, offset + (j * b) as u64, b as u32);
+                }
+                offset += packed.len() as u64;
+                entries = upper;
             }
-            let mut upper = Vec::new();
-            for (j, (from, to)) in firsts.iter().enumerate() {
-                let (key, _, _, _) = entry_at(&entries[*from..*to], 0)?;
-                put_entry(&mut upper, key, offset + (j * b) as u64, b as u32);
-            }
-            offset += blocks.len() as u64;
-            entries = upper;
         };
         Ok(FamilyMeta {
             lane: self.lane,
@@ -1381,6 +1517,22 @@ mod tests {
         for i in 0..2_000 {
             assert!(big.contains_name(format!("n{i:05}").as_bytes()).unwrap(), "{i}");
         }
+    }
+
+    #[test]
+    fn the_packer_holds_only_a_few_blocks_of_level_zero_at_once() {
+        let fs = FaultFs::new();
+        let space = placed(&fs, thresholds());
+        L0_RESIDENT_HIGH.with(|h| h.set(0));
+        let family = one(&space, Lane::Names, 0, names(2_000));
+        let high = L0_RESIDENT_HIGH.with(Cell::get);
+        assert!(family.meta.levels.len() >= 3, "{:?}", family.meta.levels);
+        assert_eq!(family.level0_entries().len(), 143, "the level-0 entries are all on disk");
+        assert!(high <= 8 * 128, "level 0 was resident: {high} bytes");
+        for i in 0..2_000 {
+            assert!(family.contains_name(format!("n{i:05}").as_bytes()).unwrap(), "{i}");
+        }
+        assert!(!family.contains_name(b"n01999x").unwrap());
     }
 
     #[test]
