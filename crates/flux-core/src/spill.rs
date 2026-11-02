@@ -6,10 +6,11 @@
 
 //! Sorted runs of directory entries in the scratch space, and their k-way merge (spec 6.2).
 //!
-//! A record is `u16` LE name length, `u8` file type (0 File, 1 Dir, 2 Symlink, 3 Other), then the name's
-//! `as_encoded_bytes()`. The `ino` hint is not stored: a decoded entry carries `None`.
+//! A record is `K` key bytes (`K` is 0, 8 or 24; the walk uses 0), then `u16` LE name length, `u8` file type
+//! (0 File, 1 Dir, 2 Symlink, 3 Other), then the name's `as_encoded_bytes()`. The `ino` hint is not stored: a
+//! decoded entry carries `None`. Order is the key bytes lexicographically, then `key_cmp` on the name bytes.
 
-use crate::scratch::{Lane, Region, ScratchSpace};
+use crate::scratch::{Lane, Region, ScratchSpace, read_fully_at, write_all_at};
 use flux_fs::{Code, DirEntry, FileType, FsError};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -19,9 +20,25 @@ fn fatal(message: impl Into<String>) -> FsError {
     FsError::new(Code::IoError, std::io::Error::other(message.into()))
 }
 
-/// Appends the record of `entry` to `out`. A name longer than `u16::MAX` bytes is an error and leaves `out` as it was.
-pub(crate) fn encode(entry: &DirEntry, out: &mut Vec<u8>) -> Result<(), FsError> {
-    let name = entry.name.as_encoded_bytes();
+/// A directory entry with the fixed-width key it sorts by first; only the first `k` bytes of the family are
+/// meaningful, the rest are zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Keyed {
+    pub key: [u8; 24],
+    pub entry: DirEntry,
+}
+
+impl Keyed {
+    /// A keyless item (`K = 0`), as the walk lists.
+    pub(crate) fn plain(entry: DirEntry) -> Keyed {
+        Keyed { key: [0; 24], entry }
+    }
+}
+
+/// Appends the record of `item` (its first `k` key bytes, then the name record) to `out`. A name longer than
+/// `u16::MAX` bytes is an error and leaves `out` as it was.
+pub(crate) fn encode(k: usize, item: &Keyed, out: &mut Vec<u8>) -> Result<(), FsError> {
+    let name = item.entry.name.as_encoded_bytes();
     let Ok(len) = u16::try_from(name.len()) else {
         return Err(fatal(format!(
             "a directory entry name of {} bytes is too long to spill (limit {})",
@@ -29,8 +46,9 @@ pub(crate) fn encode(entry: &DirEntry, out: &mut Vec<u8>) -> Result<(), FsError>
             u16::MAX
         )));
     };
+    out.extend_from_slice(&item.key[..k]);
     out.extend_from_slice(&len.to_le_bytes());
-    out.push(match entry.file_type {
+    out.push(match item.entry.file_type {
         FileType::File => 0,
         FileType::Dir => 1,
         FileType::Symlink => 2,
@@ -40,9 +58,12 @@ pub(crate) fn encode(entry: &DirEntry, out: &mut Vec<u8>) -> Result<(), FsError>
     Ok(())
 }
 
-/// The first record of `bytes` and its length, with `ino: None`; `None` on a short buffer or an unknown type byte.
-pub(crate) fn decode(bytes: &[u8]) -> Option<(DirEntry, usize)> {
-    let header = bytes.get(..3)?;
+/// The first record of `bytes` and its length (key bytes included), with `ino: None` and the key bytes past `k`
+/// zero; `None` on a short buffer or an unknown type byte.
+pub(crate) fn decode(k: usize, bytes: &[u8]) -> Option<(Keyed, usize)> {
+    let mut key = [0u8; 24];
+    key[..k].copy_from_slice(bytes.get(..k)?);
+    let header = bytes.get(k..k + 3)?;
     let len = usize::from(u16::from_le_bytes([header[0], header[1]]));
     let file_type = match header[2] {
         0 => FileType::File,
@@ -51,22 +72,26 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<(DirEntry, usize)> {
         3 => FileType::Other,
         _ => return None,
     };
-    let name = bytes.get(3..3 + len)?;
-    Some((DirEntry { name: os_name(name), file_type, ino: None }, 3 + len))
+    let name = bytes.get(k + 3..k + 3 + len)?;
+    Some((
+        Keyed { key, entry: DirEntry { name: os_name(name), file_type, ino: None } },
+        k + 3 + len,
+    ))
 }
 
+/// Rebuilds a name from the bytes `as_encoded_bytes` gave.
 #[cfg(unix)]
-fn os_name(bytes: &[u8]) -> OsString {
+pub(crate) fn os_name(bytes: &[u8]) -> OsString {
     std::os::unix::ffi::OsStringExt::from_vec(bytes.to_vec())
 }
 
 #[cfg(windows)]
-fn os_name(bytes: &[u8]) -> OsString {
+pub(crate) fn os_name(bytes: &[u8]) -> OsString {
     std::os::windows::ffi::OsStringExt::from_wide(&wtf8_to_wide(bytes))
 }
 
 #[cfg(not(any(unix, windows)))]
-fn os_name(bytes: &[u8]) -> OsString {
+pub(crate) fn os_name(bytes: &[u8]) -> OsString {
     OsString::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
@@ -120,34 +145,50 @@ pub(crate) fn key_cmp(a: &[u8], b: &[u8]) -> Ordering {
     prefix(a).cmp(&prefix(b)).then_with(|| a.cmp(b))
 }
 
-/// Sorts by name bytes, comparing cached `u64` prefixes before the bytes (no two names are equal, so the order of
-/// equals does not matter).
-pub(crate) fn sort_entries(v: &mut [DirEntry]) {
-    let mut keys: Vec<(u64, u32)> = Vec::with_capacity(v.len());
+/// The first eight key bytes (fewer when `k < 8`), big-endian, zero padded.
+fn key_prefix(k: usize, key: &[u8; 24]) -> u64 {
+    prefix(&key[..k.min(8)])
+}
+
+/// Key bytes first (the first eight as a big-endian `u64`, then the whole `k` bytes), then `key_cmp` on the names.
+pub(crate) fn keyed_cmp(k: usize, a: &Keyed, b: &Keyed) -> Ordering {
+    let head =
+        if k >= 8 { key_prefix(k, &a.key).cmp(&key_prefix(k, &b.key)) } else { Ordering::Equal };
+    head.then_with(|| a.key[..k].cmp(&b.key[..k]))
+        .then_with(|| key_cmp(a.entry.name.as_encoded_bytes(), b.entry.name.as_encoded_bytes()))
+}
+
+/// Sorts by `keyed_cmp`, comparing cached `u64` prefixes of the key and of the name before the bytes (equal items
+/// may land in either order).
+pub(crate) fn sort_keyed(k: usize, v: &mut [Keyed]) {
+    let mut keys: Vec<(u64, u64, u32)> = Vec::with_capacity(v.len());
     for (i, e) in v.iter().enumerate() {
         let Ok(i) = u32::try_from(i) else {
             // More entries than an index holds: sort directly.
-            v.sort_unstable_by(|a, b| {
-                key_cmp(a.name.as_encoded_bytes(), b.name.as_encoded_bytes())
-            });
+            v.sort_unstable_by(|a, b| keyed_cmp(k, a, b));
             return;
         };
-        keys.push((prefix(e.name.as_encoded_bytes()), i));
+        keys.push((key_prefix(k, &e.key), prefix(e.entry.name.as_encoded_bytes()), i));
     }
     keys.sort_unstable_by(|a, b| {
-        a.0.cmp(&b.0).then_with(|| {
-            v[a.1 as usize].name.as_encoded_bytes().cmp(v[b.1 as usize].name.as_encoded_bytes())
-        })
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| keyed_cmp(k, &v[a.2 as usize], &v[b.2 as usize]))
     });
     // Apply the permutation in place (the method of `slice::sort_by_cached_key`).
     for i in 0..v.len() {
-        let mut index = keys[i].1 as usize;
+        let mut index = keys[i].2 as usize;
         while index < i {
-            index = keys[index].1 as usize;
+            index = keys[index].2 as usize;
         }
-        keys[i].1 = index as u32;
+        keys[i].2 = index as u32;
         v.swap(i, index);
     }
+}
+
+/// Sorts keyless items (`K = 0`) by name bytes: the walk's sort.
+pub(crate) fn sort_entries(v: &mut [Keyed]) {
+    sort_keyed(0, v);
 }
 
 /// Where a sorted run lies in the scratch file.
@@ -158,9 +199,58 @@ pub(crate) struct RunSpan {
     pub count: u64,
 }
 
-/// Appends one run at the end of the file through a buffer flushed as it fills.
+/// Where a run is read from: a lane of the scratch space, or a transient file a worker owns.
+// The `File` variant is built by the index tasks that follow (plan 3, tasks 3-4); unused until they land.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub(crate) enum Source<'s, 'h> {
+    Lane(&'s ScratchSpace<'h>, Lane),
+    File(&'s std::fs::File),
+}
+
+impl Source<'_, '_> {
+    fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        match self {
+            Source::Lane(space, lane) => space.read_at(*lane, offset, buf),
+            Source::File(file) => read_fully_at(file, buf, offset).map_err(FsError::from_io),
+        }
+    }
+}
+
+/// Where runs are appended: a lane of the scratch space, or a transient file with its append offset.
+// The `File` variant is built by the index tasks that follow (plan 3, tasks 3-4); unused until they land.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub(crate) enum Sink<'s, 'h> {
+    Lane(&'s ScratchSpace<'h>, Lane),
+    File(&'s std::fs::File, &'s std::cell::Cell<u64>),
+}
+
+impl Sink<'_, '_> {
+    /// The offset the next byte goes to.
+    fn end(&self) -> u64 {
+        match self {
+            Sink::Lane(space, lane) => space.len(*lane),
+            Sink::File(_, offset) => offset.get(),
+        }
+    }
+
+    fn write(&self, offset: u64, bytes: &[u8]) -> Result<(), FsError> {
+        match self {
+            Sink::Lane(space, lane) => space.write_at(*lane, offset, bytes),
+            Sink::File(file, cell) => {
+                write_all_at(file, bytes, offset).map_err(FsError::from_io)?;
+                cell.set(cell.get().max(offset + bytes.len() as u64));
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Appends one run at the end of the sink through a buffer flushed as it fills.
 struct RunWriter<'s, 'h> {
-    space: &'s ScratchSpace<'h>,
+    sink: Sink<'s, 'h>,
+    k: usize,
     start: u64,
     offset: u64,
     buf: Vec<u8>,
@@ -169,25 +259,25 @@ struct RunWriter<'s, 'h> {
 }
 
 impl<'s, 'h> RunWriter<'s, 'h> {
-    fn new(space: &'s ScratchSpace<'h>) -> Self {
-        let start = space.len(Lane::Walk);
-        let cap = space.thresholds().merge_buffer.saturating_mul(4);
-        RunWriter { space, start, offset: start, buf: Vec::new(), cap, count: 0 }
+    fn new(sink: Sink<'s, 'h>, k: usize, merge_buffer: usize) -> Self {
+        let start = sink.end();
+        let cap = merge_buffer.saturating_mul(4);
+        RunWriter { sink, k, start, offset: start, buf: Vec::new(), cap, count: 0 }
     }
 
     fn flush(&mut self, n: usize) -> Result<(), FsError> {
         if n == 0 {
             return Ok(());
         }
-        self.space.write_at(Lane::Walk, self.offset, &self.buf[..n])?;
+        self.sink.write(self.offset, &self.buf[..n])?;
         self.offset += n as u64;
         self.buf.drain(..n);
         Ok(())
     }
 
-    fn push(&mut self, entry: &DirEntry) -> Result<(), FsError> {
+    fn push(&mut self, item: &Keyed) -> Result<(), FsError> {
         let mark = self.buf.len();
-        encode(entry, &mut self.buf)?;
+        encode(self.k, item, &mut self.buf)?;
         self.count += 1;
         if mark > 0 && self.buf.len() > self.cap {
             self.flush(mark)?;
@@ -204,11 +294,17 @@ impl<'s, 'h> RunWriter<'s, 'h> {
     }
 }
 
-/// Appends the (already sorted) `entries` as one run at the end of the file.
-pub(crate) fn write_run(space: &ScratchSpace, entries: &[DirEntry]) -> Result<RunSpan, FsError> {
-    let mut w = RunWriter::new(space);
-    for e in entries {
-        w.push(e)?;
+/// Appends the (already sorted) `items` as one run at the end of the sink; `merge_buffer` is the threshold of that
+/// name (the writer buffers four times as much).
+pub(crate) fn write_run(
+    sink: Sink,
+    k: usize,
+    merge_buffer: usize,
+    items: &[Keyed],
+) -> Result<RunSpan, FsError> {
+    let mut w = RunWriter::new(sink, k, merge_buffer);
+    for item in items {
+        w.push(item)?;
     }
     w.finish()
 }
@@ -226,16 +322,17 @@ impl RunCursor {
         RunCursor { next_off: span.start, end: span.start + span.len, buf: Vec::new(), pos: 0 }
     }
 
-    /// The next entry of the run, refilling by `chunk` bytes (a record longer than that grows the buffer).
+    /// The next item of the run, refilling by `chunk` bytes (a record longer than that grows the buffer).
     fn next_entry(
         &mut self,
-        space: &ScratchSpace,
+        source: Source,
+        k: usize,
         chunk: usize,
-    ) -> Result<Option<DirEntry>, FsError> {
+    ) -> Result<Option<Keyed>, FsError> {
         loop {
-            if let Some((entry, n)) = decode(&self.buf[self.pos..]) {
+            if let Some((item, n)) = decode(k, &self.buf[self.pos..]) {
                 self.pos += n;
-                return Ok(Some(entry));
+                return Ok(Some(item));
             }
             if self.next_off >= self.end {
                 if self.pos < self.buf.len() {
@@ -248,7 +345,7 @@ impl RunCursor {
             let want = (self.end - self.next_off).min(chunk as u64) as usize;
             let old = self.buf.len();
             self.buf.resize(old + want, 0);
-            let got = space.read_at(Lane::Walk, self.next_off, &mut self.buf[old..])?;
+            let got = source.read(self.next_off, &mut self.buf[old..])?;
             if got < want {
                 return Err(fatal("a scratch run ends before its recorded length"));
             }
@@ -259,14 +356,14 @@ impl RunCursor {
 
 /// A run's current head in the merge heap; `BinaryHeap` is a max-heap, so the order is reversed.
 struct Head {
-    entry: DirEntry,
+    item: Keyed,
+    k: usize,
     run: usize,
 }
 
 impl Ord for Head {
     fn cmp(&self, other: &Self) -> Ordering {
-        key_cmp(other.entry.name.as_encoded_bytes(), self.entry.name.as_encoded_bytes())
-            .then_with(|| other.run.cmp(&self.run))
+        keyed_cmp(self.k, &other.item, &self.item).then_with(|| other.run.cmp(&self.run))
     }
 }
 
@@ -285,34 +382,39 @@ impl PartialEq for Head {
 impl Eq for Head {}
 
 /// The merge itself, with no region of its own (so `cascade` can append inside its caller's).
-struct Merger<'s, 'h> {
-    space: &'s ScratchSpace<'h>,
+pub(crate) struct Merger<'s, 'h> {
+    source: Source<'s, 'h>,
+    k: usize,
     cursors: Vec<RunCursor>,
     heap: BinaryHeap<Head>,
     chunk: usize,
 }
 
 impl<'s, 'h> Merger<'s, 'h> {
-    fn new(space: &'s ScratchSpace<'h>, runs: &[RunSpan]) -> Result<Self, FsError> {
-        let chunk = space.thresholds().merge_buffer;
+    pub(crate) fn new(
+        source: Source<'s, 'h>,
+        k: usize,
+        chunk: usize,
+        runs: &[RunSpan],
+    ) -> Result<Self, FsError> {
         let mut cursors: Vec<RunCursor> = runs.iter().map(|r| RunCursor::new(*r)).collect();
         let mut heap = BinaryHeap::with_capacity(cursors.len());
         for (run, cursor) in cursors.iter_mut().enumerate() {
-            if let Some(entry) = cursor.next_entry(space, chunk)? {
-                heap.push(Head { entry, run });
+            if let Some(item) = cursor.next_entry(source, k, chunk)? {
+                heap.push(Head { item, k, run });
             }
         }
-        Ok(Merger { space, cursors, heap, chunk })
+        Ok(Merger { source, k, cursors, heap, chunk })
     }
 
-    fn next_entry(&mut self) -> Result<Option<DirEntry>, FsError> {
+    pub(crate) fn next_entry(&mut self) -> Result<Option<Keyed>, FsError> {
         let Some(head) = self.heap.pop() else {
             return Ok(None);
         };
-        if let Some(entry) = self.cursors[head.run].next_entry(self.space, self.chunk)? {
-            self.heap.push(Head { entry, run: head.run });
+        if let Some(item) = self.cursors[head.run].next_entry(self.source, self.k, self.chunk)? {
+            self.heap.push(Head { item, k: self.k, run: head.run });
         }
-        Ok(Some(head.entry))
+        Ok(Some(head.item))
     }
 }
 
@@ -328,16 +430,19 @@ pub(crate) struct MergeReader<'s, 'h> {
 impl<'s, 'h> MergeReader<'s, 'h> {
     pub(crate) fn new(
         space: &'s ScratchSpace<'h>,
+        lane: Lane,
+        k: usize,
         runs: Vec<RunSpan>,
         region: Region<'s, 'h>,
     ) -> Result<Self, FsError> {
-        let merger = Merger::new(space, &runs)?;
+        let merger =
+            Merger::new(Source::Lane(space, lane), k, space.thresholds().merge_buffer, &runs)?;
         Ok(MergeReader { merger, done: false, _region: region })
     }
 }
 
 impl Iterator for MergeReader<'_, '_> {
-    type Item = Result<DirEntry, FsError>;
+    type Item = Result<Keyed, FsError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
@@ -357,50 +462,122 @@ impl Iterator for MergeReader<'_, '_> {
     }
 }
 
-/// Merges consecutive groups of `merge_fan_in` runs into new runs appended at the end of the file (the inputs stay
-/// until the caller's region drops) while more than `merge_fan_in` remain. A lone run at the end of a pass is
-/// carried over as it is. `tick` gets the entries merged so far every `tick_entries` entries and once at the end
-/// of each pass.
+/// The number of passes a cascade of `n` runs makes at `fan_in`.
+pub(crate) fn passes_for(mut n: usize, fan_in: usize) -> u32 {
+    let mut passes = 0u32;
+    while n > fan_in {
+        n = n.div_ceil(fan_in);
+        passes += 1;
+    }
+    passes
+}
+
+/// One merge pass, counting merged entries in `merged` (so a caller looping over passes keeps one running count
+/// for its ticks).
+#[allow(clippy::too_many_arguments)]
+fn cascade_pass_counting(
+    source: Source,
+    sink: Sink,
+    k: usize,
+    merge_buffer: usize,
+    runs: &[RunSpan],
+    fan_in: usize,
+    tick_entries: usize,
+    pass: u32,
+    passes: u32,
+    merged: &mut u64,
+    tick: &mut dyn FnMut(u64) -> Result<(), FsError>,
+) -> Result<Vec<RunSpan>, FsError> {
+    let mut next = Vec::with_capacity(runs.len().div_ceil(fan_in));
+    let mut bytes = 0u64;
+    for group in runs.chunks(fan_in) {
+        if let [only] = group {
+            next.push(*only);
+            continue;
+        }
+        let mut merger = Merger::new(source, k, merge_buffer, group)?;
+        let mut writer = RunWriter::new(sink, k, merge_buffer);
+        while let Some(item) = merger.next_entry()? {
+            writer.push(&item)?;
+            *merged += 1;
+            if tick_entries > 0 && merged.is_multiple_of(tick_entries as u64) {
+                tick(*merged)?;
+            }
+        }
+        let span = writer.finish()?;
+        bytes += span.len;
+        next.push(span);
+    }
+    tracing::debug!(pass, passes, bytes, "merge pass");
+    tick(*merged)?;
+    Ok(next)
+}
+
+/// Merges ONE pass: consecutive groups of `fan_in` runs of `source` into new runs appended to `sink`; a lone
+/// trailing run is carried over as it is. `merge_buffer` and `tick_entries` are the thresholds of those names,
+/// passed as values because a worker thread has no `&ScratchSpace`. `tick` gets the entries merged in this pass
+/// every `tick_entries` entries and once at the end. Logs the pass (`pass` of `passes`, as its caller counts).
+// Read by the index tasks that follow (plan 3, tasks 3-4); unused until they land.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn cascade_pass(
+    source: Source,
+    sink: Sink,
+    k: usize,
+    merge_buffer: usize,
+    runs: &[RunSpan],
+    fan_in: usize,
+    tick_entries: usize,
+    pass: u32,
+    passes: u32,
+    tick: &mut dyn FnMut(u64) -> Result<(), FsError>,
+) -> Result<Vec<RunSpan>, FsError> {
+    let mut merged = 0u64;
+    cascade_pass_counting(
+        source,
+        sink,
+        k,
+        merge_buffer,
+        runs,
+        fan_in,
+        tick_entries,
+        pass,
+        passes,
+        &mut merged,
+        tick,
+    )
+}
+
+/// Merges consecutive groups of `merge_fan_in` runs into new runs appended at the end of the lane's file (the
+/// inputs stay until the caller's region drops) while more than `merge_fan_in` remain. A lone run at the end of a
+/// pass is carried over as it is. `tick` gets the entries merged so far every `tick_entries` entries and once at
+/// the end of each pass.
 pub(crate) fn cascade(
     space: &ScratchSpace,
+    lane: Lane,
+    k: usize,
     mut runs: Vec<RunSpan>,
     tick: &mut dyn FnMut(u64) -> Result<(), FsError>,
 ) -> Result<Vec<RunSpan>, FsError> {
     let t = space.thresholds();
     let fan = t.merge_fan_in;
-    let mut passes = 0u32;
-    let mut n = runs.len();
-    while n > fan {
-        n = n.div_ceil(fan);
-        passes += 1;
-    }
+    let passes = passes_for(runs.len(), fan);
     let mut merged = 0u64;
     let mut pass = 0u32;
     while runs.len() > fan {
         pass += 1;
-        let mut next = Vec::with_capacity(runs.len().div_ceil(fan));
-        let mut bytes = 0u64;
-        for group in runs.chunks(fan) {
-            if let [only] = group {
-                next.push(*only);
-                continue;
-            }
-            let mut merger = Merger::new(space, group)?;
-            let mut writer = RunWriter::new(space);
-            while let Some(entry) = merger.next_entry()? {
-                writer.push(&entry)?;
-                merged += 1;
-                if t.tick_entries > 0 && merged.is_multiple_of(t.tick_entries as u64) {
-                    tick(merged)?;
-                }
-            }
-            let span = writer.finish()?;
-            bytes += span.len;
-            next.push(span);
-        }
-        tracing::debug!(pass, passes, bytes, "merge pass");
-        tick(merged)?;
-        runs = next;
+        runs = cascade_pass_counting(
+            Source::Lane(space, lane),
+            Sink::Lane(space, lane),
+            k,
+            t.merge_buffer,
+            &runs,
+            fan,
+            t.tick_entries,
+            pass,
+            passes,
+            &mut merged,
+            tick,
+        )?;
     }
     Ok(runs)
 }
@@ -423,6 +600,33 @@ mod tests {
         space
     }
 
+    fn sort_plain(v: &mut Vec<DirEntry>) {
+        let mut k: Vec<Keyed> = v.drain(..).map(Keyed::plain).collect();
+        sort_entries(&mut k);
+        v.extend(k.into_iter().map(|i| i.entry));
+    }
+
+    fn wr(space: &ScratchSpace, items: &[DirEntry]) -> Result<RunSpan, FsError> {
+        let k: Vec<Keyed> = items.iter().cloned().map(Keyed::plain).collect();
+        write_run(Sink::Lane(space, Lane::Walk), 0, space.thresholds().merge_buffer, &k)
+    }
+
+    fn casc(
+        space: &ScratchSpace,
+        runs: Vec<RunSpan>,
+        tick: &mut dyn FnMut(u64) -> Result<(), FsError>,
+    ) -> Result<Vec<RunSpan>, FsError> {
+        cascade(space, Lane::Walk, 0, runs, tick)
+    }
+
+    fn reader<'s, 'h>(
+        space: &'s ScratchSpace<'h>,
+        runs: Vec<RunSpan>,
+        region: Region<'s, 'h>,
+    ) -> Result<impl Iterator<Item = Result<DirEntry, FsError>> + use<'s, 'h>, FsError> {
+        Ok(MergeReader::new(space, Lane::Walk, 0, runs, region)?.map(|r| r.map(|i| i.entry)))
+    }
+
     fn entry(name: OsString, file_type: FileType) -> DirEntry {
         DirEntry { name, file_type, ino: None }
     }
@@ -443,12 +647,12 @@ mod tests {
         names.push(std::os::windows::ffi::OsStringExt::from_wide(&[0xD800, 0xD83D, 0xDE00, 0x61]));
         for ft in TYPES {
             for name in &names {
-                let e = entry(name.clone(), ft);
+                let e = Keyed::plain(entry(name.clone(), ft));
                 let mut buf = Vec::new();
-                encode(&e, &mut buf).unwrap();
+                encode(0, &e, &mut buf).unwrap();
                 assert_eq!(buf.len(), 3 + name.as_encoded_bytes().len());
-                assert_eq!(decode(&buf), Some((e, buf.len())));
-                assert_eq!(decode(&buf[..buf.len() - 1]), None, "a short buffer");
+                assert_eq!(decode(0, &buf), Some((e, buf.len())));
+                assert_eq!(decode(0, &buf[..buf.len() - 1]), None, "a short buffer");
             }
         }
     }
@@ -458,10 +662,10 @@ mod tests {
     fn a_name_longer_than_u16_is_an_error_not_a_panic() {
         let name: OsString = std::os::unix::ffi::OsStringExt::from_vec(vec![b'a'; 65_536]);
         let mut buf = Vec::new();
-        assert!(encode(&entry(name, FileType::File), &mut buf).is_err());
+        assert!(encode(0, &Keyed::plain(entry(name, FileType::File)), &mut buf).is_err());
         assert!(buf.is_empty(), "nothing is written for a refused name");
         let ok: OsString = std::os::unix::ffi::OsStringExt::from_vec(vec![b'a'; 65_535]);
-        assert!(encode(&entry(ok, FileType::File), &mut buf).is_ok());
+        assert!(encode(0, &Keyed::plain(entry(ok, FileType::File)), &mut buf).is_ok());
     }
 
     #[test]
@@ -518,12 +722,12 @@ mod tests {
             let mut runs = Vec::new();
             for chunk in entries.chunks(t.run_entries) {
                 let mut c = chunk.to_vec();
-                sort_entries(&mut c);
-                runs.push(write_run(&space, &c).unwrap());
+                sort_plain(&mut c);
+                runs.push(wr(&space, &c).unwrap());
             }
-            let runs = cascade(&space, runs, &mut |_| Ok(())).unwrap();
+            let runs = casc(&space, runs, &mut |_| Ok(())).unwrap();
             prop_assert!(runs.len() <= t.merge_fan_in);
-            let got: Vec<DirEntry> = MergeReader::new(&space, runs, region)
+            let got: Vec<DirEntry> = reader(&space, runs, region)
                 .unwrap()
                 .collect::<Result<_, _>>()
                 .unwrap();
@@ -540,12 +744,12 @@ mod tests {
         let mut runs = Vec::new();
         for c in 0..25 {
             let mut chunk: Vec<DirEntry> = (0..4).map(|i| named(i * 25 + c)).collect();
-            sort_entries(&mut chunk);
-            runs.push(write_run(&space, &chunk).unwrap());
+            sort_plain(&mut chunk);
+            runs.push(wr(&space, &chunk).unwrap());
         }
         assert_eq!(runs.len(), 25);
         let mut ticks = 0;
-        let runs = cascade(&space, runs, &mut |_| {
+        let runs = casc(&space, runs, &mut |_| {
             ticks += 1;
             Ok(())
         })
@@ -553,7 +757,7 @@ mod tests {
         assert_eq!(runs.len(), 2);
         assert_eq!(ticks, 4, "25 -> 13 -> 7 -> 4 -> 2 is four passes");
         let names: Vec<OsString> =
-            MergeReader::new(&space, runs, region).unwrap().map(|e| e.unwrap().name).collect();
+            reader(&space, runs, region).unwrap().map(|e| e.unwrap().name).collect();
         let want: Vec<OsString> = (0..100).map(|i| named(i).name).collect();
         assert_eq!(names, want);
     }
@@ -572,11 +776,11 @@ mod tests {
         let runs: Vec<RunSpan> = (0..3)
             .map(|r| {
                 let c: Vec<DirEntry> = (0..4).map(|i| named(i * 3 + r)).collect();
-                write_run(&space, &c).unwrap()
+                wr(&space, &c).unwrap()
             })
             .collect();
         assert!(space.len(Lane::Walk) > start);
-        let reader = MergeReader::new(&space, runs, region).unwrap();
+        let reader = reader(&space, runs, region).unwrap();
         drop(reader);
         assert_eq!(space.len(Lane::Walk), start);
         drop(outer);
@@ -592,10 +796,10 @@ mod tests {
         let runs: Vec<RunSpan> = (0..3)
             .map(|r| {
                 let c: Vec<DirEntry> = (0..8).map(|i| named(i * 3 + r)).collect();
-                write_run(&space, &c).unwrap()
+                wr(&space, &c).unwrap()
             })
             .collect();
-        let mut reader = MergeReader::new(&space, runs, region).unwrap();
+        let mut reader = reader(&space, runs, region).unwrap();
         space.fail_reads_after(0);
         let mut items = Vec::new();
         for _ in 0..40 {
@@ -617,12 +821,12 @@ mod tests {
         let region = space.begin(Lane::Walk, space.next_owner()).unwrap();
         let mut spans = Vec::new();
         for mut run in runs {
-            sort_entries(&mut run);
-            spans.push(write_run(&space, &run).unwrap());
+            sort_plain(&mut run);
+            spans.push(wr(&space, &run).unwrap());
         }
-        let spans = cascade(&space, spans, &mut |_| Ok(())).unwrap();
+        let spans = casc(&space, spans, &mut |_| Ok(())).unwrap();
         assert!(spans.len() <= t.merge_fan_in);
-        MergeReader::new(&space, spans, region).unwrap().collect::<Result<_, _>>().unwrap()
+        reader(&space, spans, region).unwrap().collect::<Result<_, _>>().unwrap()
     }
 
     fn by_bytes(mut v: Vec<DirEntry>) -> Vec<DirEntry> {
@@ -697,11 +901,11 @@ mod tests {
         let runs: Vec<RunSpan> = (0..3)
             .map(|r| {
                 let c: Vec<DirEntry> = (0..4).map(|i| named(i * 3 + r)).collect();
-                write_run(&space, &c).unwrap()
+                wr(&space, &c).unwrap()
             })
             .collect();
         let mut calls = 0;
-        let err = cascade(&space, runs, &mut |_| {
+        let err = casc(&space, runs, &mut |_| {
             calls += 1;
             Err(FsError::new(Code::IoError, std::io::Error::other("stop")))
         })
@@ -713,5 +917,173 @@ mod tests {
         assert_eq!(space.len(Lane::Walk), start);
         drop(outer);
         assert_eq!(space.len(Lane::Walk), 0);
+    }
+
+    fn kitem(key_byte: u8, name: &str) -> Keyed {
+        let mut key = [0u8; 24];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = key_byte.wrapping_add(i as u8);
+        }
+        Keyed { key, entry: entry(OsString::from(name), FileType::File) }
+    }
+
+    /// What a record keeps for `k`: the first `k` key bytes, the rest zero.
+    fn masked(k: usize, mut item: Keyed) -> Keyed {
+        item.key[k..].fill(0);
+        item
+    }
+
+    #[test]
+    fn a_keyed_record_round_trips_for_k_0_8_and_24() {
+        for k in [0usize, 8, 24] {
+            for ft in TYPES {
+                let mut item = kitem(7, "name");
+                item.entry.file_type = ft;
+                let mut buf = Vec::new();
+                encode(k, &item, &mut buf).unwrap();
+                assert_eq!(buf.len(), k + 3 + 4, "k = {k}");
+                assert_eq!(&buf[..k], &item.key[..k]);
+                let want = masked(k, item);
+                assert_eq!(decode(k, &buf), Some((want, buf.len())), "k = {k}");
+                assert_eq!(decode(k, &buf[..buf.len() - 1]), None, "a short buffer, k = {k}");
+                if k > 0 {
+                    assert_eq!(decode(k, &buf[..k - 1]), None, "a short key, k = {k}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn keyed_order_is_key_bytes_then_name_bytes() {
+        for k in [8usize, 24] {
+            let mut lo = kitem(0, "b");
+            let mut hi = kitem(0, "a");
+            lo.key = [0; 24];
+            hi.key = [0; 24];
+            hi.key[..8].fill(1);
+            assert_eq!(keyed_cmp(k, &lo, &hi), Ordering::Less, "the key decides, k = {k}");
+            assert_eq!(keyed_cmp(k, &hi, &lo), Ordering::Greater);
+            let a = Keyed { key: [3; 24], entry: entry(OsString::from("a"), FileType::File) };
+            let b = Keyed { key: [3; 24], entry: entry(OsString::from("b"), FileType::Dir) };
+            assert_eq!(keyed_cmp(k, &a, &b), Ordering::Less, "equal keys: the name decides");
+            assert_eq!(keyed_cmp(k, &b, &a), Ordering::Greater);
+        }
+        // A difference after the first K bytes does not count.
+        let mut x = kitem(0, "a");
+        let mut y = kitem(0, "a");
+        x.key[8] = 1;
+        y.key[8] = 2;
+        assert_eq!(keyed_cmp(8, &x, &y), Ordering::Equal);
+        assert_eq!(keyed_cmp(24, &x, &y), Ordering::Less);
+    }
+
+    #[test]
+    fn a_keyed_merge_of_three_runs_is_sorted_and_complete() {
+        let t = Thresholds::new(4, 4, 2, 16, 3).unwrap();
+        let fs = FaultFs::new();
+        let space = placed(&fs, t);
+        let file = space.transient().unwrap();
+        let offset = std::cell::Cell::new(0u64);
+        let items: Vec<Keyed> =
+            (0..12u8).map(|i| kitem(i * 5 % 4, &format!("n{:02}", i * 7 % 12))).collect();
+        let mut spans = Vec::new();
+        for chunk in items.chunks(4) {
+            let mut c = chunk.to_vec();
+            sort_keyed(8, &mut c);
+            spans.push(write_run(Sink::File(&file, &offset), 8, t.merge_buffer, &c).unwrap());
+        }
+        assert_eq!(spans.len(), 3);
+        let mut merger = Merger::new(Source::File(&file), 8, t.merge_buffer, &spans).unwrap();
+        let mut got = Vec::new();
+        while let Some(item) = merger.next_entry().unwrap() {
+            got.push(item);
+        }
+        let mut want: Vec<Keyed> = items.into_iter().map(|i| masked(8, i)).collect();
+        sort_keyed(8, &mut want);
+        assert_eq!(got.len(), 12);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn the_walks_k0_runs_are_byte_identical_to_plan_2() {
+        let names = ["a", "bb", "ccc", "dddd", "eeeee"];
+        let mut got = Vec::new();
+        for (i, n) in names.iter().enumerate() {
+            let mut item = kitem(9, n);
+            item.entry.file_type = TYPES[i % 4];
+            encode(0, &item, &mut got).unwrap();
+        }
+        let want: Vec<u8> = vec![
+            1, 0, 0, b'a', //
+            2, 0, 1, b'b', b'b', //
+            3, 0, 2, b'c', b'c', b'c', //
+            4, 0, 3, b'd', b'd', b'd', b'd', //
+            5, 0, 0, b'e', b'e', b'e', b'e', b'e',
+        ];
+        assert_eq!(got, want);
+    }
+
+    #[cfg(unix)]
+    fn random_items() -> impl Strategy<Value = Vec<(Vec<u8>, Vec<u8>)>> {
+        let name = proptest::collection::vec(1u8..=255, 1..=40);
+        let key = proptest::collection::vec(prop::sample::select(vec![0u8, 1, 255]), 24);
+        proptest::collection::vec((key, name), 1..=200)
+    }
+
+    #[cfg(unix)]
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        #[test]
+        fn keyed_merge_equals_sort_for_random_keys_and_names(
+            k in prop::sample::select(vec![0usize, 8, 24]),
+            raw in random_items(),
+        ) {
+            let t = Thresholds::new(4, 8, 2, 16, 3).unwrap();
+            let fs = FaultFs::new();
+            let space = placed(&fs, t);
+            let items: Vec<Keyed> = raw
+                .into_iter()
+                .enumerate()
+                .map(|(i, (key, name))| {
+                    let name = name.into_iter().map(|b| if b == b'/' { b'a' } else { b }).collect();
+                    let mut item = Keyed {
+                        key: key.try_into().unwrap(),
+                        entry: entry(std::os::unix::ffi::OsStringExt::from_vec(name), TYPES[i % 4]),
+                    };
+                    item = masked(k, item);
+                    item
+                })
+                .collect();
+            let mut want = items.clone();
+            want.sort_by(|a, b| a.key[..k].cmp(&b.key[..k]).then_with(|| {
+                a.entry.name.as_encoded_bytes().cmp(b.entry.name.as_encoded_bytes())
+            }));
+            // Duplicate (key, name) pairs may repeat; their relative order is not observable but their
+            // file types are, so compare as multisets by sorting those too.
+            let mut spans = Vec::new();
+            let region = space.begin(Lane::Walk, space.next_owner()).unwrap();
+            for chunk in items.chunks(t.run_entries) {
+                let mut c = chunk.to_vec();
+                sort_keyed(k, &mut c);
+                spans.push(write_run(Sink::Lane(&space, Lane::Walk), k, t.merge_buffer, &c).unwrap());
+            }
+            let spans = cascade(&space, Lane::Walk, k, spans, &mut |_| Ok(())).unwrap();
+            let got: Vec<Keyed> = MergeReader::new(&space, Lane::Walk, k, spans, region)
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let order = |v: &[Keyed]| -> Vec<(Vec<u8>, Vec<u8>)> {
+                v.iter()
+                    .map(|i| (i.key[..k].to_vec(), i.entry.name.as_encoded_bytes().to_vec()))
+                    .collect()
+            };
+            prop_assert_eq!(order(&got), order(&want));
+            let mut a = got;
+            let mut b = want;
+            let total = |v: &mut Vec<Keyed>| v.sort_by_key(|i| format!("{i:?}"));
+            total(&mut a);
+            total(&mut b);
+            prop_assert_eq!(a, b);
+        }
     }
 }

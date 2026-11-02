@@ -7,7 +7,7 @@
 //! The ordered directory walk (§7.2, §9, §149.4).
 
 use crate::scratch::{Lane, Region, ScratchSpace, Thresholds};
-use crate::spill::{MergeReader, RunSpan, cascade, sort_entries, write_run};
+use crate::spill::{Keyed, MergeReader, RunSpan, Sink, cascade, sort_entries, write_run};
 use flux_fs::{
     Code, DirEntry, FileIdentity, FileSystem, FileType, FsError, MountRoot, ObjectId, Result,
     Selection, Verdict,
@@ -123,7 +123,7 @@ impl Iterator for Entries<'_, '_> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Entries::Inline(it) => it.next().map(Ok),
-            Entries::Spilled(m) => m.next(),
+            Entries::Spilled(m) => m.next().map(|r| r.map(|item| item.entry)),
         }
     }
 }
@@ -581,15 +581,19 @@ impl<'a, 'h, F: FileSystem> Walk<'a, 'h, F> {
         listed.map_err(ListError::Listing)?;
         let Some(space) = l.space.filter(|_| !l.runs.is_empty() || l.buf.len() > t.inline_entries)
         else {
-            return Ok(Entries::Inline(sorted(l.buf).into_iter()));
+            return Ok(Entries::Inline(
+                sorted(l.buf.into_iter().map(|item| item.entry).collect()).into_iter(),
+            ));
         };
         l.flush().map_err(ListError::Fatal)?;
         let entries = l.total;
-        let runs = cascade(space, std::mem::take(&mut l.runs), &mut |_| tick())
+        let runs = cascade(space, Lane::Walk, 0, std::mem::take(&mut l.runs), &mut |_| tick())
             .map_err(ListError::Fatal)?;
         tracing::debug!(entries, runs = runs.len(), "listing spilled");
         let region = l.region.take().expect("a spilled listing holds a region");
-        MergeReader::new(space, runs, region).map(Entries::Spilled).map_err(ListError::Fatal)
+        MergeReader::new(space, Lane::Walk, 0, runs, region)
+            .map(Entries::Spilled)
+            .map_err(ListError::Fatal)
     }
 
     /// Descend into `rel`, or refuse it. On `Ok` a frame has been pushed and the
@@ -732,7 +736,7 @@ struct Listing<'a, 'h> {
     space: Option<&'a ScratchSpace<'h>>,
     owner: u64,
     t: Thresholds,
-    buf: Vec<DirEntry>,
+    buf: Vec<Keyed>,
     runs: Vec<RunSpan>,
     region: Option<Region<'a, 'h>>,
     read: usize,
@@ -746,7 +750,7 @@ impl Listing<'_, '_> {
         if self.space.is_some() && self.buf.len() >= self.t.run_entries {
             self.flush()?;
         }
-        self.buf.push(e);
+        self.buf.push(Keyed::plain(e));
         self.read += 1;
         if self.t.tick_entries > 0 && self.read.is_multiple_of(self.t.tick_entries) {
             tick()?;
@@ -764,7 +768,7 @@ impl Listing<'_, '_> {
             self.region = Some(space.begin(Lane::Walk, self.owner)?);
         }
         sort_entries(&mut self.buf);
-        let run = write_run(space, &self.buf)?;
+        let run = write_run(Sink::Lane(space, Lane::Walk), 0, self.t.merge_buffer, &self.buf)?;
         self.total += run.count;
         self.runs.push(run);
         self.buf.clear();
