@@ -1609,3 +1609,213 @@ mod tests {
         }
     }
 }
+
+/// The scale harness for the destination index criteria (spec 6.3). Every test is `#[ignore]`: they run only by
+/// name under `--run-ignored only --no-capture`, sized by `FLUX_SCALE_N` (default 10,000,000) and placed under
+/// `FLUX_SCALE_DIR` (default `~/.cache/flux-scale`, which should be ext4). Rates and latencies are printed, never
+/// asserted; correctness always is, and the structural cache-miss bounds only from 5,000,000 names up.
+#[cfg(test)]
+pub(crate) mod scale_tests {
+    use super::*;
+    use flux_fs::{DestinationRoot, DirEntry, FileType};
+    use flux_platform::StdFileSystem;
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    pub(crate) fn mix(mut x: u64) -> u64 {
+        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^ (x >> 31)
+    }
+
+    /// The benchmark's `name(i)`: 24 pseudo-random printable bytes (0x21..=0x7E).
+    pub(crate) fn name(i: u64) -> [u8; 24] {
+        let mut n = [0u8; 24];
+        for k in 0..3u64 {
+            let b = mix(i * 3 + k).to_le_bytes();
+            for j in 0..8 {
+                n[8 * k as usize + j] = b[j] % 94 + 0x21;
+            }
+        }
+        n
+    }
+
+    pub(crate) fn dino(i: u64) -> u64 {
+        mix(i) | 1
+    }
+
+    pub(crate) fn scale_n() -> u64 {
+        std::env::var("FLUX_SCALE_N").ok().map_or(10_000_000, |v| {
+            v.replace('_', "")
+                .parse()
+                .unwrap_or_else(|_| panic!("FLUX_SCALE_N is not a number: {v}"))
+        })
+    }
+
+    /// A fresh directory under `FLUX_SCALE_DIR`, removed when dropped (also on a failed assertion).
+    pub(crate) struct ScaleDir(pub(crate) PathBuf);
+
+    impl ScaleDir {
+        pub(crate) fn new(tag: &str) -> ScaleDir {
+            let base = std::env::var_os("FLUX_SCALE_DIR").map(PathBuf::from).unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/flux-scale")
+            });
+            let dir = base.join(format!("{tag}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("create the scale directory");
+            ScaleDir(dir)
+        }
+    }
+
+    impl Drop for ScaleDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// One field of `/proc/self/status` in kB (`RssAnon:`, `VmRSS:`).
+    pub(crate) fn status_kb(field: &str) -> u64 {
+        let text = std::fs::read_to_string("/proc/self/status").expect("/proc/self/status");
+        text.lines()
+            .find_map(|l| l.strip_prefix(field))
+            .and_then(|r| r.trim().trim_end_matches("kB").trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Median and p99 of `lat` (nanoseconds) in microseconds.
+    pub(crate) fn percentiles(lat: &mut [u64]) -> (f64, f64) {
+        lat.sort_unstable();
+        let at = |q: usize| lat[(lat.len() * q / 100).min(lat.len() - 1)] as f64 / 1000.0;
+        (at(50), at(99))
+    }
+
+    fn entry(bytes: &[u8]) -> DirEntry {
+        DirEntry { name: crate::spill::os_name(bytes), file_type: FileType::File, ino: None }
+    }
+
+    fn report(label: &str, lat: &mut [u64], misses: u64) {
+        let (median, p99) = percentiles(lat);
+        let probes = lat.len() as u64;
+        println!(
+            "{label}: probes={probes} median_us={median:.1} p99_us={p99:.1} cache_misses={misses} misses_per_probe={:.3}",
+            misses as f64 / probes as f64
+        );
+    }
+
+    #[test]
+    #[ignore = "scale harness: run by name with FLUX_SCALE_N, under --no-capture"]
+    fn tier1_criteria() {
+        let n = scale_n();
+        let scale = ScaleDir::new("tier1");
+        let space = ScratchSpace::unplaced(Thresholds::default(), None);
+        space.place(StdFileSystem.destination_root(&scale.0).unwrap(), scale.0.clone());
+        println!("tier1: n={n} dir={}", scale.0.display());
+
+        let started = Instant::now();
+        let mut names_builder = FamilyBuilder::new(&space, Lane::Names, 0);
+        let mut inodes_builder = FamilyBuilder::new(&space, Lane::Inodes, 8);
+        let mut tick = || Ok(());
+        for i in 0..n {
+            let nm = name(i);
+            names_builder.push(Keyed::plain(entry(&nm)), &mut tick).unwrap();
+            let mut key = [0u8; 24];
+            key[..8].copy_from_slice(&dino(i).to_be_bytes());
+            inodes_builder.push(Keyed { key, entry: entry(&nm) }, &mut tick).unwrap();
+        }
+        let pending_names = names_builder.into_pending().unwrap();
+        let pending_inodes = inodes_builder.into_pending().unwrap();
+        let runs_of = |p: &PendingFamily| match p {
+            PendingFamily::Runs(r) => r.runs.len(),
+            PendingFamily::Empty => 0,
+        };
+        let (runs_names, runs_inodes) = (runs_of(&pending_names), runs_of(&pending_inodes));
+        let (names, inodes) = build_two(&space, pending_names, pending_inodes, &mut tick).unwrap();
+        let (names, inodes) = (names.expect("a names family"), inodes.expect("an inodes family"));
+        let build = started.elapsed().as_secs_f64();
+        println!("build_s={build:.2} names_per_s={:.0}", n as f64 / build);
+        println!("runs_names={runs_names} runs_inodes={runs_inodes}");
+        println!(
+            "levels_names={} levels_inodes={}",
+            names.meta.levels.len(),
+            inodes.meta.levels.len()
+        );
+        println!(
+            "index_bytes_names={} index_bytes_inodes={}",
+            space.len(Lane::Names),
+            space.len(Lane::Inodes)
+        );
+        println!(
+            "rss_anon_kb_after_build={} vm_rss_kb_after_build={}",
+            status_kb("RssAnon:"),
+            status_kb("VmRSS:")
+        );
+
+        let probes = 100_000usize.min(n as usize);
+        // Walk order: the names in frame order, as the walk of the destination lists them.
+        let walk: Vec<Vec<u8>> = names
+            .names()
+            .take(probes)
+            .map(|k| k.unwrap().entry.name.as_encoded_bytes().to_vec())
+            .collect();
+        assert_eq!(walk.len(), probes);
+
+        let mut lat = Vec::with_capacity(probes);
+        let before = space.cache_misses();
+        for nm in &walk {
+            let t = Instant::now();
+            let found = names.contains_name(nm).unwrap();
+            lat.push(t.elapsed().as_nanos() as u64);
+            assert!(found, "a walk-order name is missing");
+        }
+        let walk_misses = space.cache_misses() - before;
+        report("names_walk_order", &mut lat, walk_misses);
+
+        lat.clear();
+        let mut s = 12_345u64;
+        let before = space.cache_misses();
+        for _ in 0..probes {
+            s = mix(s);
+            let nm = name(s % n);
+            let t = Instant::now();
+            let found = names.contains_name(&nm).unwrap();
+            lat.push(t.elapsed().as_nanos() as u64);
+            assert!(found, "a random name is missing");
+        }
+        let random_misses = space.cache_misses() - before;
+        report("names_random", &mut lat, random_misses);
+
+        lat.clear();
+        s = 12_345;
+        let before = space.cache_misses();
+        for _ in 0..probes {
+            s = mix(s);
+            let i = s % n;
+            let t = Instant::now();
+            let got = inodes.names_with_key(&dino(i).to_be_bytes(), 16).unwrap();
+            lat.push(t.elapsed().as_nanos() as u64);
+            let want = crate::spill::os_name(&name(i));
+            assert!(got.contains(&want), "the inode lookup of entry {i} lost its name");
+        }
+        let inode_misses = space.cache_misses() - before;
+        report("inodes_random", &mut lat, inode_misses);
+
+        // A byte outside 0x21..=0x7E in front: never generated.
+        for j in 0..1_000u64 {
+            let mut nm = name(j + n + 7);
+            nm[0] = 0x7F;
+            assert!(!names.contains_name(&nm).unwrap(), "a never-generated name was found ({j})");
+        }
+        println!("absent_probes=1000 all_false=true");
+
+        let per = |m: u64| m as f64 / probes as f64;
+        if n >= 5_000_000 {
+            assert!(per(walk_misses) <= 0.05, "walk-order misses/probe {}", per(walk_misses));
+            assert!(per(random_misses) <= 3.0, "names random misses/probe {}", per(random_misses));
+            assert!(per(inode_misses) <= 3.0, "inodes random misses/probe {}", per(inode_misses));
+            println!("structural assertions: ran");
+        } else {
+            println!("structural assertions: SKIPPED (n={n} < 5000000)");
+        }
+        println!("rss_anon_kb_after_lookups={}", status_kb("RssAnon:"));
+    }
+}

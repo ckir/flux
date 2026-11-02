@@ -946,3 +946,94 @@ mod tests {
         assert!(space.poison_error().is_some());
     }
 }
+
+/// The tier 2 scale harness (spec 6.3); see `index::scale_tests` for the knobs. `#[ignore]`, run by name.
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+    use crate::index::scale_tests::{ScaleDir, mix, name, percentiles, scale_n, status_kb};
+    use crate::scratch::{ScratchSpace, Thresholds};
+    use flux_fs::DestinationRoot;
+    use flux_platform::StdFileSystem;
+    use std::time::Instant;
+
+    fn id_of(i: u64) -> ObjectId {
+        ObjectId { volume: 1, index: u128::from(mix(i ^ 0x5CA1_E5CA_1E00_0000)) }
+    }
+
+    #[test]
+    #[ignore = "scale harness: run by name with FLUX_SCALE_N, under --no-capture"]
+    fn tier2_criteria() {
+        let n = scale_n();
+        let scale = ScaleDir::new("tier2");
+        let thresholds = Thresholds { publication_commit: 1_024, ..Thresholds::default() };
+        let space = ScratchSpace::unplaced(thresholds, None);
+        space.place(StdFileSystem.destination_root(&scale.0).unwrap(), scale.0.clone());
+        let dir = DirKey::Ordinal(1);
+        println!(
+            "tier2: n={n} dir={} publication_commit={}",
+            scale.0.display(),
+            thresholds.publication_commit
+        );
+
+        let mut store = space.store().unwrap();
+        let started = Instant::now();
+        for i in 0..n {
+            // Random key order: the id is a hash of the row number.
+            store.ids_row(&dir, id_of(i), Some(&os_name(&name(i))), i).unwrap();
+            if i + 1 == n / 2 {
+                println!("rss_anon_kb_at_half={} rows={}", status_kb("RssAnon:"), i + 1);
+            }
+        }
+        let ingest = started.elapsed().as_secs_f64();
+        println!("ingest_s={ingest:.2} inserts_per_s={:.0}", n as f64 / ingest);
+        println!(
+            "rss_anon_kb_at_end={} vm_rss_kb_at_end={} rows={n}",
+            status_kb("RssAnon:"),
+            status_kb("VmRSS:")
+        );
+
+        // Rows read back: 1,000 random inserted rows, each found with its spelling and sequence number.
+        let mut s = 777u64;
+        for _ in 0..1_000.min(n) {
+            s = mix(s);
+            let i = s % n;
+            let rows = store.ids_rows(&dir, id_of(i)).unwrap();
+            assert!(
+                rows.contains(&(Some(os_name(&name(i))), i)),
+                "inserted row {i} did not read back: {rows:?}"
+            );
+        }
+        println!("readback_rows=1000 all_found=true");
+
+        // Point lookups over the ingested table. `has_name` reads `names2`, which `ids_row` does not fill, so the
+        // lookup that exercises the ingested `ids` table is `ids_rows` (one id's key range); `has_name` is timed too.
+        let probes = 100_000usize.min(n as usize);
+        let mut lat = Vec::with_capacity(probes);
+        s = 4242;
+        for _ in 0..probes {
+            s = mix(s);
+            let i = s % n;
+            let t = Instant::now();
+            let rows = store.ids_rows(&dir, id_of(i)).unwrap();
+            lat.push(t.elapsed().as_nanos() as u64);
+            assert!(!rows.is_empty());
+        }
+        let (median, p99) = percentiles(&mut lat);
+        println!("ids_rows_point_lookup: probes={probes} median_us={median:.1} p99_us={p99:.1}");
+        lat.clear();
+        s = 4242;
+        for _ in 0..probes {
+            s = mix(s);
+            let nm = os_name(&name(s % n));
+            let t = Instant::now();
+            let _ = store.has_name(&dir, &nm).unwrap();
+            lat.push(t.elapsed().as_nanos() as u64);
+        }
+        let (median, p99) = percentiles(&mut lat);
+        println!(
+            "has_name_lookup (names2, not populated by ids_row): probes={probes} median_us={median:.1} p99_us={p99:.1}"
+        );
+        println!("rss_anon_kb_after_lookups={}", status_kb("RssAnon:"));
+    }
+}
