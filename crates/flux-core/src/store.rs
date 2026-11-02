@@ -712,6 +712,36 @@ mod tests {
     }
 
     #[test]
+    fn retiring_a_lower_directory_leaves_every_higher_one() {
+        let fs = FaultFs::new();
+        let space = placed(&fs);
+        let mut store = space.store().unwrap();
+        let low = DirKey::Strong(id(1, 7));
+        let higher = [DirKey::Strong(id(1, 8)), DirKey::Ordinal(1)];
+        let obj = id(9, 9);
+        let owner = FluxPathKey(b"T".to_vec());
+        for d in [&low, &higher[0], &higher[1]] {
+            store.publish_name(d, &name("a")).unwrap();
+            store.set_owner(d, &name("a"), &owner).unwrap();
+            store.learn(d, &name("a"), 5).unwrap();
+            store.ids_row(d, obj, None, 1).unwrap();
+            store.ids_row(d, obj, Some(&name("a")), 2).unwrap();
+        }
+        let mut tick = no_tick();
+        store.retire(&low, &mut tick).unwrap();
+        assert!(!store.has_name(&low, &name("a")).unwrap());
+        assert_eq!(store.owner(&low, &name("a")).unwrap(), None);
+        assert_eq!(store.learned(&low, &name("a")).unwrap(), None);
+        assert!(store.ids_rows(&low, obj).unwrap().is_empty());
+        for d in &higher {
+            assert!(store.has_name(d, &name("a")).unwrap());
+            assert_eq!(store.owner(d, &name("a")).unwrap(), Some(owner.clone()));
+            assert_eq!(store.learned(d, &name("a")).unwrap(), Some(5));
+            assert_eq!(store.ids_rows(d, obj).unwrap(), vec![(None, 1), (Some(name("a")), 2)]);
+        }
+    }
+
+    #[test]
     fn the_ordinal_prefix_sorts_after_every_strong_prefix_and_ranges_do_not_overlap() {
         let mut state = 0x9E37_79B9_7F4A_7C15u64;
         let mut next = move || {
