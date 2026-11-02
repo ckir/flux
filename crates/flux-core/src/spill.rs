@@ -168,7 +168,10 @@ pub(crate) fn sort_keyed(k: usize, v: &mut [Keyed]) {
             v.sort_unstable_by(|a, b| keyed_cmp(k, a, b));
             return;
         };
-        keys.push((key_prefix(k, &e.key), prefix(e.entry.name.as_encoded_bytes()), i));
+        // Past eight key bytes the name must not be compared before the rest of the key, so its cached prefix is
+        // left out and a tie goes through `keyed_cmp`.
+        let name = if k > 8 { 0 } else { prefix(e.entry.name.as_encoded_bytes()) };
+        keys.push((key_prefix(k, &e.key), name, i));
     }
     keys.sort_unstable_by(|a, b| {
         a.0.cmp(&b.0)
@@ -978,6 +981,22 @@ mod tests {
     }
 
     #[test]
+    fn sort_keyed_orders_k24_items_whose_first_eight_key_bytes_tie() {
+        let item = |tail: u8, name: &str| {
+            let mut key = [5u8; 24];
+            key[16..].fill(tail);
+            Keyed { key, entry: entry(OsString::from(name), FileType::File) }
+        };
+        // Key order is 1, 2, 3; the names are in the opposite order.
+        let mut got = vec![item(3, "a"), item(1, "c"), item(2, "b")];
+        let mut want = got.clone();
+        want.sort_by(|a, b| keyed_cmp(24, a, b));
+        sort_keyed(24, &mut got);
+        assert_eq!(got, want);
+        assert_eq!(got[0].key[16], 1);
+    }
+
+    #[test]
     fn a_keyed_merge_of_three_runs_is_sorted_and_complete() {
         let t = Thresholds::new(4, 4, 2, 16, 3).unwrap();
         let fs = FaultFs::new();
@@ -1023,11 +1042,15 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    /// Items whose keys share one random eight-byte prefix, so the first cached word ties for every pair.
     #[cfg(unix)]
     fn random_items() -> impl Strategy<Value = Vec<(Vec<u8>, Vec<u8>)>> {
         let name = proptest::collection::vec(1u8..=255, 1..=40);
-        let key = proptest::collection::vec(prop::sample::select(vec![0u8, 1, 255]), 24);
-        proptest::collection::vec((key, name), 1..=200)
+        let tail = proptest::collection::vec(prop::sample::select(vec![0u8, 1, 255]), 16);
+        let shared = proptest::collection::vec(any::<u8>(), 8);
+        (shared, proptest::collection::vec((tail, name), 1..=200)).prop_map(|(shared, items)| {
+            items.into_iter().map(|(tail, name)| ([shared.clone(), tail].concat(), name)).collect()
+        })
     }
 
     #[cfg(unix)]
