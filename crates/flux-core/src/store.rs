@@ -123,6 +123,7 @@ pub(crate) mod faults {
         static WRITE_AT: Cell<Option<u64>> = const { Cell::new(None) };
         static COMMIT_AT: Cell<Option<u64>> = const { Cell::new(None) };
         static AT_FIRST_RETIRE: Cell<Option<u64>> = const { Cell::new(None) };
+        static FINISHED: Cell<bool> = const { Cell::new(false) };
     }
 
     /// Zeroes the counters and starts counting.
@@ -158,6 +159,15 @@ pub(crate) mod faults {
     /// `commits()` as it stood when the first `Store::retire` began.
     pub(crate) fn commits_at_first_retire() -> u64 {
         AT_FIRST_RETIRE.get().unwrap_or(0)
+    }
+
+    /// Whether `Store::finish` has been called on this thread.
+    pub(crate) fn finish_ran() -> bool {
+        FINISHED.get()
+    }
+
+    pub(super) fn on_finish() {
+        FINISHED.set(true);
     }
 
     pub(super) fn on_retire() {
@@ -610,6 +620,8 @@ impl Store {
 
     /// Commits the live transaction: the run's final commit, whose error is the fatal scratch error (spec 6.6).
     pub(crate) fn finish(&mut self) -> Result<(), FsError> {
+        #[cfg(test)]
+        faults::on_finish();
         self.run(|s| {
             if s.txn.is_none() {
                 return Ok(());

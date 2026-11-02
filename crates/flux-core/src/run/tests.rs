@@ -12069,3 +12069,410 @@ fn a_dry_restart_whose_sweep_walk_fails_fatally_stops_the_preview() {
         "no partial is planned for discard: {got:?}"
     );
 }
+
+// ---- Bounded listing (cut 23, plan 3, task 6): the copy indexes a large pre-existing destination ----
+
+/// Spills a listing of more than 4 names, indexes a destination of more than 4 names, 2 names per commit, `tick`
+/// entries per tick.
+fn indexing_with(tick: usize, commit_every: usize) -> crate::scratch::Thresholds {
+    crate::scratch::Thresholds::new(4, 8, 2, 16, tick)
+        .unwrap()
+        .with_index(4, 2, 4, 1 << 20, commit_every, 128)
+        .unwrap()
+}
+
+fn indexing() -> crate::scratch::Thresholds {
+    indexing_with(3, 2)
+}
+
+/// `/src` holding `f00`..`f{n-1}` (modified at 100) and `/p/dest` holding the same names with other bytes.
+fn replaced_dest(n: usize) -> FaultFs {
+    let fs = FaultFs::new();
+    for d in ["/src", "/p", "/p/dest"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    for i in 0..n {
+        put(&fs, &format!("/src/f{i:02}"), format!("new {i}").as_bytes(), 100);
+        fs.write_file(format!("/p/dest/f{i:02}"), format!("old {i}").as_bytes());
+    }
+    fs
+}
+
+fn dest_bytes(fs: &FaultFs, n: usize) -> Vec<Option<Vec<u8>>> {
+    (0..n).map(|i| fs.read_file(format!("/p/dest/f{i:02}"))).collect()
+}
+
+fn creates_of_scratch(fs: &FaultFs) -> usize {
+    count(&calls(fs), "create_scratch(")
+}
+
+#[test]
+fn a_pre_existing_destination_above_the_threshold_is_copied_with_the_same_outcome_as_below() {
+    let run = |t: crate::scratch::Thresholds| {
+        let fs = replaced_dest(6);
+        let (r, got) = run_tree_small(&fs, &cfg(), t);
+        let out = ok(&r);
+        assert!(got.is_empty(), "{got:?}");
+        let counts = (
+            out.files_total,
+            out.files_copied,
+            out.files_overwritten,
+            out.files_skipped,
+            out.bytes_copied,
+            out.failures.total(),
+        );
+        (counts, dest_bytes(&fs, 6), creates_of_scratch(&fs))
+    };
+    let (small, small_bytes, small_scratch) = run(indexing());
+    let (plain, plain_bytes, plain_scratch) = run(crate::scratch::Thresholds::default());
+    assert!(small_scratch > 0 && plain_scratch == 0, "the small run indexed through scratch");
+    assert_eq!(small, plain);
+    assert_eq!(small.2, 6, "every file replaced a pre-existing one");
+    assert_eq!(small_bytes, plain_bytes);
+    assert_eq!(small_bytes[3].as_deref(), Some(&b"new 3"[..]));
+}
+
+/// The ordinal (1-based) of the first call named `op` that mentions `needle` and comes after the first call that
+/// starts with `after`.
+fn nth_after(fs: &FaultFs, op: &str, needle: &str, after: &str) -> u32 {
+    let c = calls(fs);
+    let from = at(&c, after);
+    let head = format!("{op}(");
+    let mut n = 0;
+    for (i, call) in c.iter().enumerate() {
+        if call.starts_with(&head) {
+            n += 1;
+            if i > from && call.contains(needle) {
+                return n;
+            }
+        }
+    }
+    panic!("no {op} mentioning {needle} after {after} in {c:?}");
+}
+
+/// Runs `f` on a thread of its own: the store's fault counters are thread-local, so a reference pass cannot leak its
+/// counts (or its armed faults) into the pass under test.
+fn on_a_fresh_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::spawn(f).join().expect("the reference pass completed")
+}
+
+#[test]
+fn a_resume_over_a_finished_copy_above_the_threshold_skips_every_file() {
+    let reference = replaced_dest(6);
+    ok(&run_tree_small(&reference, &cfg(), indexing()).0);
+    // The finish rewrites the manifest (to Completed) once the walk is done; dying just before that leaves a finished
+    // copy whose operation is still resumable, with its workspace.
+    let manifest_tmp = format!("remove_file(/p/dest/.flux/operations/{ID}/manifest.tmp)");
+    let removes: Vec<String> =
+        calls(&reference).into_iter().filter(|c| c.starts_with("remove_file(")).collect();
+    let last = removes.iter().rposition(|c| *c == manifest_tmp).expect("the finish rewrites it")
+        as u32
+        + 1;
+    let fs = replaced_dest(6);
+    fs.on_nth("remove_file", last, |_| panic!("the test's crash point"));
+    let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_tree_small(&fs, &cfg(), indexing())
+    }));
+    assert!(died.is_err(), "the run died at its finish");
+    assert_eq!(dest_bytes(&fs, 6)[5].as_deref(), Some(&b"new 5"[..]), "the copy had finished");
+    let before = calls(&fs).len();
+    let again = RunConfig { operation_id: id(0x77), ..resume() };
+    let (r, got) = run_tree_small(&fs, &again, indexing());
+    let out = ok(&r);
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!((out.files_resumed, out.files_copied, out.files_overwritten), (6, 0, 0));
+    let log = &calls(&fs)[before..];
+    assert!(count(log, "create_scratch(") > 0, "the resumed run indexed DEST: {log:?}");
+    assert!(!log.iter().any(|c| c.starts_with("rename_replace(/p/dest/f")), "{log:?}");
+}
+
+#[test]
+fn a_heartbeat_failure_during_an_index_build_ends_the_copy_at_the_heartbeat_step() {
+    let fs = replaced_dest(6);
+    fs.on_nth("create_scratch", 2, |fs| fs.fail_always("write_at_start", Code::IoError));
+    let (r, got) = run_tree_small(&fs, &beating(), indexing_with(7, 2));
+    // The enumeration the arming point rests on: the walk's lane (#1, after the source root is listed), then, inside
+    // the listing of DEST, the names builder's transient (#2) and the inodes builder's (#3). DEST lists seven names
+    // (its six files and `.flux`), so the builders' own tick at the seventh push is the first heartbeat after #2; the
+    // two lanes of `build_two` are made after it.
+    let c = calls(&fs);
+    let src = at(&c, "read_dir(/src)");
+    let dest = at(&c, "read_dir(/p/dest)");
+    let scratch: Vec<usize> =
+        (0..c.len()).filter(|i| c[*i].starts_with("create_scratch(")).collect();
+    assert!(src < scratch[0] && scratch[0] < dest && dest < scratch[1], "{c:?}");
+    let failing = (scratch[1]..c.len())
+        .find(|i| c[*i].starts_with("write_at_start("))
+        .expect("a heartbeat after the arming point");
+    assert_eq!(
+        scratch.iter().filter(|i| **i < failing).count(),
+        3,
+        "the first failing heartbeat is inside the index build, after its two transients: {c:?}"
+    );
+    assert_eq!(scratch.len(), 3, "the build stopped there: {c:?}");
+    let a = aborted(&r);
+    assert_eq!((a.error.step, a.error.code()), (CopyStep::Heartbeat, Code::IoError));
+    assert!(got.is_empty(), "an abort, never a file's failure: {got:?}");
+    assert!(
+        dest_bytes(&fs, 6)
+            .iter()
+            .enumerate()
+            .all(|(i, b)| b.as_deref() == Some(format!("old {i}").as_bytes())),
+        "DEST keeps its bytes"
+    );
+    assert!(
+        !c.iter().any(|x| x.starts_with("create_new(") && x.contains(".flux-partial.")),
+        "no publication began: {c:?}"
+    );
+    assert_eq!(manifest(&fs, ID).state, OpState::Failed);
+}
+
+#[test]
+fn a_store_failure_on_the_last_publication_fails_the_run() {
+    use crate::store::faults;
+    // The plain pass: every store write commits (`commit_every 1`), and the count at the first `retire` is the number
+    // of commits the publications made.
+    let k = on_a_fresh_thread(|| {
+        let fs = replaced_dest(6);
+        ok(&run_tree_small(&fs, &cfg(), indexing_with(3, 1)).0);
+        faults::commits_at_first_retire()
+    });
+    assert!(k > 0, "the publications committed");
+    faults::arm_commit_failure(k);
+    let fs = replaced_dest(6);
+    let (r, _) = run_tree_small(&fs, &cfg(), indexing_with(3, 1));
+    let a = aborted(&r);
+    assert_eq!(a.error.step, CopyStep::Resolve, "{a:?}");
+    assert_eq!(manifest(&fs, ID).state, OpState::Failed);
+    assert_eq!(faults::commits_at_first_retire(), 0, "the poison is seen before any retire");
+    assert_eq!(
+        dest_bytes(&fs, 6)[5].as_deref(),
+        Some(&b"new 5"[..]),
+        "the file itself was published"
+    );
+}
+
+#[test]
+fn a_failed_final_commit_fails_an_otherwise_successful_run() {
+    use crate::store::faults;
+    let c = on_a_fresh_thread(|| {
+        let fs = replaced_dest(6);
+        ok(&run_tree_small(&fs, &cfg(), indexing()).0);
+        // The count below is only the final commit's if the run made one: `finish` must have run.
+        assert!(faults::finish_ran(), "the run's end commits the store");
+        faults::commits()
+    });
+    assert!(c > 0);
+    faults::arm_commit_failure(c);
+    let fs = replaced_dest(6);
+    let (r, _) = run_tree_small(&fs, &cfg(), indexing());
+    let a = aborted(&r);
+    assert_eq!(a.error.step, CopyStep::Resolve, "{a:?}");
+    assert!(a.error.cause.source.to_string().contains("injected commit failure"), "{a:?}");
+    assert_eq!(manifest(&fs, ID).state, OpState::Failed);
+}
+
+#[test]
+fn a_poisoned_index_aborts_at_the_next_resolve_not_per_file() {
+    crate::store::faults::arm_write_failure(1);
+    let fs = replaced_dest(6);
+    // The source lists inline (16 names): the walk never touches the scratch space, so nothing but the index's own
+    // `resolve` can meet the poison.
+    let t = crate::scratch::Thresholds::new(16, 16, 2, 16, 3)
+        .unwrap()
+        .with_index(4, 2, 4, 1 << 20, 2, 128)
+        .unwrap();
+    let (r, got) = run_tree_small(&fs, &cfg(), t);
+    let a = aborted(&r);
+    assert_eq!(a.error.step, CopyStep::Resolve, "{a:?}");
+    assert!(got.is_empty(), "the run aborts, it does not fail one file: {got:?}");
+    let c = calls(&fs);
+    assert!(
+        !c.iter().any(|x| x.starts_with("create_new(") && x.contains("f05.flux-partial.")),
+        "no later source file began: {c:?}"
+    );
+    assert!(
+        count(&c, "rename_replace(/p/dest/f") < 6,
+        "the walk stopped at the poison: {:?}",
+        count(&c, "rename_replace(/p/dest/f")
+    );
+    assert_eq!(manifest(&fs, ID).state, OpState::Failed);
+}
+
+/// A case-folding `/p/dest` of `F00`..`F05` whose listing reports wrong inode numbers, and a source of `f00`..`f05`
+/// (case aliases): the first resolution finds the entry by name but no listed inode agrees with it.
+fn aliased_dest() -> FaultFs {
+    let fs = FaultFs::new();
+    for d in ["/src", "/p", "/p/dest"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    for i in 0..6 {
+        put(&fs, &format!("/src/f{i:02}"), format!("new {i}").as_bytes(), 100);
+        fs.write_file(format!("/p/dest/F{i:02}"), format!("old {i}").as_bytes());
+    }
+    fs.set_case_insensitive(true);
+    fs.set_ino_mode(Path::new("/p/dest"), crate::fault_fs::InoMode::Wrong);
+    fs
+}
+
+#[test]
+fn a_heartbeat_failure_during_the_identity_pass_ends_the_copy_at_the_heartbeat_step() {
+    let fs = aliased_dest();
+    fs.on_nth("create_scratch", 7, |fs| fs.fail_always("write_at_start", Code::IoError));
+    let (r, got) = run_tree_small(&fs, &beating(), indexing_with(3, 2));
+    // The enumeration the arming point rests on: #1 the walk's lane, #2-#3 the two builders' transients, #4-#5 the two
+    // lanes in `build_two`, #6 the scratch store's file (the first `resolve` asks it whether the name is known), #7 the
+    // identity builder's transient on its first push; its tick at the third push is the first failing heartbeat.
+    let c = calls(&fs);
+    let seventh = (0..c.len())
+        .filter(|i| c[*i].starts_with("create_scratch("))
+        .nth(6)
+        .expect("a seventh scratch file");
+    let identity_pass = at(&c, "metadata(/src/f00)");
+    assert!(
+        identity_pass < seventh,
+        "the seventh scratch file belongs to the first resolve: {c:?}"
+    );
+    let failing = (seventh..c.len())
+        .find(|i| c[*i].starts_with("write_at_start("))
+        .expect("a heartbeat after the arming point");
+    assert_eq!(count(&c[..failing], "create_scratch("), 7, "{c:?}");
+    let a = aborted(&r);
+    assert_eq!((a.error.step, a.error.code()), (CopyStep::Heartbeat, Code::IoError));
+    assert!(got.is_empty(), "{got:?}");
+    assert!(
+        !c.iter().any(|x| x.starts_with("rename_") && x.contains("/p/dest/f")),
+        "nothing was published: {c:?}"
+    );
+}
+
+/// `/src` holding `a_file`, `b_dir/inner` and `c_dir/inner`, over a `/p/dest` of six files.
+fn poison_tree() -> FaultFs {
+    let fs = FaultFs::new();
+    for d in ["/src", "/src/b_dir", "/src/c_dir", "/p", "/p/dest"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    for f in ["/src/a_file", "/src/b_dir/inner", "/src/c_dir/inner"] {
+        fs.write_file(f, b"x");
+    }
+    for i in 0..6 {
+        fs.write_file(format!("/p/dest/old{i}"), b"o");
+    }
+    fs
+}
+
+#[test]
+fn a_scratch_poisoned_at_a_child_dir_end_aborts_before_the_next_directory() {
+    crate::store::faults::arm_write_failure(1);
+    let fs = poison_tree();
+    let (r, got) = run_tree_small(&fs, &cfg(), indexing_with(3, 1));
+    let a = aborted(&r);
+    assert_eq!(a.error.step, CopyStep::Resolve, "{a:?}");
+    assert!(got.is_empty(), "{got:?}");
+    let c = calls(&fs);
+    assert!(c.iter().any(|x| x.starts_with("create_dir(/p/dest/b_dir)")), "{c:?}");
+    assert!(
+        !c.iter().any(|x| x.starts_with("create_dir(/p/dest/c_dir)")),
+        "no later directory is entered: {c:?}"
+    );
+    let message = a.error.cause.source.to_string();
+    assert!(message.contains("b_dir"), "names the directory the run died in: {message}");
+    // The brief also expects the scratch location in this message. The store's own cause for a failed backend write
+    // (which is what poisons the space and must not be rewritten) names none: `ScratchBackend::write` returns the raw
+    // I/O error, so the location is NOT asserted here (reported as a conflict with the brief).
+    assert!(message.contains("scratch space is unusable"), "{message}");
+    assert_eq!(a.error.code(), Code::DiskFull);
+}
+
+/// `/src` with `d` of six files and a file `g`; `/p/dest` with `d` of six files.
+fn child_dest() -> FaultFs {
+    let fs = FaultFs::new();
+    for d in ["/src", "/src/d", "/p", "/p/dest", "/p/dest/d"] {
+        fs.create_dir(Path::new(d)).unwrap();
+    }
+    for i in 0..6 {
+        fs.write_file(format!("/src/d/f{i}"), b"new");
+        fs.write_file(format!("/p/dest/d/f{i}"), b"old");
+    }
+    fs.write_file("/src/g", b"G");
+    fs
+}
+
+#[test]
+fn a_listing_error_in_a_child_dir_index_build_skips_that_subtree() {
+    let plain = child_dest();
+    ok(&run_tree_small(&plain, &cfg(), indexing()).0);
+    let n = nth_of(&plain, "read_dir", "/p/dest/d)");
+    let fs = child_dest();
+    fs.fail_nth("read_dir", n, Code::PermissionDenied, std::io::ErrorKind::PermissionDenied);
+    let (r, got) = run_tree_small(&fs, &cfg(), indexing());
+    let reads: Vec<String> =
+        calls(&fs).into_iter().filter(|c| c.starts_with("read_dir(")).collect();
+    assert_eq!(
+        reads[n as usize - 1],
+        "read_dir(/p/dest/d)",
+        "the armed call is the child's listing"
+    );
+    let out = ok(&r);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].path, Path::new("d"));
+    assert!(
+        matches!(&got[0].cause, TreeFailureCause::CreateDir(e) if e.code == Code::PermissionDenied)
+    );
+    assert_eq!(fs.read_file("/p/dest/g").as_deref(), Some(&b"G"[..]), "the sibling is copied");
+    assert_eq!(
+        fs.read_file("/p/dest/d/f0").as_deref(),
+        Some(&b"old"[..]),
+        "the subtree is skipped"
+    );
+    assert_eq!(out.files_copied, 1);
+}
+
+#[test]
+fn a_heartbeat_failure_in_a_child_dir_index_build_ends_the_copy() {
+    let plain = child_dest();
+    ok(&run_tree_small(&plain, &beating(), indexing_with(3, 2)).0);
+    let m = nth_after(&plain, "create_scratch", "", "read_dir(/p/dest/d)");
+    let fs = child_dest();
+    fs.on_nth("create_scratch", m, |fs| fs.fail_always("write_at_start", Code::IoError));
+    let (r, got) = run_tree_small(&fs, &beating(), indexing_with(3, 2));
+    let c = calls(&fs);
+    let listed = at(&c, "read_dir(/p/dest/d)");
+    let armed = (0..c.len())
+        .filter(|i| c[*i].starts_with("create_scratch("))
+        .nth(m as usize - 1)
+        .expect("the armed scratch file");
+    assert!(armed > listed, "the armed scratch file is the child's index build: {c:?}");
+    let a = aborted(&r);
+    assert_eq!((a.error.step, a.error.code()), (CopyStep::Heartbeat, Code::IoError), "{a:?}");
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(fs.read_file("/p/dest/d/f0").as_deref(), Some(&b"old"[..]));
+}
+
+#[test]
+fn the_dry_run_builds_the_index_in_its_temporary_scratch() {
+    let fs = replaced_dest(6);
+    fs.create_dir(Path::new("/t")).unwrap();
+    let before = calls(&fs).len();
+    let (r, got) = run_tree_small(&fs, &dry_in_t(), indexing());
+    assert!(r.stop.is_none(), "{:?}", r.stop);
+    let replaced = got
+        .iter()
+        .filter(|f| {
+            matches!(
+                &f.cause,
+                TreeFailureCause::Planned(PlannedEntry { action: PlannedAction::Overwrite, .. })
+            )
+        })
+        .count();
+    assert_eq!(replaced, 6, "{got:?}");
+    let log = &calls(&fs)[before..];
+    assert!(count(log, "create_scratch(") > 0, "the index was built in scratch: {log:?}");
+    assert_eq!(
+        scratch_homes(&fs).iter().collect::<std::collections::BTreeSet<_>>(),
+        [expected_temporary_home().to_string()].iter().collect()
+    );
+    assert!(!log.iter().any(|c| c.starts_with("create_new(")), "{log:?}");
+    assert_eq!(dest_bytes(&fs, 6)[0].as_deref(), Some(&b"old 0"[..]));
+    assert!(!fs.exists("/p/dest/.flux"), "a dry run makes no workspace");
+}

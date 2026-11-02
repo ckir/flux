@@ -19,11 +19,13 @@ use crate::copy::{
 };
 use crate::dry_run::{PlannedAction, PlannedEntry, PlannedObject, SkipReason};
 use crate::hardlinks::{Candidacy, anchor_parent, candidacy, shown, strong};
-use crate::names::{NameIndex, Resolved};
+use crate::names::{BuildError, IndexSite, NameIndex, Resolved};
 use crate::oplog::{self, Verb};
 use crate::scratch::{ScratchSpace, Thresholds, temporary_home};
 use crate::state::{FLUX_DIR, RESERVED_DIRS, identity_text, native_hex};
-use crate::walk::{DEFAULT_MAX_DEPTH, MountPolicy, Walk, WalkEvent, WalkOptions, walk_unstarted};
+use crate::walk::{
+    DEFAULT_MAX_DEPTH, MountPolicy, Tick, Walk, WalkEvent, WalkOptions, walk_unstarted,
+};
 use flux_fs::{
     ClaimKey, ClaimOutcome, ClaimRecord, ClaimStatus, ClaimStore, Code, CopyOptions,
     DestinationRoot, DirHandle, Durability, ExistingPolicy, FileIdentity, FileSystem, FileType,
@@ -753,7 +755,10 @@ fn run_tree<F: DestinationRoot>(
         hardlinks: None,
         anchor_root: None,
     };
-    let result = copy_tree_at(&cx, source.events, root, false, out, on_report).1;
+    let walked = copy_tree_at(&cx, source.events, root, false, out, on_report).1;
+    // The store's final commit belongs to a walk that ended well; a failed one keeps its own error.
+    let result = walked
+        .and_then(|()| scratch.finish_store().map_err(|e| CopyError::at(CopyStep::Resolve, e)));
     scratch.close();
     result
 }
@@ -836,18 +841,19 @@ pub(crate) struct RootDone {
 /// DEST for a folder root's entries (`<name>/<path>`) and is the name itself for a file root. `dest` is
 /// `RootsDest::Existing` in a live run; `RootsDest::Planned(anchor)` only in a dry run whose DEST is absent, where every
 /// root is planned against `anchor`'s identity.
-pub(crate) fn copy_roots_at<F: DestinationRoot>(
+pub(crate) fn copy_roots_at<'s, 'h, F: DestinationRoot>(
     base: &Shared<'_, F>,
     dest: RootsDest<'_, F::Dir>,
     dest_created: bool,
     roots: Vec<RootInput<'_, '_, F>>,
+    scratch: Option<&'s ScratchSpace<'h>>,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> (Vec<RootDone>, std::result::Result<(), CopyError>) {
     let mut done = Vec::with_capacity(roots.len());
     let mut abort: Option<CopyError> = None;
     // The DEST-level state the file roots share (one frame's worth), made at the first file root.
-    let mut files: Option<RootState<'_, '_>> = None;
+    let mut files: Option<RootState<'s, 'h>> = None;
     for root in roots {
         let name = root.name().to_os_string();
         if abort.is_some() {
@@ -883,6 +889,7 @@ pub(crate) fn copy_roots_at<F: DestinationRoot>(
                 &name,
                 &src_parent,
                 identity,
+                scratch,
                 out,
                 on_report,
             ),
@@ -897,6 +904,28 @@ pub(crate) fn copy_roots_at<F: DestinationRoot>(
         if let Err(e) = result {
             abort = Some(e);
         }
+    }
+    // The file roots' DEST-level index ends here, as a frame's does at its `DirEnd`. Its error, and then the scratch
+    // space's poison (a store failure inside a batch-mode publication is first seen here), is the run's only when no
+    // root aborted first; a root's `RootDone` stays as the loop made it, since its file was published.
+    // After an abort the state is only dropped: a heartbeat write must not follow a lost lock.
+    let retired = match files.take() {
+        Some(state) if abort.is_none() => {
+            let mut stored = None;
+            let r = {
+                let mut tick = || tick_beat_and_guard(base, &mut stored);
+                state.names.retire(&mut tick)
+            };
+            r.map_err(|e| stored.take().unwrap_or_else(|| CopyError::at(CopyStep::Resolve, e)))
+        }
+        _ => Ok(()),
+    };
+    let poisoned = match scratch.and_then(|s| s.poison_error()) {
+        Some(e) => Err(CopyError::at(CopyStep::Resolve, at_path(Path::new(""), e))),
+        None => Ok(()),
+    };
+    if abort.is_none() {
+        abort = retired.and(poisoned).err();
     }
     (done, abort.map_or(Ok(()), Err))
 }
@@ -1015,14 +1044,15 @@ fn folder_root<F: DestinationRoot>(
 /// name IS the key (`FluxPathKey::from_relative("<name>")`).
 // One input per piece of the root's state, as `copy_one`'s.
 #[allow(clippy::too_many_arguments)]
-fn file_root<F: DestinationRoot>(
+fn file_root<'s, 'h, F: DestinationRoot>(
     base: &Shared<'_, F>,
     dest: &RootsDest<'_, F::Dir>,
     dest_created: bool,
-    state: &mut Option<RootState<'_, '_>>,
+    state: &mut Option<RootState<'s, 'h>>,
     name: &OsStr,
     src_parent: &Path,
     identity: FileIdentity,
+    scratch: Option<&'s ScratchSpace<'h>>,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<(), CopyError> {
@@ -1037,6 +1067,7 @@ fn file_root<F: DestinationRoot>(
                     Some(dest),
                     RootIdentity::Existing(dest_identity),
                     dest_created,
+                    scratch,
                     out,
                 )?)
             }
@@ -1045,6 +1076,7 @@ fn file_root<F: DestinationRoot>(
                 None,
                 RootIdentity::Planned(*anchor),
                 dest_created,
+                scratch,
                 out,
             )?),
         },
@@ -1144,7 +1176,8 @@ pub(crate) fn copy_tree_frames<F: DestinationRoot>(
         };
         return (root, Err(error));
     }
-    let state = match root_state(cx, root.as_ref(), root_identity, root_created, out) {
+    let scratch = events.scratch();
+    let state = match root_state(cx, root.as_ref(), root_identity, root_created, scratch, out) {
         Ok(state) => state,
         Err(e) => return (root, Err(e)),
     };
@@ -1156,7 +1189,7 @@ pub(crate) fn copy_tree_frames<F: DestinationRoot>(
         fresh: state.fresh,
         batch: Batch::default(),
     }];
-    let walked = walk_into(cx, &mut events, root_identity, &mut stack, out, on_report);
+    let walked = walk_into(cx, &mut events, root_identity, &mut stack, scratch, out, on_report);
     // Cut 16 (section 5.9): counted here, before the drain, so every exit path of the walk carries it.
     out.excluded += events.excluded();
     // Cut 9d, spec decision 5(e): every live frame's batch is flushed whatever the walk returned; the walk's own error
@@ -1166,7 +1199,28 @@ pub(crate) fn copy_tree_frames<F: DestinationRoot>(
     let walked = walked.and(drained);
     // The walk emits no `Dir` for the root, so no `DirEnd` pops it, and a frame is skipped only when pushed.
     match stack.into_iter().next() {
-        Some(Frame::Live { dir, .. }) => (dir, walked),
+        Some(Frame::Live { dir, names, .. }) => {
+            // The root's index ends with the walk, as a child's does at its `DirEnd`: after the drain, and only for a
+            // walk that did not already fail (the first error wins, and a failed run writes nothing more).
+            let walked = walked.and_then(|()| {
+                let mut stored = None;
+                let retired = {
+                    let mut tick = || tick_beat_and_guard(cx, &mut stored);
+                    names.retire(&mut tick)
+                };
+                if let Err(e) = retired {
+                    return Err(stored
+                        .take()
+                        .unwrap_or_else(|| CopyError::at(CopyStep::Resolve, e)));
+                }
+                match scratch.and_then(|s| s.poison_error()) {
+                    // The root's own path is empty, in the walk and in the tree's names for it.
+                    Some(e) => Err(CopyError::at(CopyStep::Resolve, at_path(Path::new(""), e))),
+                    None => Ok(()),
+                }
+            });
+            (dir, walked)
+        }
         _ => unreachable!("the root frame is never popped, and never skipped"),
     }
 }
@@ -1187,6 +1241,7 @@ fn root_state<'s, 'h, F: DestinationRoot>(
     root: Option<&F::Dir>,
     root_identity: RootIdentity,
     root_created: bool,
+    scratch: Option<&'s ScratchSpace<'h>>,
     out: &mut TreeOutcome,
 ) -> std::result::Result<RootState<'s, 'h>, CopyError> {
     let claim_parent = match (cx.claims, root_identity.inner()) {
@@ -1207,8 +1262,16 @@ fn root_state<'s, 'h, F: DestinationRoot>(
     // A pre-existing root is listed once; a root this run made (or, dry, one that does not exist) is `fresh` and needs
     // no listing.
     let fresh = root_created || root.is_none();
-    let names = NameIndex::for_dir(fresh, root.filter(|_| claim_parent.is_some()), None, None)
-        .map_err(|e| CopyError::at(CopyStep::Resolve, e.into_fs()))?;
+    // The index spills into the run's scratch space when the listing is large; its builders beat the heartbeat, and a
+    // failed tick is kept whole in `stored` (a `BuildError` carries only a stand-in for it).
+    let mut stored: Option<CopyError> = None;
+    let mut tick = || tick_beat_and_guard(cx, &mut stored);
+    let site = scratch.map(|scratch| IndexSite { scratch, tick: &mut tick });
+    let built =
+        NameIndex::for_dir(fresh, root.filter(|_| claim_parent.is_some()), site, claim_parent);
+    let names = built.map_err(|e| {
+        stored.take().unwrap_or_else(|| CopyError::at(CopyStep::Resolve, e.into_fs()))
+    })?;
     Ok(RootState { names, claim_parent, fresh })
 }
 
@@ -1227,11 +1290,12 @@ fn drain_mode(walked: &std::result::Result<(), CopyError>) -> DrainMode {
 }
 
 /// `copy_tree_at`'s loop. Every `?` here is an abort.
-fn walk_into<F: DestinationRoot>(
+fn walk_into<'s, 'h, F: DestinationRoot>(
     cx: &Shared<'_, F>,
     events: &mut Walk<'_, '_, F>,
     root_identity: RootIdentity,
-    stack: &mut Vec<Frame<'_, '_, F::Dir>>,
+    stack: &mut Vec<Frame<'s, 'h, F::Dir>>,
+    scratch: Option<&'s ScratchSpace<'h>>,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<(), CopyError> {
@@ -1300,19 +1364,30 @@ fn walk_into<F: DestinationRoot>(
                     // §101, then §99, before the directory's creation.
                     (cx.beat)().map_err(|e| CopyError::at(CopyStep::Heartbeat, e))?;
                     (cx.guard)().map_err(|e| CopyError::at(CopyStep::Create, e))?;
-                    enter_dir(
-                        stack,
-                        &path,
-                        identity,
-                        root_identity,
-                        cx.src_identity,
-                        cx.opts,
-                        cx.claims.is_some(),
-                        cx.dry_run,
-                        cx.key_prefix,
-                        out,
-                        on_report,
-                    )?
+                    // A tick that fails inside the index build is kept whole in `stored`; it wins over the build's
+                    // stand-in for it.
+                    let entered = {
+                        let mut tick = || tick_beat_and_guard(cx, &mut stored);
+                        enter_dir(
+                            stack,
+                            &path,
+                            identity,
+                            root_identity,
+                            cx.src_identity,
+                            cx.opts,
+                            cx.claims.is_some(),
+                            cx.dry_run,
+                            cx.key_prefix,
+                            scratch,
+                            &mut tick,
+                            out,
+                            on_report,
+                        )
+                    };
+                    match entered {
+                        Ok(frame) => frame,
+                        Err(e) => return Err(stored.take().unwrap_or(e)),
+                    }
                 };
                 stack.push(frame);
             }
@@ -1421,6 +1496,20 @@ fn walk_into<F: DestinationRoot>(
                         // A directory that does not exist yet (dry) staged nothing.
                         None => debug_assert!(batch.pending.is_empty()),
                     }
+                    // The directory's index ends with it; then the scratch space is asked once, for a poison that no
+                    // `resolve` of this directory met (an inline index never touches the store).
+                    let retired = {
+                        let mut tick = || tick_beat_and_guard(cx, &mut stored);
+                        names.retire(&mut tick)
+                    };
+                    if let Err(e) = retired {
+                        return Err(stored
+                            .take()
+                            .unwrap_or_else(|| CopyError::at(CopyStep::Resolve, e)));
+                    }
+                    if let Some(e) = scratch.and_then(|s| s.poison_error()) {
+                        return Err(CopyError::at(CopyStep::Resolve, at_path(&path, e)));
+                    }
                     if claim_parent.is_some()
                         && let Some(claims) = cx.claims
                     {
@@ -1525,7 +1614,7 @@ fn reserved_conflict() -> FsError {
 
 /// A `Dir` event under a live frame: the dynamic §129 check, then decision 8. In dry mode (cut 11a) nothing is created:
 /// a directory that is absent, or sits under a frame with no directory, becomes a planned child with no handle.
-// The signature is the plan's: ten inputs, each a distinct piece of walk state.
+// One input per piece of walk state.
 #[allow(clippy::too_many_arguments)]
 fn enter_dir<'s, 'h, D: DirHandle>(
     stack: &mut [Frame<'s, 'h, D>],
@@ -1537,6 +1626,8 @@ fn enter_dir<'s, 'h, D: DirHandle>(
     claims_on: bool,
     dry_run: bool,
     prefix: Option<&OsStr>,
+    scratch: Option<&'s ScratchSpace<'h>>,
+    tick: &mut Tick<'_>,
     out: &mut TreeOutcome,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> std::result::Result<Frame<'s, 'h, D>, CopyError> {
@@ -1730,17 +1821,21 @@ fn enter_dir<'s, 'h, D: DirHandle>(
         },
     };
     // A directory this run created is empty; a pre-existing one is listed once, here.
+    let site = scratch.map(|scratch| IndexSite { scratch, tick: &mut *tick });
     let names = match NameIndex::for_dir(
         !pre_existing,
         child.as_ref().filter(|_| claim_parent.is_some()),
-        None,
-        None,
+        site,
+        claim_parent,
     ) {
         Ok(names) => names,
-        Err(e) => {
-            report(out, on_report, path.to_path_buf(), TreeFailureCause::CreateDir(e.into_fs()));
+        // The directory could not be listed: it is skipped, as before.
+        Err(BuildError::Listing(e)) => {
+            report(out, on_report, path.to_path_buf(), TreeFailureCause::CreateDir(e));
             return Ok(Frame::Skipped);
         }
+        // The scratch space or the run's tick failed: the run stops.
+        Err(BuildError::Fatal(e)) => return Err(CopyError::at(CopyStep::Resolve, e)),
     };
     Ok(Frame::Live {
         dir: child,
@@ -1750,6 +1845,36 @@ fn enter_dir<'s, 'h, D: DirHandle>(
         fresh: !pre_existing,
         batch: Batch::default(),
     })
+}
+
+/// `e` re-made to name `path`: the same code, the source's kind, and the path in front of the message (the form
+/// `open_explicit` uses). A `CopyError` carries no path of its own, so without it the operator would read the scratch
+/// location and not the directory the run died in.
+fn at_path(path: &Path, e: FsError) -> FsError {
+    FsError::new(
+        e.code,
+        std::io::Error::new(e.source.kind(), format!("{}: {}", path.display(), e.source)),
+    )
+}
+
+/// After a failed `resolve` or `owner` of `path`: the error that ends the run instead of failing the one file, if any.
+/// A tick that failed during the identity pass is the run's error, at its own step; a poisoned scratch space aborts the
+/// run (spec 6.6), because every later file would meet the same fault.
+fn index_abort(
+    names: &NameIndex<'_, '_>,
+    tick_err: &mut Option<CopyError>,
+    path: &Path,
+    e: &FsError,
+) -> Option<CopyError> {
+    if let Some(t) = tick_err.take() {
+        return Some(t);
+    }
+    names.is_poisoned().then(|| CopyError::at(CopyStep::Resolve, at_path(path, same_fs_error(e))))
+}
+
+/// The same error again (`FsError` is not `Clone`).
+fn same_fs_error(e: &FsError) -> FsError {
+    FsError::new(e.code, std::io::Error::new(e.source.kind(), e.source.to_string()))
 }
 
 /// What the tree decided for one file target.
@@ -1976,14 +2101,20 @@ fn copy_one<F: DestinationRoot>(
 
     // 1-2. Resolve the planned name to the entry it denotes.
     // A directory this run created plans every target as new (plan decision 6), and so does a planned one (dry).
+    // A heartbeat or guard that fails while the index builds its identity family is kept whole here.
+    let mut tick_err: Option<CopyError> = None;
     let resolved = if fresh {
         Ok(Ok(Resolved::Absent))
     } else {
         let Some(parent) = parent else { unreachable!("a planned directory is fresh") };
-        names.resolve(parent, name, &mut || Ok(()))
+        let mut tick = || tick_beat_and_guard(cx, &mut tick_err);
+        names.resolve(parent, name, &mut tick)
     };
     let plan = match resolved {
         Err(e) => {
+            if let Some(abort) = index_abort(names, &mut tick_err, &path, &e) {
+                return Err(abort);
+            }
             report(
                 out,
                 on_report,
@@ -2008,6 +2139,9 @@ fn copy_one<F: DestinationRoot>(
             // is that target's. Refused before any policy decision, without consulting or writing the store.
             match names.owner(&stored) {
                 Err(e) => {
+                    if let Some(abort) = index_abort(names, &mut tick_err, &path, &e) {
+                        return Err(abort);
+                    }
                     report(
                         out,
                         on_report,
@@ -3127,14 +3261,20 @@ fn link_one<F: DestinationRoot>(
         }
     }
 
+    // A heartbeat or guard that fails while the index builds its identity family is kept whole here.
+    let mut tick_err: Option<CopyError> = None;
     let resolved = if fresh {
         Ok(Ok(Resolved::Absent))
     } else {
         let Some(parent) = parent else { unreachable!("a planned directory is fresh") };
-        names.resolve(parent, name, &mut || Ok(()))
+        let mut tick = || tick_beat_and_guard(cx, &mut tick_err);
+        names.resolve(parent, name, &mut tick)
     };
     let plan = match resolved {
         Err(e) => {
+            if let Some(abort) = index_abort(names, &mut tick_err, &path, &e) {
+                return Err(abort);
+            }
             report(
                 out,
                 on_report,
@@ -3159,6 +3299,9 @@ fn link_one<F: DestinationRoot>(
             // §241.5, before any policy decision.
             match names.owner(&stored) {
                 Err(e) => {
+                    if let Some(abort) = index_abort(names, &mut tick_err, &path, &e) {
+                        return Err(abort);
+                    }
                     report(
                         out,
                         on_report,
@@ -5847,6 +5990,8 @@ mod tests {
                 true,
                 false,
                 None,
+                None,
+                &mut || Ok(()),
                 &mut out,
                 &mut |_| {},
             )
@@ -10248,11 +10393,107 @@ mod tests {
             .collect();
         let mut out = TreeOutcome::default();
         let mut got = Vec::new();
-        let (done, result) =
-            copy_roots_at(&base, RootsDest::Existing(&dest), false, roots, &mut out, &mut |f| {
-                got.push(f)
-            });
+        let (done, result) = copy_roots_at(
+            &base,
+            RootsDest::Existing(&dest),
+            false,
+            roots,
+            None,
+            &mut out,
+            &mut |f| got.push(f),
+        );
         RootsRun { done, result, out, got }
+    }
+
+    /// One FILE root `g0` replacing a file of a `/dst` that holds six, indexed through a real scratch space (in `/t`)
+    /// with `commit_every` rows per commit: `(copy_roots_at's result, its RootDone)`.
+    fn file_root_into_a_large_dest(
+        commit_every: usize,
+    ) -> (std::result::Result<(), CopyError>, Vec<RootDone>, FaultFs) {
+        let fs = FaultFs::new();
+        for d in ["/", "/src", "/dst", "/t"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        fs.write_file("/src/g0", b"new");
+        for i in 0..6 {
+            fs.write_file(format!("/dst/g{i}"), b"old");
+        }
+        let dest = fs.destination_root(Path::new("/dst")).unwrap();
+        let store = dest.create_claim_store(OsStr::new("state.db"), Durability::Normal).unwrap();
+        let claims = std::cell::RefCell::new(store);
+        let o = opts();
+        let base = Shared {
+            fs: &fs,
+            src_root: Path::new("/src"),
+            src_identity: FileIdentity::Unavailable,
+            opts: &o,
+            guard: &unguarded,
+            beat: &no_heartbeat,
+            claims: Some(&claims),
+            resume: false,
+            batch: policy(1),
+            ckpt: None,
+            dry_run: false,
+            dry_prior: None,
+            dry_partials: None,
+            key_prefix: None,
+            hardlinks: None,
+            anchor_root: None,
+        };
+        let identity = fs.metadata(Path::new("/src/g0")).unwrap().identity;
+        let roots = vec![RootInput::File {
+            name: OsString::from("g0"),
+            src_parent: PathBuf::from("/src"),
+            identity,
+        }];
+        let thresholds = Thresholds::new(4, 8, 2, 16, 3)
+            .unwrap()
+            .with_index(4, 2, 4, 1 << 20, commit_every, 128)
+            .unwrap();
+        let temp_root = PathBuf::from("/t");
+        let scratch = ScratchSpace::unplaced(thresholds, None);
+        scratch.place_deferred(|| temporary_home(&fs, None, &temp_root));
+        let mut out = TreeOutcome::default();
+        let (done, result) = copy_roots_at(
+            &base,
+            RootsDest::Existing(&dest),
+            false,
+            roots,
+            Some(&scratch),
+            &mut out,
+            &mut |f| panic!("no failure expected: {f:?}"),
+        );
+        scratch.close();
+        drop(scratch);
+        (result, done, fs)
+    }
+
+    #[test]
+    fn copy_roots_at_returns_the_store_failure_of_its_post_loop_retire() {
+        use crate::store::faults;
+        // The plain pass: `commit_every 1`, so the publication commits itself and `retire` makes the commits after
+        // `k`. Its own thread keeps the pass's counters out of the one under test.
+        let k = std::thread::spawn(|| {
+            let (result, done, fs) = file_root_into_a_large_dest(1);
+            result.unwrap();
+            assert_eq!(fs.read_file("/dst/g0").as_deref(), Some(&b"new"[..]));
+            assert_eq!(done[0].status, RootStatus::Completed);
+            faults::commits_at_first_retire()
+        })
+        .join()
+        .expect("the plain pass completed");
+        assert!(k > 0, "the publication committed before the retire");
+
+        // The first commit of the retire pass: only a failing `retire` can turn this red (the poison check alone
+        // sees nothing, since nothing failed before).
+        faults::arm_commit_failure(k + 1);
+        let (result, done, fs) = file_root_into_a_large_dest(1);
+        let e = result.unwrap_err();
+        assert_eq!(e.step, CopyStep::Resolve, "{e:?}");
+        assert!(e.cause.source.to_string().contains("injected commit failure"), "{e:?}");
+        assert!(!e.cause.source.to_string().contains("/dst"), "names no directory: {e:?}");
+        assert_eq!(done[0].status, RootStatus::Completed, "its file was published");
+        assert_eq!(fs.read_file("/dst/g0").as_deref(), Some(&b"new"[..]));
     }
 
     fn statuses(run: &RootsRun) -> Vec<RootStatus> {

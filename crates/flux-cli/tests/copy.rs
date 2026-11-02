@@ -1345,3 +1345,96 @@ fn a_dry_run_that_does_not_spill_ignores_an_unusable_scratch_dir() {
         .unwrap();
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
 }
+
+/// `n` empty files `f00000`.. in `dir`, made if need be.
+fn empty_files_in(dir: &Path, n: usize) -> PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    for i in 0..n {
+        std::fs::File::create(dir.join(format!("f{i:05}"))).unwrap();
+    }
+    dir.to_path_buf()
+}
+
+/// The names under `dir` with their modification times, sorted.
+fn names_and_times(dir: &Path) -> Vec<(std::ffi::OsString, std::time::SystemTime)> {
+    let mut found: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            (e.file_name(), e.metadata().unwrap().modified().unwrap())
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+#[test]
+fn a_copy_onto_a_pre_existing_directory_above_the_threshold_uses_the_scratch_dir() {
+    let d = TempDir::new().unwrap();
+    let src = empty_files_in(&d.path().join("src"), 9_000);
+    let dst = empty_files_in(&d.path().join("dst"), 9_000);
+    let before = names_and_times(&dst);
+    let missing = d.path().join("missing");
+    let out =
+        flux().arg("copy").arg(&src).arg(&dst).arg("--scratch-dir").arg(&missing).output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains(missing.to_str().unwrap()), "{}", stderr(&out));
+    assert_eq!(names_and_times(&dst), before, "no file under DEST changed, and nothing was added");
+
+    let home = TempDir::new().unwrap();
+    let out = flux()
+        .arg("copy")
+        .arg("-vv")
+        .arg(&src)
+        .arg(&dst)
+        .arg("--scratch-dir")
+        .arg(home.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let e = stderr(&out);
+    assert!(e.contains("destination index spilled"), "{e}");
+    assert!(e.contains("indexing"), "{e}");
+    assert_eq!(std::fs::read_dir(&dst).unwrap().filter(|e| e.is_ok()).count(), 9_000);
+    assert_eq!(
+        std::fs::read_dir(home.path()).unwrap().count(),
+        0,
+        "the scratch files are nameless"
+    );
+}
+
+/// Spec 6.5: a destination of 300,000 names is indexed with the production constants (`index_inline` 8,192,
+/// `run_entries` 262,144): two sorted runs per family, one spill, and every file replaced.
+#[test]
+fn a_300k_entry_destination_is_indexed_with_the_production_constants() {
+    let d = TempDir::new().unwrap();
+    let src = empty_files_in(&d.path().join("src"), 300_000);
+    let dst = empty_files_in(&d.path().join("dst"), 300_000);
+    let home = TempDir::new().unwrap();
+    let out = flux()
+        .arg("copy")
+        .args(["-vv", "--json"])
+        .arg(&src)
+        .arg(&dst)
+        .arg("--scratch-dir")
+        .arg(home.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr (head): {:.2000}", stderr(&out));
+    let e = stderr(&out);
+    assert_eq!(e.matches("destination index spilled").count(), 1);
+    for family in ["names", "inodes"] {
+        let line = e
+            .lines()
+            .find(|l| l.contains("indexing") && l.contains(family))
+            .unwrap_or_else(|| panic!("no indexing line for {family}"));
+        assert!(line.contains("runs=2"), "{family}: {line}");
+    }
+    let report = json(&out);
+    assert_eq!(report["files_overwritten"], 300_000, "every destination file replaced");
+    assert_eq!(
+        std::fs::read_dir(home.path()).unwrap().count(),
+        0,
+        "the scratch files are nameless"
+    );
+}

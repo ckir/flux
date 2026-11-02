@@ -820,6 +820,20 @@ pub fn trees<F: DestinationRoot>(
     cfg: &RunConfig,
     on_report: &mut dyn FnMut(TreeFailure),
 ) -> MultiRun {
+    trees_with_thresholds(fs, specs, dst_root, opts, cfg, on_report, Thresholds::default())
+}
+
+/// `trees` with the listing thresholds given: the test seam for a small spill, as `tree_with_thresholds` is for one
+/// source.
+pub(crate) fn trees_with_thresholds<F: DestinationRoot>(
+    fs: &F,
+    specs: Vec<SourceSpec>,
+    dst_root: &Path,
+    opts: &CopyOptions,
+    cfg: &RunConfig,
+    on_report: &mut dyn FnMut(TreeFailure),
+    thresholds: Thresholds,
+) -> MultiRun {
     // A one-root manifest would be format 4 with a `kind`, which the validator rejects: the caller routes one source
     // to `tree` or `file`.
     // A resume (`--resume`) adopts in `MultiPlace::adopt`, which takes the prefix locks under this run's id; `remove` of
@@ -846,7 +860,7 @@ pub fn trees<F: DestinationRoot>(
         }
     };
     // Created before any walk so it outlives them all; placed under the lock (or at once, for a dry run).
-    let scratch = ScratchSpace::unplaced(Thresholds::default(), cfg.scratch_dir.clone());
+    let scratch = ScratchSpace::unplaced(thresholds, cfg.scratch_dir.clone());
     // A real copy opens an explicit `--scratch-dir` once, here, before DEST or the lock is touched; a dry run opens it
     // at its first spill.
     if !cfg.dry_run
@@ -1015,6 +1029,7 @@ pub fn trees<F: DestinationRoot>(
                 RootsDest::Existing(dest),
                 place.tree.created_dest,
                 inputs,
+                Some(&scratch),
                 out,
                 report,
             );
@@ -1185,7 +1200,11 @@ fn dry_trees<'h, F: DestinationRoot>(
         Some(d) => RootsDest::Existing(d),
         None => RootsDest::Planned(anchor),
     };
-    let (done, walked) = copy_roots_at(&cx, dest, false, inputs, &mut out, on_report);
+    let (done, walked) =
+        copy_roots_at(&cx, dest, false, inputs, Some(scratch), &mut out, on_report);
+    // The store's final commit belongs to a walk that ended well; a failed one keeps its own error.
+    let walked = walked
+        .and_then(|()| scratch.finish_store().map_err(|e| CopyError::at(CopyStep::Resolve, e)));
     scratch.close();
     // Cut 12: the index file and its private directory go with the slot.
     if let Some(slot) = hardlink_slot {
@@ -1695,6 +1714,102 @@ mod trees_tests {
             .read_file(format!("/p/dest/.flux/operations/{ID}/manifest"))
             .expect("the workspace is kept");
         decode_state(&bytes).unwrap()
+    }
+
+    // ----- Bounded listing (cut 23, plan 3, task 6): file roots index a large pre-existing DEST -----
+
+    /// Spills a listing of more than 4 names and indexes a destination of more than 4 names; `commit_every` names per
+    /// commit.
+    fn indexing(commit_every: usize) -> Thresholds {
+        Thresholds::new(4, 8, 2, 16, 3)
+            .unwrap()
+            .with_index(4, 2, 4, 1 << 20, commit_every, 128)
+            .unwrap()
+    }
+
+    fn file_specs(names: &[&str]) -> Vec<SourceSpec> {
+        names
+            .iter()
+            .map(|n| SourceSpec {
+                src: Path::new("/src").join(n),
+                name: OsString::from(n),
+                kind: SourceKind::File,
+            })
+            .collect()
+    }
+
+    /// `/src/g0`.. replacing the same names in a `/p/dest` of six files `g0`..`g5`.
+    fn file_roots_fake() -> FaultFs {
+        let fs = FaultFs::new();
+        for d in ["/src", "/p", "/p/dest"] {
+            fs.create_dir(Path::new(d)).unwrap();
+        }
+        for i in 0..6 {
+            fs.write_file(format!("/src/g{i}"), format!("new {i}").as_bytes());
+            fs.write_file(format!("/p/dest/g{i}"), format!("old {i}").as_bytes());
+        }
+        fs
+    }
+
+    fn go_small(fs: &FaultFs, names: &[&str], t: Thresholds) -> (MultiRun, Vec<TreeFailure>) {
+        let mut got = Vec::new();
+        let r = trees_with_thresholds(
+            fs,
+            file_specs(names),
+            Path::new("/p/dest"),
+            &opts(),
+            &cfg(),
+            &mut |f| got.push(f),
+            t,
+        );
+        (r, got)
+    }
+
+    #[test]
+    fn several_file_roots_into_a_destination_above_the_threshold_use_the_index() {
+        let run = |t: Thresholds| {
+            let fs = file_roots_fake();
+            let (r, got) = go_small(&fs, &["g1", "g4"], t);
+            let out = ok(&r);
+            assert!(got.is_empty(), "{got:?}");
+            let counts =
+                (out.files_total, out.files_copied, out.files_overwritten, out.bytes_copied);
+            let bytes: Vec<_> = (0..6).map(|i| fs.read_file(format!("/p/dest/g{i}"))).collect();
+            (counts, bytes, count_of(&calls(&fs), "create_scratch("), statuses(&r))
+        };
+        let (small, small_bytes, small_scratch, small_status) = run(indexing(2));
+        let (plain, plain_bytes, plain_scratch, plain_status) = run(Thresholds::default());
+        assert!(
+            small_scratch >= 2,
+            "the index's transient and its lane, with no walk: {small_scratch}"
+        );
+        assert_eq!(plain_scratch, 0);
+        assert_eq!(small, plain);
+        assert_eq!(small_status, plain_status);
+        assert_eq!(small.2, 2, "both files replaced a pre-existing one");
+        assert_eq!(small_bytes, plain_bytes);
+        assert_eq!(small_bytes[4].as_deref(), Some(&b"new 4"[..]));
+        assert_eq!(small_bytes[0].as_deref(), Some(&b"old 0"[..]));
+    }
+
+    fn count_of(calls: &[String], prefix: &str) -> usize {
+        calls.iter().filter(|c| c.starts_with(prefix)).count()
+    }
+
+    #[test]
+    fn a_store_failure_during_file_roots_fails_the_run() {
+        crate::store::faults::arm_write_failure(1);
+        let fs = file_roots_fake();
+        let (r, got) = go_small(&fs, &["g0", "g1", "g2"], indexing(2));
+        let Some(Err(abort)) = &r.run.copy else { panic!("expected an abort: {:?}", r.run.copy) };
+        assert_eq!(abort.error.step, CopyStep::Resolve, "{abort:?}");
+        assert!(got.is_empty(), "an abort, not a file's failure: {got:?}");
+        assert_eq!(
+            statuses(&r),
+            [RootStatus::Completed, RootStatus::Failed, RootStatus::NotStarted],
+            "the second root's resolve is the first to meet the poison"
+        );
+        assert_eq!(manifest(&fs).state, OpState::Failed);
     }
 
     #[test]
