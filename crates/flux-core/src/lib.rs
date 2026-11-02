@@ -22,6 +22,7 @@ pub mod run;
 pub mod scratch;
 mod spill;
 pub mod state;
+mod store;
 pub mod tree;
 pub mod verify;
 pub(crate) mod wal;

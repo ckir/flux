@@ -7,8 +7,9 @@
 //! The scratch space a bounded listing spills into: one anonymous file in a directory, carved into regions that
 //! are truncated in stack order.
 
+use crate::store::Store;
 use flux_fs::{Code, DestinationRoot, DirHandle, FsError};
-use std::cell::{Cell, Ref, RefCell};
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -263,6 +264,7 @@ pub struct ScratchSpace<'h> {
     home: RefCell<Home<'h>>,
     lanes: [LaneState; Lane::COUNT],
     poison: Rc<Poison>,
+    store: RefCell<Option<Store>>,
     owners: Cell<u64>,
     #[allow(dead_code)] // read by `next_ordinal`, first used by plan 3, task 5
     ordinals: Cell<u64>,
@@ -285,6 +287,7 @@ impl<'h> ScratchSpace<'h> {
             home: RefCell::new(Home::Unplaced),
             lanes: std::array::from_fn(|_| LaneState::new()),
             poison: Rc::new(Poison::new()),
+            store: RefCell::new(None),
             owners: Cell::new(0),
             ordinals: Cell::new(0),
             cache: RefCell::new(BlockCache::new(thresholds.index_cache_blocks)),
@@ -493,6 +496,57 @@ impl<'h> ScratchSpace<'h> {
         }
     }
 
+    /// The tier-2 store, created on first use over an unlinked file of its own. Any error is poisoned and returned;
+    /// on a poisoned space the poison error comes back and nothing is touched.
+    // Read by the index tasks that follow (plan 3, tasks 5-8); unused until they land.
+    #[allow(dead_code)]
+    pub(crate) fn store(&self) -> Result<RefMut<'_, Store>, FsError> {
+        self.check_usable()?;
+        let mut slot = self
+            .store
+            .try_borrow_mut()
+            .map_err(|_| fatal("the scratch store is already borrowed"))?;
+        if slot.is_none() {
+            let created = self.transient().and_then(|file| {
+                Store::create(
+                    file,
+                    self.shown(),
+                    self.thresholds.index_store_cache,
+                    self.thresholds.publication_commit,
+                    self.poison_handle(),
+                )
+            });
+            match created {
+                Ok(store) => *slot = Some(store),
+                Err(e) => {
+                    self.poison(FsError::new(
+                        e.code,
+                        std::io::Error::new(e.source.kind(), e.source.to_string()),
+                    ));
+                    return Err(e);
+                }
+            }
+            #[cfg(test)]
+            crate::store::faults::created();
+        }
+        RefMut::filter_map(slot, Option::as_mut).map_err(|_| fatal("the scratch store is missing"))
+    }
+
+    /// Makes the store's final commit, if a store exists: a run that is otherwise ending successfully calls it
+    /// before `close()`. Its error is the fatal scratch error.
+    // Read by the index tasks that follow (plan 3, tasks 5-8); unused until they land.
+    #[allow(dead_code)]
+    pub(crate) fn finish_store(&self) -> Result<(), FsError> {
+        self.check_usable()?;
+        match self.store.try_borrow_mut() {
+            Ok(mut slot) => match slot.as_mut() {
+                Some(store) => store.finish(),
+                None => Ok(()),
+            },
+            Err(_) => Err(fatal("the scratch store is already borrowed")),
+        }
+    }
+
     /// The lane's file, created if needed (the same path as `begin`), for a worker thread that writes it through
     /// `&File` with `write_all_at`.
     ///
@@ -532,8 +586,6 @@ impl<'h> ScratchSpace<'h> {
     }
 
     /// The poison, shared with the store that lives inside the space.
-    // Task 4: the store takes this clone.
-    #[allow(dead_code)]
     pub(crate) fn poison_handle(&self) -> Rc<Poison> {
         Rc::clone(&self.poison)
     }
@@ -547,6 +599,8 @@ impl<'h> ScratchSpace<'h> {
     /// Drops the file (on Windows the delete-on-close handle, without which the workspace cannot be removed). A
     /// later `begin` is a fatal error.
     pub fn close(&self) {
+        // The store holds a file of its own: it goes first.
+        *self.store.borrow_mut() = None;
         for state in &self.lanes {
             *state.backing.borrow_mut() = Backing::Closed;
         }
