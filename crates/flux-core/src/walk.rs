@@ -6,7 +6,7 @@
 
 //! The ordered directory walk (§7.2, §9, §149.4).
 
-use crate::scratch::{Region, ScratchSpace, Thresholds};
+use crate::scratch::{Lane, Region, ScratchSpace, Thresholds};
 use crate::spill::{MergeReader, RunSpan, cascade, sort_entries, write_run};
 use flux_fs::{
     Code, DirEntry, FileIdentity, FileSystem, FileType, FsError, MountRoot, ObjectId, Result,
@@ -539,6 +539,11 @@ impl<'a, 'h, F: FileSystem> Walk<'a, 'h, F> {
         self.excluded
     }
 
+    /// The scratch space this walk spills into, if it was given one.
+    pub fn scratch(&self) -> Option<&'a ScratchSpace<'h>> {
+        self.scratch
+    }
+
     /// How many directories this walk spilled to the scratch space.
     pub fn spilled_directories(&self) -> u64 {
         self.spilled
@@ -756,7 +761,7 @@ impl Listing<'_, '_> {
             return Ok(());
         }
         if self.region.is_none() {
-            self.region = Some(space.begin(self.owner)?);
+            self.region = Some(space.begin(Lane::Walk, self.owner)?);
         }
         sort_entries(&mut self.buf);
         let run = write_run(space, &self.buf)?;
@@ -1965,6 +1970,16 @@ mod tests {
     }
 
     #[test]
+    fn the_walk_exposes_its_scratch() {
+        let fs = component_order_tree();
+        let space = spilled(&fs, small());
+        let walk = walk_with(&fs, Path::new("/r"), opts(), Some(&space)).unwrap();
+        assert!(std::ptr::eq(walk.scratch().expect("a scratch space"), &space));
+        let bare = walk_with(&fs, Path::new("/r"), opts(), None).unwrap();
+        assert!(bare.scratch().is_none());
+    }
+
+    #[test]
     fn a_spilled_walk_yields_the_same_events_as_an_inline_walk() {
         let fs = component_order_tree();
         for (d, n) in [("/r/d0", 0), ("/r/d9", 9), ("/r/d40", 40)] {
@@ -2004,7 +2019,7 @@ mod tests {
         let want = paths(&fs);
         let space = spilled(&fs, small());
         assert_eq!(spilled_paths(&fs, &space), want);
-        assert_eq!(space.len(), 0);
+        assert_eq!(space.len(Lane::Walk), 0);
     }
 
     #[test]
@@ -2016,15 +2031,15 @@ mod tests {
         files(&fs, "/r", "g", 2);
         let space = spilled(&fs, small());
         let n = spilled_paths(&fs, &space).len();
-        assert_eq!((space.len(), space.physical_len()), (0, 0));
+        assert_eq!((space.len(Lane::Walk), space.physical_len(Lane::Walk)), (0, 0));
         {
             let mut walk = walk_with(&fs, Path::new("/r"), opts(), Some(&space)).unwrap();
             for _ in 0..5 {
                 assert!(walk.next().unwrap().is_ok());
             }
-            assert!(space.len() > 0, "the root's runs are live while the walk is open");
+            assert!(space.len(Lane::Walk) > 0, "the root's runs are live while the walk is open");
         }
-        assert_eq!((space.len(), space.physical_len()), (0, 0));
+        assert_eq!((space.len(Lane::Walk), space.physical_len(Lane::Walk)), (0, 0));
         assert!(n > 5);
     }
 
@@ -2052,7 +2067,7 @@ mod tests {
             assert!(walk.next().is_none());
             assert!(walk.next().is_none());
         }
-        assert_eq!((space.len(), space.physical_len()), (0, 0));
+        assert_eq!((space.len(Lane::Walk), space.physical_len(Lane::Walk)), (0, 0));
     }
 
     fn big_root(n: usize) -> FaultFs {
@@ -2084,7 +2099,7 @@ mod tests {
         assert!(walk.next_with(&mut tick).is_none());
         assert!(walk.next_with(&mut tick).is_none());
         drop(walk);
-        assert_eq!(space.len(), 0);
+        assert_eq!(space.len(Lane::Walk), 0);
     }
 
     #[test]
@@ -2161,7 +2176,7 @@ mod tests {
         assert!(walk.next_with(&mut tick).is_none());
         assert!(walk.next_with(&mut tick).is_none());
         drop(walk);
-        assert_eq!((space.len(), space.physical_len()), (0, 0));
+        assert_eq!((space.len(Lane::Walk), space.physical_len(Lane::Walk)), (0, 0));
         (oks, err)
     }
 
@@ -2215,7 +2230,7 @@ mod tests {
             assert!(walk.next().is_none());
             assert!(walk.next().is_none());
         }
-        assert_eq!((space.len(), space.physical_len()), (0, 0));
+        assert_eq!((space.len(Lane::Walk), space.physical_len(Lane::Walk)), (0, 0));
     }
 
     #[test]

@@ -8,9 +8,10 @@
 //! are truncated in stack order.
 
 use flux_fs::{Code, DestinationRoot, DirHandle, FsError};
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, Ref, RefCell};
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 /// The sizes that decide when a directory listing spills and how its runs are merged (spec 6.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +26,18 @@ pub struct Thresholds {
     pub merge_buffer: usize,
     /// Entries between two ticks (heartbeat and cancellation checks).
     pub tick_entries: usize,
+    /// A destination index with at most this many names stays in memory.
+    pub index_inline: usize,
+    /// Candidates verified per lookup in the inode family; more are treated as none.
+    pub max_candidates: usize,
+    /// Blocks of the index block cache.
+    pub index_cache_blocks: usize,
+    /// Bytes of cache for the embedded store.
+    pub index_store_cache: usize,
+    /// Store rows written or removed per commit.
+    pub publication_commit: usize,
+    /// Bytes per index block (a power of two, at least 64).
+    pub index_block: usize,
 }
 
 impl Default for Thresholds {
@@ -35,6 +48,12 @@ impl Default for Thresholds {
             merge_fan_in: 384,
             merge_buffer: 16_384,
             tick_entries: 65_536,
+            index_inline: 8_192,
+            max_candidates: 16,
+            index_cache_blocks: 256,
+            index_store_cache: 16 * 1024 * 1024,
+            publication_commit: 1_024,
+            index_block: 4_096,
         }
     }
 }
@@ -60,7 +79,53 @@ impl Thresholds {
         if merge_buffer < 4 {
             return Err("merge_buffer must be at least 4");
         }
-        Ok(Thresholds { inline_entries, run_entries, merge_fan_in, merge_buffer, tick_entries })
+        Ok(Thresholds {
+            inline_entries,
+            run_entries,
+            merge_fan_in,
+            merge_buffer,
+            tick_entries,
+            ..Thresholds::default()
+        })
+    }
+
+    /// Replaces the destination index sizes; refuses a combination the index cannot work with.
+    pub fn with_index(
+        self,
+        index_inline: usize,
+        max_candidates: usize,
+        index_cache_blocks: usize,
+        index_store_cache: usize,
+        publication_commit: usize,
+        index_block: usize,
+    ) -> Result<Thresholds, &'static str> {
+        if index_inline == 0 {
+            return Err("index_inline must be at least 1");
+        }
+        if max_candidates == 0 {
+            return Err("max_candidates must be at least 1");
+        }
+        if index_cache_blocks < 4 {
+            return Err("index_cache_blocks must be at least 4");
+        }
+        if publication_commit == 0 {
+            return Err("publication_commit must be at least 1");
+        }
+        if index_block < 64 {
+            return Err("index_block must be at least 64");
+        }
+        if !index_block.is_power_of_two() {
+            return Err("index_block must be a power of two");
+        }
+        Ok(Thresholds {
+            index_inline,
+            max_candidates,
+            index_cache_blocks,
+            index_store_cache,
+            publication_commit,
+            index_block,
+            ..self
+        })
     }
 }
 
@@ -100,6 +165,91 @@ fn fatal(message: impl Into<String>) -> FsError {
     FsError::new(Code::IoError, std::io::Error::other(message.into()))
 }
 
+/// The owner every index lane's regions are taken with: index frames nest in stack order and no two walks share a
+/// lane, so the one-active-walk check does not apply to them.
+// Read by the index tasks that follow (plan 3, tasks 2-4); unused until they land.
+#[allow(dead_code)]
+pub(crate) const INDEX_OWNER: u64 = u64::MAX;
+
+/// One anonymous file of the space, with its own logical end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(dead_code)] // the index lanes are first used by plan 3, tasks 2-4
+pub(crate) enum Lane {
+    Walk,
+    Names,
+    Inodes,
+    Identity,
+}
+
+impl Lane {
+    const COUNT: usize = 4;
+
+    pub(crate) fn idx(self) -> usize {
+        match self {
+            Lane::Walk => 0,
+            Lane::Names => 1,
+            Lane::Inodes => 2,
+            Lane::Identity => 3,
+        }
+    }
+}
+
+/// The per-file state of one lane.
+struct LaneState {
+    backing: RefCell<Backing>,
+    /// The logical end of the file.
+    end: Cell<u64>,
+    live_regions: Cell<usize>,
+    holder: Cell<u64>,
+}
+
+impl LaneState {
+    fn new() -> LaneState {
+        LaneState {
+            backing: RefCell::new(Backing::NotCreated),
+            end: Cell::new(0),
+            live_regions: Cell::new(0),
+            holder: Cell::new(0),
+        }
+    }
+}
+
+/// The first cause that made a space unusable. `FsError` is not `Clone` and its source must never be rebuilt with
+/// context, so the code, the kind and the text are kept and the error is re-made from them.
+pub(crate) struct Poison {
+    cause: RefCell<Option<(Code, std::io::ErrorKind, String)>>,
+}
+
+impl Poison {
+    pub(crate) fn new() -> Poison {
+        Poison { cause: RefCell::new(None) }
+    }
+
+    /// Keeps the FIRST cause; a later one is ignored.
+    pub(crate) fn set(&self, cause: FsError) {
+        let mut slot = self.cause.borrow_mut();
+        if slot.is_none() {
+            *slot = Some((cause.code, cause.source.kind(), cause.source.to_string()));
+        }
+    }
+
+    pub(crate) fn error(&self) -> Option<FsError> {
+        self.cause.borrow().as_ref().map(|(code, kind, message)| {
+            FsError::new(
+                *code,
+                std::io::Error::new(*kind, format!("scratch space is unusable: {message}")),
+            )
+        })
+    }
+
+    pub(crate) fn check(&self) -> Result<(), FsError> {
+        match self.error() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
 /// One anonymous file in a directory, carved into regions that are truncated in stack order.
 ///
 /// INVARIANT: one ACTIVE walk per space. Regions are LIFO, so two walks iterated in alternation on one space (as
@@ -110,13 +260,11 @@ pub struct ScratchSpace<'h> {
     thresholds: Thresholds,
     explicit: Option<PathBuf>,
     home: RefCell<Home<'h>>,
-    backing: RefCell<Backing>,
-    /// The logical end of the file.
-    end: Cell<u64>,
-    poisoned: Cell<bool>,
-    live_regions: Cell<usize>,
-    holder: Cell<u64>,
+    lanes: [LaneState; Lane::COUNT],
+    poison: Rc<Poison>,
     owners: Cell<u64>,
+    #[allow(dead_code)] // read by `next_ordinal`, first used by plan 3, task 5
+    ordinals: Cell<u64>,
     #[cfg(test)]
     writes_before_failure: Cell<Option<u64>>,
     #[cfg(test)]
@@ -133,12 +281,10 @@ impl<'h> ScratchSpace<'h> {
             thresholds,
             explicit,
             home: RefCell::new(Home::Unplaced),
-            backing: RefCell::new(Backing::NotCreated),
-            end: Cell::new(0),
-            poisoned: Cell::new(false),
-            live_regions: Cell::new(0),
-            holder: Cell::new(0),
+            lanes: std::array::from_fn(|_| LaneState::new()),
+            poison: Rc::new(Poison::new()),
             owners: Cell::new(0),
+            ordinals: Cell::new(0),
             #[cfg(test)]
             writes_before_failure: Cell::new(None),
             #[cfg(test)]
@@ -160,6 +306,15 @@ impl<'h> ScratchSpace<'h> {
     pub(crate) fn next_owner(&self) -> u64 {
         let n = self.owners.get() + 1;
         self.owners.set(n);
+        n
+    }
+
+    /// The tier 2 key of a directory with no Strong identity: 1, 2, 3, ...
+    // Read by the index tasks that follow (plan 3, tasks 2-4); unused until they land.
+    #[allow(dead_code)]
+    pub(crate) fn next_ordinal(&self) -> u64 {
+        let n = self.ordinals.get() + 1;
+        self.ordinals.set(n);
         n
     }
 
@@ -192,19 +347,25 @@ impl<'h> ScratchSpace<'h> {
         }
     }
 
-    /// A region starting at the file's current length. Creates the file on the first call.
-    pub(crate) fn begin(&self, owner: u64) -> Result<Region<'_, 'h>, FsError> {
-        self.check_usable()?;
-        if self.live_regions.get() > 0 && self.holder.get() != owner {
-            return Err(fatal("one scratch space is shared by two walks"));
-        }
-        self.ensure_open()?;
-        self.holder.set(owner);
-        self.live_regions.set(self.live_regions.get() + 1);
-        Ok(Region { space: self, start: self.end.get() })
+    fn lane(&self, lane: Lane) -> &LaneState {
+        &self.lanes[lane.idx()]
     }
 
-    pub(crate) fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<(), FsError> {
+    /// A region of `lane` starting at the lane's current length. Creates the lane's file on its first call. Only
+    /// `Lane::Walk` has the one-active-walk check; the index lanes take `INDEX_OWNER` and nest freely.
+    pub(crate) fn begin(&self, lane: Lane, owner: u64) -> Result<Region<'_, 'h>, FsError> {
+        self.check_usable()?;
+        let state = self.lane(lane);
+        if lane == Lane::Walk && state.live_regions.get() > 0 && state.holder.get() != owner {
+            return Err(fatal("one scratch space is shared by two walks"));
+        }
+        self.ensure_open(lane)?;
+        state.holder.set(owner);
+        state.live_regions.set(state.live_regions.get() + 1);
+        Ok(Region { space: self, lane, start: state.end.get() })
+    }
+
+    pub(crate) fn write_at(&self, lane: Lane, offset: u64, bytes: &[u8]) -> Result<(), FsError> {
         self.check_usable()?;
         #[cfg(test)]
         if let Some(n) = self.writes_before_failure.get() {
@@ -216,19 +377,25 @@ impl<'h> ScratchSpace<'h> {
             }
             self.writes_before_failure.set(Some(n - 1));
         }
-        let backing = self.backing.borrow();
+        let state = self.lane(lane);
+        let backing = state.backing.borrow();
         let Backing::Open(file) = &*backing else {
             return Err(self.not_open(&backing));
         };
         write_all_at(file, bytes, offset).map_err(|e| self.io_error(e))?;
         let new_end = offset + bytes.len() as u64;
-        if new_end > self.end.get() {
-            self.end.set(new_end);
+        if new_end > state.end.get() {
+            state.end.set(new_end);
         }
         Ok(())
     }
 
-    pub(crate) fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    pub(crate) fn read_at(
+        &self,
+        lane: Lane,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, FsError> {
         self.check_usable()?;
         #[cfg(test)]
         if let Some(n) = self.reads_before_failure.get() {
@@ -240,28 +407,101 @@ impl<'h> ScratchSpace<'h> {
             }
             self.reads_before_failure.set(Some(n - 1));
         }
-        let backing = self.backing.borrow();
+        let backing = self.lane(lane).backing.borrow();
         let Backing::Open(file) = &*backing else {
             return Err(self.not_open(&backing));
         };
         read_fully_at(file, buf, offset).map_err(|e| self.io_error(e))
     }
 
-    /// The logical end of the file.
-    pub(crate) fn len(&self) -> u64 {
-        self.end.get()
+    /// The logical end of the lane's file.
+    pub(crate) fn len(&self, lane: Lane) -> u64 {
+        self.lane(lane).end.get()
+    }
+
+    /// A fresh anonymous file from the home, for a family's cascade passes: not a lane and not tracked; the caller
+    /// drops it. A deferred home is resolved first, exactly as `ensure_open` does.
+    // Read by the index tasks that follow (plan 3, tasks 2-4); unused until they land.
+    #[allow(dead_code)]
+    pub(crate) fn transient(&self) -> Result<File, FsError> {
+        self.check_usable()?;
+        self.resolve_home();
+        match &*self.home.borrow() {
+            Home::Deferred(_) | Home::Unplaced => {
+                Err(fatal("scratch space used before it was placed"))
+            }
+            Home::Failed { code, message } => {
+                Err(FsError::new(*code, std::io::Error::other(message.clone())))
+            }
+            Home::Placed { create, shown } => create().map_err(|e| {
+                FsError::new(
+                    e.code,
+                    std::io::Error::new(
+                        e.source.kind(),
+                        format!("{}: {}", shown.display(), e.source),
+                    ),
+                )
+            }),
+        }
+    }
+
+    /// The lane's file, created if needed (the same path as `begin`), for a worker thread that writes it through
+    /// `&File` with `write_all_at`.
+    ///
+    /// INVARIANT: while the returned `Ref` is held no call may take `borrow_mut` on that lane's backing (`ensure_open`
+    /// does). The tick the listing thread calls while waiting is the beat-and-guard closure, which touches the lock
+    /// file, never the scratch space.
+    // Read by the index tasks that follow (plan 3, tasks 2-4); unused until they land.
+    #[allow(dead_code)]
+    pub(crate) fn lane_file(&self, lane: Lane) -> Result<Ref<'_, File>, FsError> {
+        self.check_usable()?;
+        self.ensure_open(lane)?;
+        Ref::filter_map(self.lane(lane).backing.borrow(), |b| match b {
+            Backing::Open(file) => Some(file),
+            _ => None,
+        })
+        .map_err(|b| self.not_open(&b))
+    }
+
+    /// Raises the lane's logical end to `end` (never lowers it): the listing thread calls it after joining the
+    /// workers that wrote the lane through `lane_file`.
+    // Read by the index tasks that follow (plan 3, tasks 2-4); unused until they land.
+    #[allow(dead_code)]
+    pub(crate) fn set_end(&self, lane: Lane, end: u64) {
+        let state = self.lane(lane);
+        if end > state.end.get() {
+            state.end.set(end);
+        }
+    }
+
+    /// Makes the space unusable, keeping the FIRST cause.
+    pub(crate) fn poison(&self, cause: FsError) {
+        self.poison.set(cause);
+    }
+
+    pub(crate) fn poison_error(&self) -> Option<FsError> {
+        self.poison.error()
+    }
+
+    /// The poison, shared with the store that lives inside the space.
+    // Task 4: the store takes this clone.
+    #[allow(dead_code)]
+    pub(crate) fn poison_handle(&self) -> Rc<Poison> {
+        Rc::clone(&self.poison)
     }
 
     // Read only by tests so far: every scratch call checks the flag itself.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn poisoned(&self) -> bool {
-        self.poisoned.get()
+        self.poison_error().is_some()
     }
 
     /// Drops the file (on Windows the delete-on-close handle, without which the workspace cannot be removed). A
     /// later `begin` is a fatal error.
     pub fn close(&self) {
-        *self.backing.borrow_mut() = Backing::Closed;
+        for state in &self.lanes {
+            *state.backing.borrow_mut() = Backing::Closed;
+        }
         // The home holds the workspace's directory handle (inside the create closure): release it too, or the
         // workspace cannot be removed while the space lives. Placed after the old home is dropped.
         let old = std::mem::replace(
@@ -273,8 +513,8 @@ impl<'h> ScratchSpace<'h> {
 
     /// The file's real length, as the operating system reports it (not the logical end).
     #[cfg(test)]
-    pub(crate) fn physical_len(&self) -> u64 {
-        match &*self.backing.borrow() {
+    pub(crate) fn physical_len(&self, lane: Lane) -> u64 {
+        match &*self.lane(lane).backing.borrow() {
             Backing::Open(file) => file.metadata().unwrap().len(),
             _ => panic!("the scratch file is not open"),
         }
@@ -299,10 +539,7 @@ impl<'h> ScratchSpace<'h> {
     }
 
     fn check_usable(&self) -> Result<(), FsError> {
-        if self.poisoned.get() {
-            return Err(fatal("scratch space is unusable after a failed truncate"));
-        }
-        Ok(())
+        self.poison.check()
     }
 
     fn shown(&self) -> String {
@@ -330,8 +567,8 @@ impl<'h> ScratchSpace<'h> {
         }
     }
 
-    fn ensure_open(&self) -> Result<(), FsError> {
-        let mut backing = self.backing.borrow_mut();
+    fn ensure_open(&self, lane: Lane) -> Result<(), FsError> {
+        let mut backing = self.lane(lane).backing.borrow_mut();
         if matches!(*backing, Backing::NotCreated) {
             self.resolve_home();
             *backing = match &*self.home.borrow() {
@@ -373,16 +610,21 @@ impl<'h> ScratchSpace<'h> {
         *self.home.borrow_mut() = resolved;
     }
 
-    fn truncate(&self, start: u64) {
+    /// Cuts the lane's file back to `start`. A failure poisons the space.
+    pub(crate) fn truncate(&self, lane: Lane, start: u64) {
+        // Task 3: invalidate the block cache here
         #[cfg(test)]
         if self.truncate_fails.replace(false) {
-            self.poisoned.set(true);
+            self.poison(fatal("a truncate failed"));
             return;
         }
-        if let Backing::Open(file) = &*self.backing.borrow()
-            && file.set_len(start).is_err()
+        if let Backing::Open(file) = &*self.lane(lane).backing.borrow()
+            && let Err(e) = file.set_len(start)
         {
-            self.poisoned.set(true);
+            self.poison(FsError::new(
+                FsError::classify(&e),
+                std::io::Error::new(e.kind(), format!("a truncate failed: {e}")),
+            ));
         }
     }
 }
@@ -392,6 +634,7 @@ impl<'h> ScratchSpace<'h> {
 /// it): then the file is left alone, since a truncate would pad it with zeros. Regions nest like a stack.
 pub(crate) struct Region<'s, 'h> {
     space: &'s ScratchSpace<'h>,
+    lane: Lane,
     start: u64,
 }
 
@@ -408,11 +651,12 @@ impl Drop for Region<'_, '_> {
         // A region dropped after its parent finds the end already below its start: it must neither extend the file
         // (`set_len` past the end pads with zeros) nor raise the end. At `start == end` the truncate still runs,
         // because a failed partial write can leave bytes physically past `end`.
-        if self.start <= self.space.end.get() {
-            self.space.truncate(self.start);
-            self.space.end.set(self.start);
+        let state = self.space.lane(self.lane);
+        if self.start <= state.end.get() {
+            self.space.truncate(self.lane, self.start);
+            state.end.set(self.start);
         }
-        self.space.live_regions.set(self.space.live_regions.get().saturating_sub(1));
+        state.live_regions.set(state.live_regions.get().saturating_sub(1));
     }
 }
 
@@ -540,12 +784,12 @@ fn windows_subdir<D: DirHandle>(dir: D, shown: PathBuf) -> (D, PathBuf) {
 }
 
 #[cfg(unix)]
-fn write_all_at(file: &File, bytes: &[u8], offset: u64) -> std::io::Result<()> {
+pub(crate) fn write_all_at(file: &File, bytes: &[u8], offset: u64) -> std::io::Result<()> {
     std::os::unix::fs::FileExt::write_all_at(file, bytes, offset)
 }
 
 #[cfg(windows)]
-fn write_all_at(file: &File, mut bytes: &[u8], mut offset: u64) -> std::io::Result<()> {
+pub(crate) fn write_all_at(file: &File, mut bytes: &[u8], mut offset: u64) -> std::io::Result<()> {
     use std::os::windows::fs::FileExt;
     while !bytes.is_empty() {
         let n = file.seek_write(bytes, offset)?;
@@ -559,7 +803,7 @@ fn write_all_at(file: &File, mut bytes: &[u8], mut offset: u64) -> std::io::Resu
 }
 
 /// Reads until `buf` is full or the file ends; returns the bytes read.
-fn read_fully_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+pub(crate) fn read_fully_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
     let mut done = 0;
     while done < buf.len() {
         #[cfg(unix)]
@@ -594,7 +838,7 @@ mod tests {
 
     /// The file's real length, as the operating system reports it (not the logical end).
     fn physical_len(space: &ScratchSpace<'_>) -> u64 {
-        space.physical_len()
+        space.physical_len(Lane::Walk)
     }
 
     fn creations(fs: &FaultFs) -> usize {
@@ -622,18 +866,140 @@ mod tests {
     }
 
     #[test]
+    fn lanes_have_independent_ends_and_regions() {
+        let fs = FaultFs::new();
+        let space = placed(&fs);
+        let walk = space.begin(Lane::Walk, 1).ok().unwrap();
+        space.write_at(Lane::Walk, walk.start(), &[1u8; 10]).unwrap();
+        let names = space.begin(Lane::Names, INDEX_OWNER).ok().unwrap();
+        space.write_at(Lane::Names, names.start(), &[2u8; 5]).unwrap();
+        assert_eq!((space.len(Lane::Walk), space.len(Lane::Names)), (10, 5));
+        assert_eq!(space.physical_len(Lane::Names), 5);
+        drop(names);
+        assert_eq!((space.len(Lane::Walk), space.len(Lane::Names)), (10, 0));
+        assert_eq!(space.physical_len(Lane::Walk), 10);
+        let mut buf = [0u8; 10];
+        assert_eq!(space.read_at(Lane::Walk, 0, &mut buf).unwrap(), 10);
+        assert_eq!(buf, [1u8; 10]);
+        drop(walk);
+        assert_eq!(space.len(Lane::Walk), 0);
+    }
+
+    #[test]
+    fn each_lane_is_created_on_its_first_region() {
+        let fs = FaultFs::new();
+        let space = placed(&fs);
+        let _w = space.begin(Lane::Walk, 1).ok().unwrap();
+        assert_eq!(creations(&fs), 1, "{:?}", fs.calls());
+        let _n = space.begin(Lane::Names, INDEX_OWNER).ok().unwrap();
+        let _n2 = space.begin(Lane::Names, INDEX_OWNER).ok().unwrap();
+        assert_eq!(creations(&fs), 2, "{:?}", fs.calls());
+    }
+
+    #[test]
+    fn a_transient_file_is_not_a_lane() {
+        let fs = FaultFs::new();
+        let space = placed(&fs);
+        let _w = space.begin(Lane::Walk, 1).ok().unwrap();
+        let _n = space.begin(Lane::Names, INDEX_OWNER).ok().unwrap();
+        assert_eq!(creations(&fs), 2);
+        let file = space.transient().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(creations(&fs), 3, "{:?}", fs.calls());
+        for lane in [Lane::Walk, Lane::Names, Lane::Inodes, Lane::Identity] {
+            assert_eq!(space.len(lane), 0);
+        }
+        drop(file);
+        assert_eq!(creations(&fs), 3);
+    }
+
+    #[test]
+    fn a_transient_file_places_a_deferred_home() {
+        let fs = FaultFs::new();
+        fs.create_dir(Path::new("/s")).unwrap();
+        let asked = std::rc::Rc::new(Cell::new(0));
+        let space = ScratchSpace::unplaced(Thresholds::default(), None);
+        let counter = std::rc::Rc::clone(&asked);
+        let fs_ref = &fs;
+        space.place_deferred(move || {
+            counter.set(counter.get() + 1);
+            Ok((fs_ref.destination_root(Path::new("/s"))?, PathBuf::from("/s")))
+        });
+        assert_eq!(asked.get(), 0);
+        assert!(space.transient().is_ok());
+        assert_eq!(asked.get(), 1);
+        assert!(space.transient().is_ok());
+        assert_eq!(asked.get(), 1, "the producer ran once");
+    }
+
+    #[test]
+    fn index_lanes_nest_regions_from_the_index_owner() {
+        let fs = FaultFs::new();
+        let space = placed(&fs);
+        let a = space.begin(Lane::Names, INDEX_OWNER);
+        let b = space.begin(Lane::Names, INDEX_OWNER);
+        assert!(a.is_ok() && b.is_ok());
+        let first = space.begin(Lane::Walk, 1).ok().unwrap();
+        let err = space.begin(Lane::Walk, 2).err().expect("refused");
+        assert!(err.to_string().contains("shared by two walks"), "{err}");
+        drop(first);
+    }
+
+    #[test]
+    fn a_poisoned_space_reports_its_first_cause() {
+        let fs = FaultFs::new();
+        let space = placed(&fs);
+        space.poison(FsError::new(Code::DiskFull, std::io::Error::other("a")));
+        space.poison(FsError::new(Code::IoError, std::io::Error::other("b")));
+        assert_eq!(space.poison_error().unwrap().code, Code::DiskFull);
+        assert!(space.poisoned());
+        for lane in [Lane::Walk, Lane::Names, Lane::Inodes, Lane::Identity] {
+            let err = space.begin(lane, INDEX_OWNER).err().expect("refused");
+            assert_eq!(err.code, Code::DiskFull);
+            let text = err.to_string();
+            assert!(text.contains("scratch space is unusable: a"), "{text}");
+            assert!(!text.contains(": b"), "{text}");
+        }
+    }
+
+    #[test]
+    fn ordinals_start_at_one_and_count_up() {
+        let space = ScratchSpace::unplaced(Thresholds::default(), None);
+        assert_eq!((space.next_ordinal(), space.next_ordinal(), space.next_ordinal()), (1, 2, 3));
+    }
+
+    #[test]
+    fn with_index_refuses_a_zero_threshold_and_a_small_block() {
+        let d = Thresholds::default();
+        assert!(d.with_index(0, 16, 256, 1, 1024, 4096).is_err());
+        assert!(d.with_index(4, 0, 256, 1, 1024, 4096).is_err());
+        assert!(d.with_index(4, 2, 3, 1, 1024, 4096).is_err());
+        assert!(d.with_index(4, 2, 4, 1, 0, 4096).is_err());
+        assert!(d.with_index(4, 2, 4, 1, 2, 32).is_err());
+        assert!(d.with_index(4, 2, 4, 1, 2, 100).is_err());
+        let t = d.with_index(4, 2, 4, 1, 2, 64).unwrap();
+        assert_eq!((t.index_inline, t.max_candidates, t.index_cache_blocks), (4, 2, 4));
+        assert_eq!((t.index_store_cache, t.publication_commit, t.index_block), (1, 2, 64));
+        let t = Thresholds::new(4, 8, 2, 16, 3).unwrap();
+        assert_eq!((t.index_inline, t.index_block), (8_192, 4_096));
+        assert_eq!(
+            (t.max_candidates, t.index_cache_blocks, t.index_store_cache, t.publication_commit),
+            (16, 256, 16 * 1024 * 1024, 1_024)
+        );
+    }
+
+    #[test]
     fn nothing_is_created_until_the_first_region() {
         let fs = FaultFs::new();
         let space = placed(&fs);
         assert_eq!(creations(&fs), 0, "{:?}", fs.calls());
-        let _r = space.begin(1).unwrap_or_else(|e| panic!("{e}"));
+        let _r = space.begin(Lane::Walk, 1).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(creations(&fs), 1, "{:?}", fs.calls());
     }
 
     #[test]
     fn an_unplaced_space_refuses_to_spill() {
         let space = ScratchSpace::unplaced(Thresholds::default(), None);
-        let err = space.begin(1).err().expect("refused");
+        let err = space.begin(Lane::Walk, 1).err().expect("refused");
         assert!(err.to_string().contains("before it was placed"), "{err}");
     }
 
@@ -641,22 +1007,22 @@ mod tests {
     fn nested_regions_truncate_in_lifo_order() {
         let fs = FaultFs::new();
         let space = placed(&fs);
-        let a = space.begin(1).ok().unwrap();
-        space.write_at(a.start(), &[1u8; 10]).unwrap();
+        let a = space.begin(Lane::Walk, 1).ok().unwrap();
+        space.write_at(Lane::Walk, a.start(), &[1u8; 10]).unwrap();
         {
-            let b = space.begin(1).ok().unwrap();
+            let b = space.begin(Lane::Walk, 1).ok().unwrap();
             assert_eq!(b.start(), 10);
-            space.write_at(b.start(), &[2u8; 5]).unwrap();
-            assert_eq!(space.len(), 15);
+            space.write_at(Lane::Walk, b.start(), &[2u8; 5]).unwrap();
+            assert_eq!(space.len(Lane::Walk), 15);
             assert_eq!(physical_len(&space), 15);
         }
-        assert_eq!(space.len(), 10);
+        assert_eq!(space.len(Lane::Walk), 10);
         assert_eq!(physical_len(&space), 10);
         let mut buf = [0u8; 10];
-        assert_eq!(space.read_at(0, &mut buf).unwrap(), 10);
+        assert_eq!(space.read_at(Lane::Walk, 0, &mut buf).unwrap(), 10);
         assert_eq!(buf, [1u8; 10]);
         drop(a);
-        assert_eq!(space.len(), 0);
+        assert_eq!(space.len(Lane::Walk), 0);
         assert_eq!(physical_len(&space), 0);
     }
 
@@ -664,15 +1030,15 @@ mod tests {
     fn a_parent_dropped_before_its_child_leaves_the_file_empty() {
         let fs = FaultFs::new();
         let space = placed(&fs);
-        let a = space.begin(1).ok().unwrap();
-        space.write_at(a.start(), &[1u8; 10]).unwrap();
-        let b = space.begin(1).ok().unwrap();
-        space.write_at(b.start(), &[2u8; 5]).unwrap();
+        let a = space.begin(Lane::Walk, 1).ok().unwrap();
+        space.write_at(Lane::Walk, a.start(), &[1u8; 10]).unwrap();
+        let b = space.begin(Lane::Walk, 1).ok().unwrap();
+        space.write_at(Lane::Walk, b.start(), &[2u8; 5]).unwrap();
         drop(a);
-        assert_eq!((space.len(), physical_len(&space)), (0, 0));
+        assert_eq!((space.len(Lane::Walk), physical_len(&space)), (0, 0));
         drop(b);
-        assert_eq!((space.len(), physical_len(&space)), (0, 0));
-        assert!(space.begin(1).is_ok(), "the space is still usable");
+        assert_eq!((space.len(Lane::Walk), physical_len(&space)), (0, 0));
+        assert!(space.begin(Lane::Walk, 1).is_ok(), "the space is still usable");
     }
 
     #[test]
@@ -681,17 +1047,17 @@ mod tests {
         let space = placed(&fs);
         space.fail_writes_after(1);
         {
-            let r = space.begin(1).ok().unwrap();
-            space.write_at(r.start(), b"abc").unwrap();
-            let err = space.write_at(r.start() + 3, b"def").unwrap_err();
+            let r = space.begin(Lane::Walk, 1).ok().unwrap();
+            space.write_at(Lane::Walk, r.start(), b"abc").unwrap();
+            let err = space.write_at(Lane::Walk, r.start() + 3, b"def").unwrap_err();
             assert_eq!(err.code, Code::DiskFull);
             // A partial write that failed halfway leaves bytes physically past the logical end.
-            if let Backing::Open(file) = &*space.backing.borrow() {
+            if let Backing::Open(file) = &*space.lanes[Lane::Walk.idx()].backing.borrow() {
                 write_all_at(file, b"de", r.start() + 3).unwrap();
             }
-            assert_eq!((space.len(), physical_len(&space)), (3, 5));
+            assert_eq!((space.len(Lane::Walk), physical_len(&space)), (3, 5));
         }
-        assert_eq!(space.len(), 0);
+        assert_eq!(space.len(Lane::Walk), 0);
         assert_eq!(physical_len(&space), 0);
     }
 
@@ -699,20 +1065,20 @@ mod tests {
     fn a_second_walk_cannot_begin_while_the_first_holds_a_region() {
         let fs = FaultFs::new();
         let space = placed(&fs);
-        let first = space.begin(1).ok().unwrap();
-        let err = space.begin(2).err().expect("refused");
+        let first = space.begin(Lane::Walk, 1).ok().unwrap();
+        let err = space.begin(Lane::Walk, 2).err().expect("refused");
         assert!(err.to_string().contains("shared by two walks"), "{err}");
         drop(first);
-        assert!(space.begin(2).is_ok());
+        assert!(space.begin(Lane::Walk, 2).is_ok());
     }
 
     #[test]
     fn a_closed_space_refuses_to_spill() {
         let fs = FaultFs::new();
         let space = placed(&fs);
-        drop(space.begin(1).ok().unwrap());
+        drop(space.begin(Lane::Walk, 1).ok().unwrap());
         space.close();
-        assert!(space.begin(1).is_err());
+        assert!(space.begin(Lane::Walk, 1).is_err());
     }
 
     #[test]
@@ -721,7 +1087,7 @@ mod tests {
         let space = placed(&fs);
         fs.fail("create_scratch", Code::PermissionDenied);
         for _ in 0..2 {
-            let err = space.begin(1).err().expect("refused");
+            let err = space.begin(Lane::Walk, 1).err().expect("refused");
             assert_eq!(err.code, Code::PermissionDenied);
         }
         assert_eq!(creations(&fs), 1, "{:?}", fs.calls());
@@ -732,15 +1098,17 @@ mod tests {
         let fs = FaultFs::new();
         let space = placed(&fs);
         {
-            let r = space.begin(1).ok().unwrap();
-            space.write_at(r.start(), b"abc").unwrap();
+            let r = space.begin(Lane::Walk, 1).ok().unwrap();
+            space.write_at(Lane::Walk, r.start(), b"abc").unwrap();
             space.fail_truncate();
         }
         assert!(space.poisoned());
-        let want = "unusable after a failed truncate";
-        assert!(space.begin(1).err().unwrap().to_string().contains(want));
-        assert!(space.write_at(0, b"x").unwrap_err().to_string().contains(want));
-        assert!(space.read_at(0, &mut [0u8; 1]).unwrap_err().to_string().contains(want));
+        let want = "scratch space is unusable: a truncate failed";
+        assert!(space.begin(Lane::Walk, 1).err().unwrap().to_string().contains(want));
+        assert!(space.write_at(Lane::Walk, 0, b"x").unwrap_err().to_string().contains(want));
+        assert!(
+            space.read_at(Lane::Walk, 0, &mut [0u8; 1]).unwrap_err().to_string().contains(want)
+        );
     }
 
     #[test]
@@ -749,10 +1117,13 @@ mod tests {
         let home: Result<(crate::fault_fs::FakeDirHandle, PathBuf), FsError> =
             Err(FsError::new(Code::PermissionDenied, std::io::Error::other("no temp dir")));
         space.place_deferred(move || home);
-        let err = space.begin(1).err().expect("refused");
+        let err = space.begin(Lane::Walk, 1).err().expect("refused");
         assert_eq!(err.code, Code::PermissionDenied);
         // Remembered, not retried: every later attempt answers the same.
-        assert_eq!(space.begin(1).err().expect("refused again").code, Code::PermissionDenied);
+        assert_eq!(
+            space.begin(Lane::Walk, 1).err().expect("refused again").code,
+            Code::PermissionDenied
+        );
     }
 
     #[test]
@@ -770,10 +1141,10 @@ mod tests {
         });
         assert!(space.is_placed());
         assert_eq!(asked.get(), 0, "placing asks nothing");
-        let Ok(first) = space.begin(1) else { panic!("the home resolves") };
+        let Ok(first) = space.begin(Lane::Walk, 1) else { panic!("the home resolves") };
         assert_eq!(asked.get(), 1);
         drop(first);
-        drop(space.begin(1).ok().unwrap());
+        drop(space.begin(Lane::Walk, 1).ok().unwrap());
         assert_eq!(asked.get(), 1, "asked once");
     }
 
@@ -800,11 +1171,11 @@ mod tests {
             }),
             PathBuf::from("/s"),
         );
-        space.begin(1).map(drop).unwrap_or_else(|e| panic!("opens: {e}"));
+        space.begin(Lane::Walk, 1).map(drop).unwrap_or_else(|e| panic!("opens: {e}"));
         assert!(!released.get(), "the home is held while the space is open");
         space.close();
         assert!(released.get(), "close drops what holds the workspace handle");
-        let err = space.begin(1).err().expect("refused");
+        let err = space.begin(Lane::Walk, 1).err().expect("refused");
         assert!(err.to_string().contains("closed"), "{err}");
     }
 
@@ -822,7 +1193,7 @@ mod tests {
         });
         space.close();
         assert!(!asked.get(), "a closed space never resolves its home");
-        assert!(space.begin(1).err().expect("refused").to_string().contains("closed"));
+        assert!(space.begin(Lane::Walk, 1).err().expect("refused").to_string().contains("closed"));
     }
 
     #[cfg(unix)]

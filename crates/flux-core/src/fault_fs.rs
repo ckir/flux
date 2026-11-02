@@ -27,8 +27,23 @@ use std::time::{Duration, SystemTime};
 /// arrivals, the condition variable, the parties to wait for, and the timeout.
 type Rendezvous = std::sync::Arc<(Mutex<usize>, Condvar, usize, Duration)>;
 
+/// What a directory's `read_dir` puts in `DirEntry::ino` (`FaultFs::set_ino_mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InoMode {
+    /// The entry's Strong identity index (`None` for an entry with no Strong identity). The default.
+    Real,
+    /// No hint at all.
+    Absent,
+    /// A hint that does not match the entry's identity: the index plus 1_000_000.
+    Wrong,
+    /// The same hint on every entry.
+    Shared(u64),
+}
+
 #[derive(Default)]
 struct Inner {
+    /// directory snapshot path -> what `read_dir` puts in `DirEntry::ino` there (absent: `InoMode::Real`)
+    ino_modes: HashMap<PathBuf, InoMode>,
     files: HashMap<PathBuf, Vec<u8>>,
     /// call name -> a pause (cut 9e `delay`); only `sync_all` honours it
     delays: HashMap<String, Duration>,
@@ -1359,6 +1374,13 @@ impl FaultFs {
         self.inner.lock().unwrap().replace_renames = on;
     }
 
+    /// What `read_dir` of the directory at `dir` puts in each entry's `ino` (default `InoMode::Real`).
+    pub fn set_ino_mode(&self, dir: &Path, mode: InoMode) {
+        let mut g = self.inner.lock().unwrap();
+        let key = stored(&g, dir);
+        g.ino_modes.insert(key, mode);
+    }
+
     /// `path` with each component in its stored spelling (identity unless the mode is on).
     fn norm(&self, path: &Path) -> PathBuf {
         stored(&self.inner.lock().unwrap(), path)
@@ -1814,6 +1836,7 @@ impl FileSystem for FaultFs {
         // Immediate children only, from both maps. Unsorted deliberately: the trait
         // says ordering is the caller's job, and a fake that pre-sorted would let a
         // walk with NO sort pass its ordering test.
+        let mode = g.ino_modes.get(&p).copied().unwrap_or(InoMode::Real);
         let mut out = Vec::new();
         for key in g.files.keys().chain(g.directories.iter()) {
             if key.parent() != Some(p.as_path()) {
@@ -1825,7 +1848,17 @@ impl FileSystem for FaultFs {
             } else {
                 g.types.get(key).copied().unwrap_or(FileType::File)
             };
-            out.push(DirEntry { name: name.to_os_string(), file_type, ino: None });
+            let index = match g.identities.get(key) {
+                Some(flux_fs::FileIdentity::Strong(id)) => Some(id.index as u64),
+                _ => None,
+            };
+            let ino = match mode {
+                InoMode::Real => index,
+                InoMode::Absent => None,
+                InoMode::Wrong => index.map(|i| i + 1_000_000),
+                InoMode::Shared(n) => Some(n),
+            };
+            out.push(DirEntry { name: name.to_os_string(), file_type, ino });
         }
         Ok(out)
     }
@@ -4606,12 +4639,62 @@ mod tests {
         fs
     }
 
+    /// The Strong identity index `metadata` reports for `path`.
+    fn strong_index(fs: &FaultFs, path: &str) -> u64 {
+        let FileIdentity::Strong(id) = fs.metadata(Path::new(path)).unwrap().identity else {
+            panic!("{path} has no Strong identity");
+        };
+        id.index as u64
+    }
+
+    #[test]
+    fn read_dir_carries_the_entry_object_index_by_default() {
+        let fs = mixed_dir();
+        let entries = fs.read_dir(Path::new("/d")).unwrap();
+        assert_eq!(entries.len(), 3);
+        for e in entries {
+            let path = format!("/d/{}", e.name.to_str().unwrap());
+            assert_eq!(e.ino, Some(strong_index(&fs, &path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn ino_modes_make_the_hint_absent_wrong_or_shared() {
+        let fs = mixed_dir();
+        let by_name = |fs: &FaultFs| {
+            let mut v: Vec<(String, Option<u64>)> = fs
+                .read_dir(Path::new("/d"))
+                .unwrap()
+                .into_iter()
+                .map(|e| (e.name.to_str().unwrap().to_string(), e.ino))
+                .collect();
+            v.sort();
+            v
+        };
+        let real: Vec<(String, Option<u64>)> = ["a", "b", "c"]
+            .iter()
+            .map(|n| (n.to_string(), Some(strong_index(&fs, &format!("/d/{n}")))))
+            .collect();
+        assert_eq!(by_name(&fs), real);
+        fs.set_ino_mode(Path::new("/d"), InoMode::Absent);
+        assert!(by_name(&fs).iter().all(|(_, i)| i.is_none()));
+        fs.set_ino_mode(Path::new("/d"), InoMode::Wrong);
+        let wrong: Vec<_> =
+            real.iter().map(|(n, i)| (n.clone(), i.map(|i| i + 1_000_000))).collect();
+        assert_eq!(by_name(&fs), wrong);
+        fs.set_ino_mode(Path::new("/d"), InoMode::Shared(7));
+        assert!(by_name(&fs).iter().all(|(_, i)| *i == Some(7)));
+        assert_eq!(by_name(&fs).len(), 3);
+        fs.set_ino_mode(Path::new("/d"), InoMode::Real);
+        assert_eq!(by_name(&fs), real);
+    }
+
     #[test]
     fn read_dir_each_visits_every_entry_once_like_read_dir() {
         let fs = mixed_dir();
         let mut seen = Vec::new();
         fs.read_dir_each(Path::new("/d"), &mut |e| {
-            assert_eq!(e.ino, None);
+            assert_eq!(e.ino, Some(strong_index(&fs, &format!("/d/{}", e.name.to_str().unwrap()))));
             seen.push((e.name, e.file_type));
             Ok(std::ops::ControlFlow::Continue(()))
         })
@@ -4682,12 +4765,12 @@ mod tests {
     fn read_dir_each_on_a_handle_matches_read_dir() {
         use flux_fs::{DestinationRoot, DirHandle};
         use std::ops::ControlFlow::{Break, Continue};
-        // Every entry once, like read_dir, with no inode number.
+        // Every entry once, like read_dir, with the entry's object index as the inode hint.
         let fs = mixed_dir();
         let d = fs.destination_root(Path::new("/d")).unwrap();
         let mut seen = Vec::new();
         DirHandle::read_dir_each(&d, &mut |e| {
-            assert_eq!(e.ino, None);
+            assert_eq!(e.ino, Some(strong_index(&fs, &format!("/d/{}", e.name.to_str().unwrap()))));
             seen.push((e.name, e.file_type));
             Ok(Continue(()))
         })

@@ -9,7 +9,7 @@
 //! A record is `u16` LE name length, `u8` file type (0 File, 1 Dir, 2 Symlink, 3 Other), then the name's
 //! `as_encoded_bytes()`. The `ino` hint is not stored: a decoded entry carries `None`.
 
-use crate::scratch::{Region, ScratchSpace};
+use crate::scratch::{Lane, Region, ScratchSpace};
 use flux_fs::{Code, DirEntry, FileType, FsError};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -170,7 +170,7 @@ struct RunWriter<'s, 'h> {
 
 impl<'s, 'h> RunWriter<'s, 'h> {
     fn new(space: &'s ScratchSpace<'h>) -> Self {
-        let start = space.len();
+        let start = space.len(Lane::Walk);
         let cap = space.thresholds().merge_buffer.saturating_mul(4);
         RunWriter { space, start, offset: start, buf: Vec::new(), cap, count: 0 }
     }
@@ -179,7 +179,7 @@ impl<'s, 'h> RunWriter<'s, 'h> {
         if n == 0 {
             return Ok(());
         }
-        self.space.write_at(self.offset, &self.buf[..n])?;
+        self.space.write_at(Lane::Walk, self.offset, &self.buf[..n])?;
         self.offset += n as u64;
         self.buf.drain(..n);
         Ok(())
@@ -248,7 +248,7 @@ impl RunCursor {
             let want = (self.end - self.next_off).min(chunk as u64) as usize;
             let old = self.buf.len();
             self.buf.resize(old + want, 0);
-            let got = space.read_at(self.next_off, &mut self.buf[old..])?;
+            let got = space.read_at(Lane::Walk, self.next_off, &mut self.buf[old..])?;
             if got < want {
                 return Err(fatal("a scratch run ends before its recorded length"));
             }
@@ -514,7 +514,7 @@ mod tests {
             let mut expected = entries.clone();
             expected.sort_by(|a, b| a.name.as_encoded_bytes().cmp(b.name.as_encoded_bytes()));
 
-            let region = space.begin(space.next_owner()).unwrap();
+            let region = space.begin(Lane::Walk, space.next_owner()).unwrap();
             let mut runs = Vec::new();
             for chunk in entries.chunks(t.run_entries) {
                 let mut c = chunk.to_vec();
@@ -536,7 +536,7 @@ mod tests {
         let t = Thresholds::new(4, 4, 2, 16, 1_000_000).unwrap();
         let fs = FaultFs::new();
         let space = placed(&fs, t);
-        let region = space.begin(space.next_owner()).unwrap();
+        let region = space.begin(Lane::Walk, space.next_owner()).unwrap();
         let mut runs = Vec::new();
         for c in 0..25 {
             let mut chunk: Vec<DirEntry> = (0..4).map(|i| named(i * 25 + c)).collect();
@@ -564,9 +564,9 @@ mod tests {
         let fs = FaultFs::new();
         let space = placed(&fs, t);
         let owner = space.next_owner();
-        let outer = space.begin(owner).unwrap();
-        space.write_at(outer.start(), &[7u8; 10]).unwrap();
-        let region = space.begin(owner).unwrap();
+        let outer = space.begin(Lane::Walk, owner).unwrap();
+        space.write_at(Lane::Walk, outer.start(), &[7u8; 10]).unwrap();
+        let region = space.begin(Lane::Walk, owner).unwrap();
         let start = region.start();
         assert_eq!(start, 10);
         let runs: Vec<RunSpan> = (0..3)
@@ -575,12 +575,12 @@ mod tests {
                 write_run(&space, &c).unwrap()
             })
             .collect();
-        assert!(space.len() > start);
+        assert!(space.len(Lane::Walk) > start);
         let reader = MergeReader::new(&space, runs, region).unwrap();
         drop(reader);
-        assert_eq!(space.len(), start);
+        assert_eq!(space.len(Lane::Walk), start);
         drop(outer);
-        assert_eq!(space.len(), 0);
+        assert_eq!(space.len(Lane::Walk), 0);
     }
 
     #[test]
@@ -588,7 +588,7 @@ mod tests {
         let t = Thresholds::new(4, 8, 2, 16, 3).unwrap();
         let fs = FaultFs::new();
         let space = placed(&fs, t);
-        let region = space.begin(space.next_owner()).unwrap();
+        let region = space.begin(Lane::Walk, space.next_owner()).unwrap();
         let runs: Vec<RunSpan> = (0..3)
             .map(|r| {
                 let c: Vec<DirEntry> = (0..8).map(|i| named(i * 3 + r)).collect();
@@ -614,7 +614,7 @@ mod tests {
     fn spill_and_merge(t: Thresholds, runs: Vec<Vec<DirEntry>>) -> Vec<DirEntry> {
         let fs = FaultFs::new();
         let space = placed(&fs, t);
-        let region = space.begin(space.next_owner()).unwrap();
+        let region = space.begin(Lane::Walk, space.next_owner()).unwrap();
         let mut spans = Vec::new();
         for mut run in runs {
             sort_entries(&mut run);
@@ -690,9 +690,9 @@ mod tests {
         let fs = FaultFs::new();
         let space = placed(&fs, t);
         let owner = space.next_owner();
-        let outer = space.begin(owner).unwrap();
-        space.write_at(outer.start(), &[7u8; 10]).unwrap();
-        let region = space.begin(owner).unwrap();
+        let outer = space.begin(Lane::Walk, owner).unwrap();
+        space.write_at(Lane::Walk, outer.start(), &[7u8; 10]).unwrap();
+        let region = space.begin(Lane::Walk, owner).unwrap();
         let start = region.start();
         let runs: Vec<RunSpan> = (0..3)
             .map(|r| {
@@ -708,10 +708,10 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.code, Code::IoError);
         assert_eq!(calls, 1, "the error stops the cascade at the first tick");
-        assert!(space.len() > start, "the partial pass is still in the file");
+        assert!(space.len(Lane::Walk) > start, "the partial pass is still in the file");
         drop(region);
-        assert_eq!(space.len(), start);
+        assert_eq!(space.len(Lane::Walk), start);
         drop(outer);
-        assert_eq!(space.len(), 0);
+        assert_eq!(space.len(Lane::Walk), 0);
     }
 }
