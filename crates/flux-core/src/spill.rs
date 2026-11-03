@@ -13,7 +13,6 @@
 use crate::scratch::{Lane, Region, ScratchSpace, read_fully_at, write_all_at};
 use flux_fs::{Code, DirEntry, FileType, FsError};
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
 use std::ffi::OsString;
 
 fn fatal(message: impl Into<String>) -> FsError {
@@ -339,7 +338,19 @@ pub(crate) fn write_encoded_run<'r>(
     w.finish()
 }
 
-/// The read position in one run.
+/// The length of the first record of `bytes` (key bytes included) when it is whole and its type byte is known:
+/// `decode` without building the item.
+fn record_len(k: usize, bytes: &[u8]) -> Option<usize> {
+    let header = bytes.get(k..k + 3)?;
+    let len = usize::from(u16::from_le_bytes([header[0], header[1]]));
+    if header[2] > 3 {
+        return None;
+    }
+    bytes.get(k + 3..k + 3 + len)?;
+    Some(k + 3 + len)
+}
+
+/// The read position in one run. The record at `pos` is the run's head: it stays in `buf` until it is consumed.
 struct RunCursor {
     next_off: u64,
     end: u64,
@@ -352,17 +363,12 @@ impl RunCursor {
         RunCursor { next_off: span.start, end: span.start + span.len, buf: Vec::new(), pos: 0 }
     }
 
-    /// The next item of the run, refilling by `chunk` bytes (a record longer than that grows the buffer).
-    fn next_entry(
-        &mut self,
-        source: Source,
-        k: usize,
-        chunk: usize,
-    ) -> Result<Option<Keyed>, FsError> {
+    /// Makes the record at `pos` whole in the buffer and returns its length without consuming it; `None` at the end
+    /// of the run. Refills by `chunk` bytes (a record longer than that grows the buffer).
+    fn fill(&mut self, source: Source, k: usize, chunk: usize) -> Result<Option<usize>, FsError> {
         loop {
-            if let Some((item, n)) = decode(k, &self.buf[self.pos..]) {
-                self.pos += n;
-                return Ok(Some(item));
+            if let Some(n) = record_len(k, &self.buf[self.pos..]) {
+                return Ok(Some(n));
             }
             if self.next_off >= self.end {
                 if self.pos < self.buf.len() {
@@ -382,42 +388,75 @@ impl RunCursor {
             self.next_off += want as u64;
         }
     }
+
+    /// The head record, `len` bytes as `fill` returned.
+    fn record(&self, len: usize) -> &[u8] {
+        &self.buf[self.pos..self.pos + len]
+    }
 }
 
-/// A run's current head in the merge heap; `BinaryHeap` is a max-heap, so the order is reversed.
+/// A run's current head in the merge heap: where it is (the record is in the run's cursor buffer) and the cached
+/// words that decide most comparisons.
 struct Head {
-    item: Keyed,
-    k: usize,
     run: usize,
+    len: usize,
+    /// The first `min(k, 8)` key bytes, big-endian.
+    key: u64,
+    /// The first eight name bytes, big-endian; `0` when `k > 8` (the name must not count before the rest of the key).
+    name: u64,
 }
 
-impl Ord for Head {
-    fn cmp(&self, other: &Self) -> Ordering {
-        keyed_cmp(self.k, &other.item, &self.item).then_with(|| other.run.cmp(&self.run))
+/// The order of the merge: key bytes, then `key_cmp` on the names (as `keyed_cmp`), then the run index.
+fn head_cmp(cursors: &[RunCursor], k: usize, a: &Head, b: &Head) -> Ordering {
+    a.key
+        .cmp(&b.key)
+        .then_with(|| a.name.cmp(&b.name))
+        .then_with(|| {
+            let (ra, rb) = (cursors[a.run].record(a.len), cursors[b.run].record(b.len));
+            ra[..k].cmp(&rb[..k]).then_with(|| key_cmp(&ra[k + 3..], &rb[k + 3..]))
+        })
+        .then_with(|| a.run.cmp(&b.run))
+}
+
+fn sift_up(heap: &mut [Head], cursors: &[RunCursor], k: usize, mut i: usize) {
+    while i > 0 {
+        let parent = (i - 1) / 2;
+        if head_cmp(cursors, k, &heap[i], &heap[parent]) != Ordering::Less {
+            break;
+        }
+        heap.swap(i, parent);
+        i = parent;
     }
 }
 
-impl PartialOrd for Head {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+fn sift_down(heap: &mut [Head], cursors: &[RunCursor], k: usize, mut i: usize) {
+    loop {
+        let (l, r) = (2 * i + 1, 2 * i + 2);
+        let mut min = i;
+        if l < heap.len() && head_cmp(cursors, k, &heap[l], &heap[min]) == Ordering::Less {
+            min = l;
+        }
+        if r < heap.len() && head_cmp(cursors, k, &heap[r], &heap[min]) == Ordering::Less {
+            min = r;
+        }
+        if min == i {
+            return;
+        }
+        heap.swap(i, min);
+        i = min;
     }
 }
-
-impl PartialEq for Head {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-
-impl Eq for Head {}
 
 /// The merge itself, with no region of its own (so `cascade` can append inside its caller's).
 pub(crate) struct Merger<'s, 'h> {
     source: Source<'s, 'h>,
     k: usize,
     cursors: Vec<RunCursor>,
-    heap: BinaryHeap<Head>,
+    /// A binary min-heap by `head_cmp`.
+    heap: Vec<Head>,
     chunk: usize,
+    /// The record `next_entry` decodes.
+    scratch: Vec<u8>,
 }
 
 impl<'s, 'h> Merger<'s, 'h> {
@@ -428,23 +467,59 @@ impl<'s, 'h> Merger<'s, 'h> {
         runs: &[RunSpan],
     ) -> Result<Self, FsError> {
         let mut cursors: Vec<RunCursor> = runs.iter().map(|r| RunCursor::new(*r)).collect();
-        let mut heap = BinaryHeap::with_capacity(cursors.len());
-        for (run, cursor) in cursors.iter_mut().enumerate() {
-            if let Some(item) = cursor.next_entry(source, k, chunk)? {
-                heap.push(Head { item, k, run });
+        let mut heap = Vec::with_capacity(cursors.len());
+        for run in 0..cursors.len() {
+            if let Some(len) = cursors[run].fill(source, k, chunk)? {
+                heap.push(Self::head(&cursors[run], k, run, len));
+                let last = heap.len() - 1;
+                sift_up(&mut heap, &cursors, k, last);
             }
         }
-        Ok(Merger { source, k, cursors, heap, chunk })
+        Ok(Merger { source, k, cursors, heap, chunk, scratch: Vec::new() })
+    }
+
+    fn head(cursor: &RunCursor, k: usize, run: usize, len: usize) -> Head {
+        let record = cursor.record(len);
+        let key = prefix(&record[..k.min(8)]);
+        let name = if k > 8 { 0 } else { prefix(&record[k + 3..]) };
+        Head { run, len, key, name }
+    }
+
+    /// Replaces `out` with the next record in merge order (as `encode` writes it); `false` at the end. It allocates
+    /// nothing per record: the record is copied out of the run's buffer before the run advances.
+    pub(crate) fn next_record_into(&mut self, out: &mut Vec<u8>) -> Result<bool, FsError> {
+        let Some(top) = self.heap.first() else {
+            return Ok(false);
+        };
+        let (run, len) = (top.run, top.len);
+        out.clear();
+        out.extend_from_slice(self.cursors[run].record(len));
+        self.cursors[run].pos += len;
+        match self.cursors[run].fill(self.source, self.k, self.chunk)? {
+            Some(next) => {
+                self.heap[0] = Self::head(&self.cursors[run], self.k, run, next);
+            }
+            None => {
+                self.heap.swap_remove(0);
+            }
+        }
+        sift_down(&mut self.heap, &self.cursors, self.k, 0);
+        Ok(true)
     }
 
     pub(crate) fn next_entry(&mut self) -> Result<Option<Keyed>, FsError> {
-        let Some(head) = self.heap.pop() else {
-            return Ok(None);
+        let mut record = std::mem::take(&mut self.scratch);
+        let result = self.next_record_into(&mut record);
+        let item = match result {
+            Ok(true) => match decode(self.k, &record) {
+                Some((item, _)) => Ok(Some(item)),
+                None => Err(fatal("a scratch run holds a corrupt record")),
+            },
+            Ok(false) => Ok(None),
+            Err(e) => Err(e),
         };
-        if let Some(item) = self.cursors[head.run].next_entry(self.source, self.k, self.chunk)? {
-            self.heap.push(Head { item, k: self.k, run: head.run });
-        }
-        Ok(Some(head.item))
+        self.scratch = record;
+        item
     }
 }
 
@@ -1048,6 +1123,115 @@ mod tests {
         sort_keyed(8, &mut want);
         assert_eq!(got.len(), 12);
         assert_eq!(got, want);
+    }
+
+    /// Items for the merge tests: names sharing an eight-byte prefix, short and empty names, keys sharing their
+    /// first eight bytes, and the same (key, name) with different file types.
+    fn merge_items(k: usize, n: usize, seed: u64) -> Vec<Keyed> {
+        let mut x = seed | 1;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        (0..n)
+            .map(|_| {
+                let name = match next() % 5 {
+                    0 => format!("sharedpr{}", next() % 6),
+                    1 => format!("{}", next() % 30),
+                    2 => String::new(),
+                    3 => format!("sharedpr-{}", next() % 3),
+                    _ => format!("n{}", next() % 40),
+                };
+                let mut key = [0u8; 24];
+                key[..8].copy_from_slice(&(next() % 3).to_be_bytes());
+                for b in &mut key[8..] {
+                    *b = (next() % 2) as u8;
+                }
+                masked(
+                    k,
+                    Keyed { key, entry: entry(OsString::from(name), TYPES[(next() % 4) as usize]) },
+                )
+            })
+            .collect()
+    }
+
+    fn write_runs(
+        file: &std::fs::File,
+        k: usize,
+        t: &Thresholds,
+        runs: &[Vec<Keyed>],
+    ) -> Vec<RunSpan> {
+        let offset = std::cell::Cell::new(0u64);
+        runs.iter()
+            .map(|r| write_run(Sink::File(file, &offset), k, t.merge_buffer, r).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn next_record_into_merges_as_the_reference_merge_does() {
+        let t = Thresholds::new(4, 4, 2, 16, 3).unwrap();
+        for k in [0usize, 8, 24] {
+            let fs = FaultFs::new();
+            let space = placed(&fs, t);
+            let file = space.transient().unwrap();
+            let items = merge_items(k, 5200, 0x2545_F491_4F6C_DD1D ^ k as u64);
+            let mut runs: Vec<Vec<Keyed>> = items.chunks(400).map(<[Keyed]>::to_vec).collect();
+            runs.iter_mut().for_each(|r| sort_keyed(k, r));
+            let spans = write_runs(&file, k, &t, &runs);
+            // The reference: every (item, run) pair sorted by keyed_cmp, then the run index (equal pairs of one
+            // run keep their written order, the sort is stable).
+            let mut want: Vec<(Keyed, usize)> = runs
+                .iter()
+                .enumerate()
+                .flat_map(|(i, r)| r.iter().cloned().map(move |x| (x, i)))
+                .collect();
+            want.sort_by(|a, b| keyed_cmp(k, &a.0, &b.0).then(a.1.cmp(&b.1)));
+            let mut merger = Merger::new(Source::File(&file), k, t.merge_buffer, &spans).unwrap();
+            let mut record = Vec::new();
+            let mut got = Vec::new();
+            while merger.next_record_into(&mut record).unwrap() {
+                let (item, n) = decode(k, &record).unwrap();
+                assert_eq!(n, record.len());
+                got.push(item);
+            }
+            let want: Vec<Keyed> = want.into_iter().map(|p| p.0).collect();
+            assert_eq!(got.len(), want.len(), "k = {k}");
+            assert!(got == want, "k = {k}: the merge order differs");
+            let mut again = Merger::new(Source::File(&file), k, t.merge_buffer, &spans).unwrap();
+            let mut via_entry = Vec::new();
+            while let Some(item) = again.next_entry().unwrap() {
+                via_entry.push(item);
+            }
+            assert!(via_entry == want, "k = {k}: next_entry differs");
+        }
+    }
+
+    #[test]
+    fn a_cut_last_record_is_the_same_corrupt_run_error_from_both_methods() {
+        let t = Thresholds::new(4, 4, 2, 16, 3).unwrap();
+        for k in [0usize, 8] {
+            let fs = FaultFs::new();
+            let space = placed(&fs, t);
+            let file = space.transient().unwrap();
+            let mut run = vec![kitem(1, "alpha"), kitem(2, "bravo"), kitem(3, "charlie")];
+            run.iter_mut().for_each(|i| *i = masked(k, i.clone()));
+            sort_keyed(k, &mut run);
+            let mut span = write_runs(&file, k, &t, &[run])[0];
+            span.len -= 2;
+            let mut a = Merger::new(Source::File(&file), k, t.merge_buffer, &[span]).unwrap();
+            let mut b = Merger::new(Source::File(&file), k, t.merge_buffer, &[span]).unwrap();
+            let mut record = Vec::new();
+            // The cut record is met while the run advances past the one before it.
+            assert!(a.next_record_into(&mut record).unwrap());
+            let from_record = a.next_record_into(&mut record).unwrap_err();
+            assert!(b.next_entry().unwrap().is_some());
+            let from_entry = b.next_entry().unwrap_err();
+            assert_eq!(from_record.code, from_entry.code, "k = {k}");
+            assert_eq!(from_record.to_string(), from_entry.to_string(), "k = {k}");
+            assert!(from_record.to_string().contains("corrupt record"), "{from_record}");
+        }
     }
 
     #[test]

@@ -361,12 +361,13 @@ impl PendingRuns {
         let mut packer =
             Packer::new(lane_file, spill, spill_at, self.lane, k, th.index_block, start);
         let mut items = 0u64;
-        while let Some(item) = merger.next_entry().map_err(classify)? {
+        let mut record = Vec::new();
+        while merger.next_record_into(&mut record).map_err(classify)? {
             if th.tick_entries > 0 && items.is_multiple_of(th.tick_entries as u64) {
                 check().map_err(classify)?;
             }
             self.hook_at(items, stop)?;
-            packer.push(&item).map_err(FinishError::Failed)?;
+            packer.push_record(&record).map_err(FinishError::Failed)?;
             items += 1;
         }
         self.hook_at(items, stop)?;
@@ -515,7 +516,6 @@ struct Packer<'f> {
     frame: Vec<u8>,
     frame_count: usize,
     first_key: Vec<u8>,
-    record: Vec<u8>,
     /// A transient file no run is being read from, which holds the level-0 entries until the data is written.
     spill: &'f File,
     spill_start: u64,
@@ -549,7 +549,6 @@ impl<'f> Packer<'f> {
             frame: Vec::new(),
             frame_count: 0,
             first_key: Vec::new(),
-            record: Vec::new(),
             spill,
             spill_start: spill_at,
             spill_buf: Vec::new(),
@@ -580,11 +579,14 @@ impl<'f> Packer<'f> {
         Ok(())
     }
 
-    fn push(&mut self, item: &Keyed) -> Result<(), FsError> {
-        self.record.clear();
-        encode(self.k, item, &mut self.record)?;
+    /// Adds the next record in sorted order, already encoded as `spill::encode` writes it.
+    fn push_record(&mut self, record: &[u8]) -> Result<(), FsError> {
+        let k = self.k;
+        let header = record.get(k..k + 3).ok_or_else(corrupt)?;
+        let len = usize::from(u16::from_le_bytes([header[0], header[1]]));
+        let name = record.get(k + 3..k + 3 + len).ok_or_else(corrupt)?;
         if self.frame_count > 0
-            && (2 + self.frame.len() + self.record.len() > self.b
+            && (2 + self.frame.len() + record.len() > self.b
                 || self.frame_count == usize::from(u16::MAX))
         {
             self.flush_frame()?;
@@ -592,11 +594,11 @@ impl<'f> Packer<'f> {
         if self.frame_count == 0 {
             let cap = self.b / 8;
             self.first_key.clear();
-            self.first_key.extend_from_slice(&item.key[..self.k]);
-            self.first_key.extend_from_slice(item.entry.name.as_encoded_bytes());
+            self.first_key.extend_from_slice(&record[..k]);
+            self.first_key.extend_from_slice(name);
             self.first_key.truncate(cap);
         }
-        self.frame.extend_from_slice(&self.record);
+        self.frame.extend_from_slice(record);
         self.frame_count += 1;
         self.count += 1;
         if 2 + self.frame.len() > self.b {
@@ -1444,6 +1446,74 @@ mod tests {
             .unwrap()
             .with_index(4, 2, 4, 1 << 20, 2, 128)
             .unwrap()
+    }
+
+    /// The old `Packer::push` (before `push_record`), kept as the reference the new path is compared with.
+    fn push_reference(p: &mut Packer<'_>, item: &Keyed) -> Result<(), FsError> {
+        let mut record = Vec::new();
+        encode(p.k, item, &mut record)?;
+        if p.frame_count > 0
+            && (2 + p.frame.len() + record.len() > p.b || p.frame_count == usize::from(u16::MAX))
+        {
+            p.flush_frame()?;
+        }
+        if p.frame_count == 0 {
+            let cap = p.b / 8;
+            p.first_key.clear();
+            p.first_key.extend_from_slice(&item.key[..p.k]);
+            p.first_key.extend_from_slice(item.entry.name.as_encoded_bytes());
+            p.first_key.truncate(cap);
+        }
+        p.frame.extend_from_slice(&record);
+        p.frame_count += 1;
+        p.count += 1;
+        if 2 + p.frame.len() > p.b {
+            p.flush_frame()?;
+        }
+        Ok(())
+    }
+
+    /// Packs `items` (sorted) with the reference path or with `push_record`; the meta and every byte written.
+    fn packed(
+        space: &ScratchSpace<'_>,
+        k: usize,
+        items: &[Keyed],
+        reference: bool,
+    ) -> (String, Vec<u8>) {
+        let file = space.transient().unwrap();
+        let spill = space.transient().unwrap();
+        let mut packer = Packer::new(&file, &spill, 0, Lane::Names, k, 128, 0);
+        for it in items {
+            if reference {
+                push_reference(&mut packer, it).unwrap();
+            } else {
+                let mut record = Vec::new();
+                encode(k, it, &mut record).unwrap();
+                packer.push_record(&record).unwrap();
+            }
+        }
+        let meta = packer.finish().unwrap();
+        let mut bytes = vec![0u8; meta.end as usize];
+        read_fully_at(&file, &mut bytes, 0).unwrap();
+        (format!("{meta:?}"), bytes)
+    }
+
+    #[test]
+    fn push_record_packs_the_bytes_and_first_keys_the_old_push_packed() {
+        for k in [0usize, 8, 24] {
+            let fs = FaultFs::new();
+            let space = placed(&fs, runs_thresholds(500));
+            let mut items = adversarial_items(k, 700, 0xD1B5_4A32_D192_ED03 ^ k as u64);
+            // Long names so some first keys are cut at the cap and some frames hold a single record.
+            items.push(item(k, &key_of(k, 3), &"long".repeat(60)));
+            items.push(item(k, &key_of(k, 3), &"longer".repeat(40)));
+            sort_keyed(k, &mut items);
+            let (want_meta, want_bytes) = packed(&space, k, &items, true);
+            let (got_meta, got_bytes) = packed(&space, k, &items, false);
+            assert!(want_meta.contains("levels"), "{want_meta}");
+            assert_eq!(got_meta, want_meta, "k = {k}");
+            assert!(got_bytes == want_bytes, "k = {k}: the packed bytes differ");
+        }
     }
 
     #[test]
