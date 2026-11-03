@@ -1843,6 +1843,25 @@ mod tests {
     }
 
     #[test]
+    fn exactly_max_candidates_sharing_a_d_ino_are_verified_without_the_identity_pass() {
+        // `max_candidates` is 2: two hard links of one object are exactly the bound, so step 4 verifies both by a stat
+        // and the directory is never stat-ed whole.
+        let fs = fs_with(&["pq.txt", "pq.lnk"]);
+        big_dir(&fs, 4);
+        let id = fs.metadata(Path::new("/d/pq.txt")).unwrap().identity;
+        fs.set_identity("/d/pq.lnk", id);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let space = space_on(&fs);
+        let mut idx = hybrid_over(&space, &d, None);
+        let before = count_metadata(&fs);
+        // Two unlearned spellings of one object are ambiguous either way; the cost is what tells the paths apart.
+        assert_eq!(probe(&mut idx, &d, "PQ.TXT"), "unresolvable");
+        // The probe's own stat plus one stat per candidate: the identity pass (one stat per name) never ran.
+        assert_eq!(count_metadata(&fs) - before, 1 + 2);
+        assert!(!idx.identity_built());
+    }
+
+    #[test]
     fn a_non_strong_directory_is_keyed_by_an_ordinal_and_a_strong_sibling_does_not_see_its_rows() {
         let fs = fs_with(&["a"]);
         let space = space_on(&fs);
