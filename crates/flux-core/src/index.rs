@@ -1711,6 +1711,12 @@ pub(crate) mod scale_tests {
         space.place(StdFileSystem.destination_root(&scale.0).unwrap(), scale.0.clone());
         println!("tier1: n={n} dir={}", scale.0.display());
 
+        let gen_started = Instant::now();
+        let mut sink = 0u64;
+        for i in 0..n {
+            sink ^= name(i)[0] as u64 ^ dino(i);
+        }
+        println!("gen_only_s={:.2} (sink {sink})", gen_started.elapsed().as_secs_f64());
         let started = Instant::now();
         let mut names_builder = FamilyBuilder::new(&space, Lane::Names, 0);
         let mut inodes_builder = FamilyBuilder::new(&space, Lane::Inodes, 8);
@@ -1722,16 +1728,22 @@ pub(crate) mod scale_tests {
             key[..8].copy_from_slice(&dino(i).to_be_bytes());
             inodes_builder.push(Keyed { key, entry: entry(&nm) }, &mut tick).unwrap();
         }
+        let push_s = started.elapsed().as_secs_f64();
+        let pending_started = Instant::now();
         let pending_names = names_builder.into_pending().unwrap();
         let pending_inodes = inodes_builder.into_pending().unwrap();
+        let pending_s = pending_started.elapsed().as_secs_f64();
         let runs_of = |p: &PendingFamily| match p {
             PendingFamily::Runs(r) => r.runs.len(),
             PendingFamily::Empty => 0,
         };
         let (runs_names, runs_inodes) = (runs_of(&pending_names), runs_of(&pending_inodes));
+        let finish_started = Instant::now();
         let (names, inodes) = build_two(&space, pending_names, pending_inodes, &mut tick).unwrap();
         let (names, inodes) = (names.expect("a names family"), inodes.expect("an inodes family"));
+        let finish_s = finish_started.elapsed().as_secs_f64();
         let build = started.elapsed().as_secs_f64();
+        println!("split: push_s={push_s:.2} pending_s={pending_s:.2} finish_s={finish_s:.2}");
         println!("build_s={build:.2} names_per_s={:.0}", n as f64 / build);
         println!("runs_names={runs_names} runs_inodes={runs_inodes}");
         println!(
