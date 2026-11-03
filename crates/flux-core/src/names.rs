@@ -13,9 +13,10 @@
 use crate::index::{Family, FamilyBuilder, build_one, build_two};
 use crate::scratch::{Lane, ScratchSpace};
 use crate::spill::Keyed;
-use crate::store::DirKey;
+use crate::store::{DirKey, remake};
 use crate::walk::Tick;
 use flux_fs::{DirEntry, DirHandle, FileIdentity, FluxPathKey, FsError, Metadata, ObjectId};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::ops::ControlFlow;
@@ -732,7 +733,9 @@ impl<'s, 'h> Hybrid<'s, 'h> {
     }
 
     /// Stats every name of the directory once and keeps `(identity, name)` in a sorted family of its own. A failed
-    /// build is not remembered, so the next call retries.
+    /// build is not remembered, so the next call retries, unless the failure came from the scratch space: that
+    /// poisons it, so the run stops (spec 6.1: a write failure is never a per-entry one). A `metadata` error is the
+    /// caller's own and a tick error is the run's own, at its own step: neither poisons.
     fn build_identity<D: DirHandle>(
         &mut self,
         dir: &D,
@@ -741,6 +744,30 @@ impl<'s, 'h> Hybrid<'s, 'h> {
         if self.identity_built {
             return Ok(());
         }
+        let ticked = Cell::new(false);
+        let callers = Cell::new(false);
+        let mut beat = || {
+            let r = tick();
+            ticked.set(ticked.get() || r.is_err());
+            r
+        };
+        let built = self.identity_pass(dir, &mut beat, &callers);
+        if let Err(e) = &built
+            && !ticked.get()
+            && !callers.get()
+        {
+            self.space.poison(remake(e));
+        }
+        built
+    }
+
+    /// The body of `build_identity`; `callers` is set when the error returned is a `metadata` error.
+    fn identity_pass<D: DirHandle>(
+        &mut self,
+        dir: &D,
+        tick: &mut Tick<'_>,
+        callers: &Cell<bool>,
+    ) -> Result<(), FsError> {
         let th = self.space.thresholds();
         let entries = self.entries;
         tracing::debug!(entries, "building the identity family");
@@ -760,7 +787,10 @@ impl<'s, 'h> Hybrid<'s, 'h> {
                 }
                 // An entry deleted since it was listed is no longer anyone's name: skipped, not a failure.
                 Err(e) if is_not_found(&e) => {}
-                Err(e) => return Err(e),
+                Err(e) => {
+                    callers.set(true);
+                    return Err(e);
+                }
             }
             Ok(())
         };
@@ -769,6 +799,7 @@ impl<'s, 'h> Hybrid<'s, 'h> {
                 visit(record?.entry.name)?;
             }
         } else {
+            // Safe to hold across the ticks: the beat closure never touches the store.
             self.space.store()?.for_each_name2(&self.key, th.publication_commit, &mut |name| {
                 visit(name)?;
                 Ok(ControlFlow::Continue(()))
@@ -1890,6 +1921,64 @@ mod tests {
         assert!(e.source.to_string().contains("tick says stop"), "{e}");
         assert!(!idx.identity_built());
         assert_eq!(space.len(Lane::Identity), 0);
+    }
+
+    #[test]
+    fn a_scratch_failure_in_the_identity_build_poisons_and_is_not_retried() {
+        let fs = fs_with(&["FILE.TXT", "OTHER.TXT"]);
+        big_dir(&fs, 4);
+        fs.set_ino_mode(Path::new("/d"), crate::fault_fs::InoMode::Absent);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let space = space_on(&fs);
+        let mut idx = hybrid_over(&space, &d, None);
+        // The store exists before the fault is armed (its creation poisons by itself and would hide the defect).
+        assert_eq!(probe(&mut idx, &d, "pad0"), "entry pad0");
+        // The identity builder's first push asks the scratch home for a transient file.
+        fs.fail("create_scratch", Code::DiskFull);
+        let e = idx.resolve(&d, os("file.txt"), &mut || Ok(())).unwrap_err();
+        assert_eq!(e.code, Code::DiskFull, "{e}");
+        assert!(idx.is_poisoned(), "a scratch write failure ends the run");
+        assert!(!idx.identity_built());
+        let before = count_metadata(&fs);
+        let again = idx.resolve(&d, os("other.txt"), &mut || Ok(())).unwrap_err();
+        assert!(again.source.to_string().contains("scratch space is unusable"), "{again}");
+        assert_eq!(again.code, Code::DiskFull);
+        assert_eq!(count_metadata(&fs), before, "the poison answers before any stat: no rebuild");
+    }
+
+    #[test]
+    fn a_tick_error_during_the_identity_pass_does_not_poison_the_space() {
+        let fs = fs_with(&["FILE.TXT"]);
+        big_dir(&fs, 5);
+        fs.set_ino_mode(Path::new("/d"), crate::fault_fs::InoMode::Absent);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let space = space_on(&fs);
+        let mut idx = hybrid_over(&space, &d, None);
+        let mut failing =
+            || Err(flux_fs::FsError::new(Code::IoError, std::io::Error::other("tick says stop")));
+        idx.resolve(&d, os("file.txt"), &mut failing).unwrap_err();
+        assert!(!idx.is_poisoned());
+    }
+
+    #[test]
+    fn a_metadata_error_in_the_identity_pass_of_a_migrated_index_is_the_files_own() {
+        let fs = fs_with(&["FILE.TXT"]);
+        let d = fs.destination_root(Path::new("/d")).unwrap();
+        let space = space_on(&fs);
+        // Inline, then past `index_inline` (4): the names now live in the store only.
+        let mut idx = NameIndex::for_new_dir_with(Some(&space), None);
+        for i in 0..5 {
+            publish(&mut idx, "t", None, &format!("n{i}"), None, FileIdentity::Unavailable);
+        }
+        assert!(idx.is_hybrid());
+        // The 2nd `metadata` call is the first name of the pass; the 1st is the planned name's.
+        fs.fail_nth("metadata", 2, Code::IoError, std::io::ErrorKind::PermissionDenied);
+        assert_eq!(probe(&mut idx, &d, "file.txt"), "err PermissionDenied");
+        assert!(!idx.is_poisoned(), "one unreadable name does not make the scratch space unusable");
+        assert!(!idx.identity_built());
+        assert_eq!(probe(&mut idx, &d, "nothing.txt"), "absent");
+        assert_eq!(probe(&mut idx, &d, "file.txt"), "unresolvable");
+        assert!(idx.identity_built());
     }
 
     #[test]

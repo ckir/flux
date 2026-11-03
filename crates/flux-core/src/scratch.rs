@@ -453,7 +453,7 @@ impl<'h> ScratchSpace<'h> {
     }
 
     /// Blocks read from the file (cache misses and uncached reads) since the space was made.
-    // Read only by tests so far; no non-test caller reports it yet.
+    // Read only by tests: no code outside them reports the miss count.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn cache_misses(&self) -> u64 {
         self.cache.borrow().misses
@@ -574,8 +574,6 @@ impl<'h> ScratchSpace<'h> {
         Rc::clone(&self.poison)
     }
 
-    // Read only by tests so far: every scratch call checks the flag itself.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn poisoned(&self) -> bool {
         self.poison_error().is_some()
     }
@@ -791,8 +789,6 @@ pub(crate) struct Region<'s, 'h> {
 }
 
 impl Region<'_, '_> {
-    // Read only by tests: the walk never needs a region's start.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn start(&self) -> u64 {
         self.start
     }

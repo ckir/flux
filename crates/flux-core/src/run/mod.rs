@@ -1653,6 +1653,9 @@ fn dry_tree<'h, F: DestinationRoot>(
             Err(CopyError::at(CopyStep::Resolve, e))
         }
     };
+    // The store's final commit belongs to a walk that ended well; a failed one keeps its own error and skips it.
+    let walked = walked
+        .and_then(|()| scratch.finish_store().map_err(|e| CopyError::at(CopyStep::Resolve, e)));
     scratch.close();
     // Cut 12: the index file and its private directory go with the slot.
     if let Some(slot) = hardlink_slot {

@@ -1852,6 +1852,10 @@ fn enter_dir<'s, 'h, D: DirHandle>(
 /// `open_explicit` uses). A `CopyError` carries no path of its own, so without it the operator would read the scratch
 /// location and not the directory the run died in.
 fn at_path(path: &Path, e: FsError) -> FsError {
+    // A root-level error has no path to show: no empty prefix.
+    if path.as_os_str().is_empty() {
+        return e;
+    }
     FsError::new(
         e.code,
         std::io::Error::new(e.source.kind(), format!("{}: {}", path.display(), e.source)),
@@ -4912,6 +4916,16 @@ mod tests {
     use crate::fault_fs::FaultFs;
     use flux_fs::{Code, Durability, FileSystem, LinkKind, Links, ObjectId, OperationId, Preserve};
     use std::ffi::OsStr;
+
+    #[test]
+    fn a_path_names_the_error_and_an_empty_path_adds_no_prefix() {
+        let e = || FsError::new(Code::DiskFull, std::io::Error::other("full"));
+        let named = at_path(Path::new("d/sub"), e());
+        assert_eq!(named.source.to_string(), "d/sub: full");
+        let root = at_path(Path::new(""), e());
+        assert_eq!(root.source.to_string(), "full");
+        assert_eq!(root.code, Code::DiskFull);
+    }
 
     #[test]
     fn the_tally_counts_each_cause_in_its_own_field() {

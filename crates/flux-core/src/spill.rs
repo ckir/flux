@@ -202,8 +202,6 @@ pub(crate) struct RunSpan {
 }
 
 /// Where a run is read from: a lane of the scratch space, or a transient file a worker owns.
-// The `File` variant is built by the index tasks that follow (plan 3, tasks 3-4); unused until they land.
-#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub(crate) enum Source<'s, 'h> {
     Lane(&'s ScratchSpace<'h>, Lane),
@@ -220,8 +218,6 @@ impl Source<'_, '_> {
 }
 
 /// Where runs are appended: a lane of the scratch space, or a transient file with its append offset.
-// The `File` variant is built by the index tasks that follow (plan 3, tasks 3-4); unused until they land.
-#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub(crate) enum Sink<'s, 'h> {
     Lane(&'s ScratchSpace<'h>, Lane),
@@ -622,8 +618,7 @@ fn cascade_pass_counting(
 /// trailing run is carried over as it is. `merge_buffer` and `tick_entries` are the thresholds of those names,
 /// passed as values because a worker thread has no `&ScratchSpace`. `tick` gets the entries merged in this pass
 /// every `tick_entries` entries and once at the end. Logs the pass (`pass` of `passes`, as its caller counts).
-// Read by the index tasks that follow (plan 3, tasks 3-4); unused until they land.
-#[allow(dead_code, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cascade_pass(
     source: Source,
     sink: Sink,

@@ -8,9 +8,6 @@
 //! holding the rows this run publishes. Every row's key is a 25-byte directory prefix followed by the datum, so a
 //! directory's rows are one contiguous key range and retiring a directory is a bounded range delete.
 
-// Read by the index tasks that follow (plan 3, tasks 5-8); unused until they land.
-#![allow(dead_code)]
-
 use crate::scratch::{Poison, read_fully_at, write_all_at};
 use crate::spill::os_name;
 use crate::walk::Tick;
@@ -41,7 +38,7 @@ fn fatal(message: impl Into<String>) -> FsError {
 }
 
 /// Re-makes an error from its parts: `FsError` is not `Clone` and its source is never rebuilt with context.
-fn remake(e: &FsError) -> FsError {
+pub(crate) fn remake(e: &FsError) -> FsError {
     FsError::new(e.code, io::Error::new(e.source.kind(), e.source.to_string()))
 }
 
@@ -553,25 +550,24 @@ impl Store {
         batch: usize,
         visit: &mut dyn FnMut(OsString) -> Result<ControlFlow<()>, FsError>,
     ) -> Result<(), FsError> {
-        self.run(|s| {
-            let batch = batch.max(1);
-            let (lo, hi) = dir.bounds();
-            let mut lo = lo.to_vec();
-            loop {
-                let keys = keys_in(s.txn()?, NAMES2, &lo, &hi, batch)?;
-                for key in &keys {
-                    if visit(os_name(&key[PREFIX..]))?.is_break() {
-                        return Ok(());
-                    }
-                }
-                let Some(last) = keys.last().filter(|_| keys.len() == batch) else {
+        let batch = batch.max(1);
+        let (lo, hi) = dir.bounds();
+        let mut lo = lo.to_vec();
+        loop {
+            // Only the page read is inside `run`: a visitor's error is the caller's and must not poison the store.
+            let keys = self.run(|s| keys_in(s.txn()?, NAMES2, &lo, &hi, batch))?;
+            for key in &keys {
+                if visit(os_name(&key[PREFIX..]))?.is_break() {
                     return Ok(());
-                };
-                // The smallest key after `last`.
-                lo = last.clone();
-                lo.push(0);
+                }
             }
-        })
+            let Some(last) = keys.last().filter(|_| keys.len() == batch) else {
+                return Ok(());
+            };
+            // The smallest key after `last`.
+            lo = last.clone();
+            lo.push(0);
+        }
     }
 
     /// Removes the directory's rows from all four tables, in passes of at most `commit_every` rows, committing and
@@ -814,6 +810,28 @@ mod tests {
         assert_eq!(faults::commits(), 3);
         store.finish().unwrap();
         assert_eq!(faults::commits(), 4);
+    }
+
+    #[test]
+    fn a_visitors_error_leaves_the_store_usable() {
+        let fs = FaultFs::new();
+        let space = placed(&fs);
+        let mut store = space.store().unwrap();
+        let dir = DirKey::Ordinal(3);
+        for i in 0..5 {
+            store.publish_name(&dir, &name(&format!("n{i}"))).unwrap();
+        }
+        let visitor_error =
+            || FsError::new(Code::PermissionDenied, io::Error::other("visitor says no"));
+        let e = store
+            .for_each_name2(&dir, 2, &mut |n| {
+                if n == name("n2") { Err(visitor_error()) } else { Ok(ControlFlow::Continue(())) }
+            })
+            .unwrap_err();
+        assert_eq!(e.code, Code::PermissionDenied);
+        assert_eq!(e.source.to_string(), "visitor says no", "the visitor's own error, unprefixed");
+        assert!(space.poison_error().is_none(), "a visitor's error is not a store failure");
+        assert!(store.has_name(&dir, &name("n4")).unwrap());
     }
 
     #[test]
