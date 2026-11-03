@@ -17,9 +17,11 @@
 use crate::scratch::{
     INDEX_OWNER, Lane, Region, ScratchSpace, Thresholds, read_fully_at, write_all_at,
 };
+#[cfg(test)]
+use crate::spill::sort_keyed;
 use crate::spill::{
-    Keyed, Merger, RunSpan, Sink, Source, cascade_pass, decode, encode, os_name, passes_for,
-    sort_keyed, write_run,
+    Keyed, Merger, RunSpan, Sink, Source, cascade_pass, decode, encode, key_cmp, os_name,
+    passes_for, prefix, write_encoded_run, write_run,
 };
 use crate::walk::Tick;
 use flux_fs::{Code, FsError};
@@ -73,13 +75,36 @@ pub(crate) enum FinishError {
 // ---------------------------------------------------------------------------------------------------------------
 // Building: sorted runs in transient files.
 
+/// One buffered record: where it starts in the arena and the cached big-endian prefixes it sorts by.
+#[derive(Clone, Copy)]
+struct Descriptor {
+    start: u64,
+    key: u64,
+    name: u64,
+}
+
+/// The whole encoded record at `start`.
+fn record_bytes(k: usize, arena: &[u8], start: u64) -> &[u8] {
+    let start = start as usize;
+    let len = usize::from(u16::from_le_bytes([arena[start + k], arena[start + k + 1]]));
+    &arena[start..start + k + 3 + len]
+}
+
+/// The key bytes and the name bytes of the record at `start`.
+fn record_parts(k: usize, arena: &[u8], start: u64) -> (&[u8], &[u8]) {
+    let record = record_bytes(k, arena, start);
+    (&record[..k], &record[k + 3..])
+}
+
 /// Collects the items of one family into sorted runs in a transient file. It creates no file until the first push.
 pub(crate) struct FamilyBuilder<'s, 'h> {
     space: &'s ScratchSpace<'h>,
     lane: Lane,
     k: usize,
     th: Thresholds,
-    buf: Vec<Keyed>,
+    /// The run being collected, encoded as `spill::encode` writes it; `descriptors` point into it.
+    arena: Vec<u8>,
+    descriptors: Vec<Descriptor>,
     file: Option<File>,
     end: Cell<u64>,
     runs: Vec<RunSpan>,
@@ -93,7 +118,8 @@ impl<'s, 'h> FamilyBuilder<'s, 'h> {
             lane,
             k,
             th: space.thresholds(),
-            buf: Vec::new(),
+            arena: Vec::new(),
+            descriptors: Vec::new(),
             file: None,
             end: Cell::new(0),
             runs: Vec::new(),
@@ -105,9 +131,17 @@ impl<'s, 'h> FamilyBuilder<'s, 'h> {
         if self.file.is_none() {
             self.file = Some(self.space.transient()?);
         }
-        self.buf.push(item);
+        let start = self.arena.len();
+        encode(self.k, &item, &mut self.arena)?;
+        let name = item.entry.name.as_encoded_bytes();
+        self.descriptors.push(Descriptor {
+            start: start as u64,
+            key: prefix(&item.key[..self.k.min(8)]),
+            // Past eight key bytes the name must not be compared before the rest of the key.
+            name: if self.k > 8 { 0 } else { prefix(name) },
+        });
         self.count += 1;
-        if self.buf.len() >= self.th.run_entries {
+        if self.descriptors.len() >= self.th.run_entries {
             self.write_buffer()?;
         }
         if self.th.tick_entries > 0 && self.count.is_multiple_of(self.th.tick_entries as u64) {
@@ -118,14 +152,34 @@ impl<'s, 'h> FamilyBuilder<'s, 'h> {
 
     fn write_buffer(&mut self) -> Result<(), FsError> {
         let Some(file) = self.file.as_ref() else { return Ok(()) };
-        if self.buf.is_empty() {
+        if self.descriptors.is_empty() {
             return Ok(());
         }
-        sort_keyed(self.k, &mut self.buf);
-        let span = write_run(Sink::File(file, &self.end), self.k, self.th.merge_buffer, &self.buf)?;
+        let (k, arena) = (self.k, &self.arena);
+        self.descriptors.sort_unstable_by(|a, b| {
+            a.key.cmp(&b.key).then_with(|| a.name.cmp(&b.name)).then_with(|| {
+                let (key_a, name_a) = record_parts(k, arena, a.start);
+                let (key_b, name_b) = record_parts(k, arena, b.start);
+                key_a.cmp(key_b).then_with(|| key_cmp(name_a, name_b))
+            })
+        });
+        let records = self.descriptors.iter().map(|d| record_bytes(k, arena, d.start));
+        let span =
+            write_encoded_run(Sink::File(file, &self.end), k, self.th.merge_buffer, records)?;
         self.runs.push(span);
-        self.buf.clear();
+        self.arena.clear();
+        self.descriptors.clear();
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn buffered(&self) -> (usize, usize, usize, usize) {
+        (
+            self.arena.len(),
+            self.arena.capacity(),
+            self.descriptors.len(),
+            self.descriptors.capacity(),
+        )
     }
 
     pub(crate) fn into_pending(mut self) -> Result<PendingFamily, FsError> {
@@ -1313,6 +1367,203 @@ mod tests {
         assert_eq!(space.len(Lane::Inodes), fb.meta.end);
         drop((fa, fb));
         assert_eq!((space.len(Lane::Names), space.len(Lane::Inodes)), (0, 0));
+    }
+
+    type Rec = (Vec<u8>, Vec<u8>, String);
+
+    fn rec(k: usize, it: &Keyed) -> Rec {
+        (
+            it.key[..k].to_vec(),
+            it.entry.name.as_encoded_bytes().to_vec(),
+            format!("{:?}", it.entry.file_type),
+        )
+    }
+
+    /// The records of one run, read back from a transient file.
+    fn read_span(k: usize, t: &Thresholds, file: &File, span: RunSpan) -> Vec<Rec> {
+        let mut merger = Merger::new(Source::File(file), k, t.merge_buffer, &[span]).unwrap();
+        let mut out = Vec::new();
+        while let Some(item) = merger.next_entry().unwrap() {
+            out.push(rec(k, &item));
+        }
+        out
+    }
+
+    /// A deterministic xorshift stream.
+    fn stream(seed: u64) -> impl FnMut() -> u64 {
+        let mut x = seed | 1;
+        move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        }
+    }
+
+    /// `n` items with distinct (key[..k], name) pairs: keys share their first eight bytes, many names share an
+    /// eight-byte prefix, some are shorter than eight bytes or empty.
+    fn adversarial_items(k: usize, n: usize, seed: u64) -> Vec<Keyed> {
+        let mut next = stream(seed);
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::new();
+        while out.len() < n {
+            let r = next();
+            let name: Vec<u8> = match r % 5 {
+                0 => format!("sharedpr{}", next() % 400).into_bytes(),
+                1 => format!("{}", next() % 5000).into_bytes(),
+                2 => Vec::new(),
+                3 => format!("sharedpr-{:x}-{}", next() % 3, next() % 50).into_bytes(),
+                _ => format!("n{:x}", next()).into_bytes(),
+            };
+            let mut key = [0u8; 24];
+            if k > 0 {
+                let mut bytes = [0u8; 24];
+                // A handful of distinct first words, and for k = 24 the rest varies independently.
+                bytes[..8].copy_from_slice(&(next() % 4).to_be_bytes());
+                for b in &mut bytes[8..] {
+                    *b = (next() % 3) as u8;
+                }
+                key[..k].copy_from_slice(&bytes[..k]);
+            }
+            if !seen.insert((key[..k].to_vec(), name.clone())) {
+                continue;
+            }
+            let file_type = match next() % 4 {
+                0 => FileType::File,
+                1 => FileType::Dir,
+                2 => FileType::Symlink,
+                _ => FileType::Other,
+            };
+            out.push(Keyed { key, entry: DirEntry { name: os_name(&name), file_type, ino: None } });
+        }
+        out
+    }
+
+    fn runs_thresholds(run_entries: usize) -> Thresholds {
+        Thresholds::new(4, run_entries, 2, 16, 3)
+            .unwrap()
+            .with_index(4, 2, 4, 1 << 20, 2, 128)
+            .unwrap()
+    }
+
+    #[test]
+    fn every_run_equals_its_chunk_sorted_by_sort_keyed_and_write_run() {
+        for k in [0usize, 8, 24] {
+            let t = runs_thresholds(500);
+            let fs = FaultFs::new();
+            let space = placed(&fs, t);
+            let items = adversarial_items(k, 5003, 0x9E37_79B9_7F4A_7C15 ^ k as u64);
+            let runs = runs_of(pending(&space, Lane::Names, k, items.clone()));
+            assert_eq!(runs.runs.len(), 11, "k = {k}");
+            let reference = space.transient().unwrap();
+            let end = Cell::new(0u64);
+            for (i, span) in runs.runs.iter().enumerate() {
+                let mut chunk: Vec<Keyed> =
+                    items[i * 500..((i + 1) * 500).min(items.len())].to_vec();
+                sort_keyed(k, &mut chunk);
+                let want_span =
+                    write_run(Sink::File(&reference, &end), k, t.merge_buffer, &chunk).unwrap();
+                let want = read_span(k, &t, &reference, want_span);
+                let got = read_span(k, &t, &runs.first, *span);
+                assert_eq!(span.count, chunk.len() as u64, "k = {k} run {i}");
+                assert_eq!(got.len(), want.len(), "k = {k} run {i}");
+                assert!(got == want, "k = {k} run {i} differs");
+            }
+        }
+    }
+
+    #[test]
+    fn records_equal_in_key_and_name_keep_every_file_type() {
+        for k in [0usize, 8, 24] {
+            let t = runs_thresholds(500);
+            let fs = FaultFs::new();
+            let space = placed(&fs, t);
+            let mut items = Vec::new();
+            for i in 0..40u64 {
+                for ty in [FileType::File, FileType::Dir, FileType::Symlink, FileType::Other] {
+                    let mut key = [0u8; 24];
+                    key[..k].copy_from_slice(&[(i % 3) as u8; 24][..k]);
+                    items.push(Keyed {
+                        key,
+                        entry: DirEntry {
+                            name: OsString::from(format!("dup{}", i % 7)),
+                            file_type: ty,
+                            ino: None,
+                        },
+                    });
+                }
+            }
+            let runs = runs_of(pending(&space, Lane::Names, k, items.clone()));
+            assert_eq!(runs.runs.len(), 1);
+            let mut got = read_span(k, &t, &runs.first, runs.runs[0]);
+            let mut want: Vec<Rec> = items.iter().map(|i| rec(k, i)).collect();
+            got.sort();
+            want.sort();
+            assert_eq!(got, want, "k = {k}");
+        }
+    }
+
+    #[test]
+    fn an_over_long_name_is_refused_and_leaves_the_builder_usable() {
+        for k in [0usize, 8, 24] {
+            let t = runs_thresholds(500);
+            let fs = FaultFs::new();
+            let space = placed(&fs, t);
+            let mut builder = FamilyBuilder::new(&space, Lane::Names, k);
+            let mut tick = || Ok(());
+            let key = vec![5u8; k];
+            for i in 0..10 {
+                builder.push(item(k, &key, &format!("early{i}")), &mut tick).unwrap();
+            }
+            let before = builder.buffered();
+            let long = "x".repeat(u16::MAX as usize + 1);
+            let err = builder.push(item(k, &key, &long), &mut tick).unwrap_err();
+            assert!(err.to_string().contains("too long to spill"), "{err}");
+            assert_eq!(builder.buffered(), before, "k = {k}");
+            builder.push(item(k, &key, "late"), &mut tick).unwrap();
+            let runs = runs_of(builder.into_pending().unwrap());
+            assert_eq!(runs.count, 11, "the refused item is not counted");
+            let got = read_span(k, &t, &runs.first, runs.runs[0]);
+            let mut want: Vec<Rec> = (0..10)
+                .map(|i| rec(k, &item(k, &key, &format!("early{i}"))))
+                .chain([rec(k, &item(k, &key, "late"))])
+                .collect();
+            want.sort_by(|a, b| a.1.cmp(&b.1));
+            assert_eq!(got, want, "k = {k}");
+        }
+    }
+
+    #[test]
+    fn a_flushed_run_keeps_the_buffers_capacity_and_the_next_run_is_correct() {
+        let t = runs_thresholds(50);
+        let fs = FaultFs::new();
+        let space = placed(&fs, t);
+        let mut builder = FamilyBuilder::new(&space, Lane::Names, 8);
+        let mut tick = || Ok(());
+        let items = adversarial_items(8, 120, 42);
+        for it in &items[..49] {
+            builder.push(it.clone(), &mut tick).unwrap();
+        }
+        let (arena_len, _, descs, _) = builder.buffered();
+        assert!(arena_len > 0 && descs == 49);
+        builder.push(items[49].clone(), &mut tick).unwrap();
+        let (arena_after, arena_cap, descs_after, desc_cap) = builder.buffered();
+        assert_eq!((arena_after, descs_after), (0, 0));
+        assert!(arena_cap >= arena_len && desc_cap >= 49, "{arena_cap} {desc_cap}");
+        for it in &items[50..100] {
+            builder.push(it.clone(), &mut tick).unwrap();
+        }
+        for it in &items[100..] {
+            builder.push(it.clone(), &mut tick).unwrap();
+        }
+        let runs = runs_of(builder.into_pending().unwrap());
+        assert_eq!(runs.runs.len(), 3);
+        for (i, span) in runs.runs.iter().enumerate() {
+            let mut chunk: Vec<Keyed> = items[i * 50..((i + 1) * 50).min(items.len())].to_vec();
+            sort_keyed(8, &mut chunk);
+            let want: Vec<Rec> = chunk.iter().map(|c| rec(8, c)).collect();
+            assert_eq!(read_span(8, &t, &runs.first, *span), want, "run {i}");
+        }
     }
 
     #[test]

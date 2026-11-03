@@ -133,7 +133,7 @@ pub(crate) fn wtf8_to_wide(bytes: &[u8]) -> Vec<u16> {
 }
 
 /// The first eight bytes, big-endian, zero padded.
-fn prefix(bytes: &[u8]) -> u64 {
+pub(crate) fn prefix(bytes: &[u8]) -> u64 {
     let mut p = [0u8; 8];
     let n = bytes.len().min(8);
     p[..n].copy_from_slice(&bytes[..n]);
@@ -281,6 +281,18 @@ impl<'s, 'h> RunWriter<'s, 'h> {
     fn push(&mut self, item: &Keyed) -> Result<(), FsError> {
         let mark = self.buf.len();
         encode(self.k, item, &mut self.buf)?;
+        self.appended(mark)
+    }
+
+    /// Appends a record already in the run's layout (as `encode` writes it).
+    fn push_encoded(&mut self, record: &[u8]) -> Result<(), FsError> {
+        let mark = self.buf.len();
+        self.buf.extend_from_slice(record);
+        self.appended(mark)
+    }
+
+    /// Counts the record that starts at `mark` and flushes as the buffer fills.
+    fn appended(&mut self, mark: usize) -> Result<(), FsError> {
         self.count += 1;
         if mark > 0 && self.buf.len() > self.cap {
             self.flush(mark)?;
@@ -308,6 +320,21 @@ pub(crate) fn write_run(
     let mut w = RunWriter::new(sink, k, merge_buffer);
     for item in items {
         w.push(item)?;
+    }
+    w.finish()
+}
+
+/// Appends the already encoded `records` (each in the layout `encode` writes, in sorted order) as one run at the
+/// end of the sink: the bytes are those `write_run` would write for the same items.
+pub(crate) fn write_encoded_run<'r>(
+    sink: Sink,
+    k: usize,
+    merge_buffer: usize,
+    records: impl Iterator<Item = &'r [u8]>,
+) -> Result<RunSpan, FsError> {
+    let mut w = RunWriter::new(sink, k, merge_buffer);
+    for record in records {
+        w.push_encoded(record)?;
     }
     w.finish()
 }
@@ -1021,6 +1048,44 @@ mod tests {
         sort_keyed(8, &mut want);
         assert_eq!(got.len(), 12);
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn write_encoded_run_writes_the_bytes_write_run_writes() {
+        use crate::fault_fs::FaultFs;
+        let t = Thresholds::new(2, 4, 2, 4, 1).unwrap();
+        for k in [0usize, 8, 24] {
+            let fs = FaultFs::new();
+            let space = placed(&fs, t);
+            let mut items: Vec<Keyed> =
+                (0..30u8).map(|i| kitem(i % 5, &format!("n{:02}", i * 7 % 30))).collect();
+            items.iter_mut().for_each(|i| *i = masked(k, i.clone()));
+            sort_keyed(k, &mut items);
+            let (a, b) = (space.transient().unwrap(), space.transient().unwrap());
+            let (ea, eb) = (std::cell::Cell::new(0u64), std::cell::Cell::new(0u64));
+            let sa = write_run(Sink::File(&a, &ea), k, t.merge_buffer, &items).unwrap();
+            let encoded: Vec<Vec<u8>> = items
+                .iter()
+                .map(|i| {
+                    let mut v = Vec::new();
+                    encode(k, i, &mut v).unwrap();
+                    v
+                })
+                .collect();
+            let sb = write_encoded_run(
+                Sink::File(&b, &eb),
+                k,
+                t.merge_buffer,
+                encoded.iter().map(|v| v.as_slice()),
+            )
+            .unwrap();
+            assert_eq!(sa, sb, "k = {k}");
+            let (mut bytes_a, mut bytes_b) =
+                (vec![0u8; sa.len as usize], vec![0u8; sb.len as usize]);
+            read_fully_at(&a, &mut bytes_a, 0).unwrap();
+            read_fully_at(&b, &mut bytes_b, 0).unwrap();
+            assert_eq!(bytes_a, bytes_b, "k = {k}");
+        }
     }
 
     #[test]
