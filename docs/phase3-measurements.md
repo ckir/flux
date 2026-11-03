@@ -496,7 +496,7 @@ Overwrite of an old copy (`flux copy -vv SRC DEST` where DEST already holds the 
 | `ru_maxrss` | 42,116; 41,684 | 42,368; 42,232 | 45,188; 44,996 | 2.8-2.9 B/entry |
 | `RssAnon` at the sampled peak | 36,456; 36,436 | 36,776; 36,836 | 39,696; 39,700 | 2.9-3.0 B/entry |
 
-Before this plan: 322,224 / 622,268 / 1,221,640 KiB (614 B/entry; table under "Cut 23 baseline"). With the first index build (`e296661`) the same cells read `ru_maxrss` 65,192-65,744 / 70,776-70,880 / 71,052-70,876 KiB and `RssAnon` 60,424 / 65,420 / 65,420 KiB (slope 0 on that binary, the buffers of a 262,144-entry run being the ceiling), and a `--resume` after a finished copy the same to within 1 MiB (66,144 / 65,420 / 65,420 KiB). The resume cells were not re-run on `e5bef9a`. Every run printed one `destination index spilled` line and two `indexing` lines (`entries=2000001 family=names runs=8`, `family=inodes runs=8` at 2M). The criterion (marginal slope at most 5 B/entry) is met with a slope of about 3 B/entry; why the slope is not zero on the lighter final builder (the ceiling fell by 29 MiB and a growing term shows through) was not investigated and is a TODO row.
+Before this plan: 322,224 / 622,268 / 1,221,640 KiB (614 B/entry; table under "Cut 23 baseline"). With the first index build (`e296661`) the same cells read `ru_maxrss` 65,192-65,744 / 70,776-70,880 / 71,052-70,876 KiB and `RssAnon` 60,424 / 65,420 / 65,420 KiB (slope 0 on that binary, the buffers of a 262,144-entry run being the ceiling), and a `--resume` after a finished copy the same to within 1 MiB (66,144 / 65,420 / 65,420 KiB). The resume cells were not re-run on `e5bef9a`. Every run printed one `destination index spilled` line and two `indexing` lines (`entries=2000001 family=names runs=8`, `family=inodes runs=8` at 2M). The spec's criterion (marginal slope at most 5 B/entry) is met with a slope of about 3 B/entry, but the plan added a second pass line, an `RssAnon` slope of at most 1 B/entry, and that is MISSED (2.9-3.0; 500,000 to 1,000,000 is 0.7); it was reported to the owner; why the slope is not zero on the lighter final builder (the ceiling fell by 29 MiB and a growing term shows through) was not investigated and is a TODO row.
 
 ### Criteria of spec 6.3, the verdict
 
@@ -509,7 +509,8 @@ Before this plan: 322,224 / 622,268 / 1,221,640 KiB (614 B/entry; table under "C
 | Tier 2 at least 5,000 inserts/s | 24.4-24.7 k | PASS |
 | Tier 2 `RssAnon` slope at most 1 B/row | 0.02 | PASS |
 | Lookup latencies reported with the page-cache state and the device | above | reported |
-| GATE-B slope at most 5 B/entry | about 3 B/entry (614 before) | PASS |
+| GATE-B marginal slope 1M to 2M at most 5 B/entry (spec section 7) | `ru_maxrss` 2.8-2.9, `RssAnon` 2.9-3.0 B/entry (614 before) | PASS |
+| GATE-B `RssAnon` slope at most 1 B/entry (the plan's additional pass line, Task 8 Step 4) | 2.9-3.0 B/entry | MISS (spec bar met; reported to the owner, TODO row) |
 
 ### Step 5: the bounded-memory argument with the production constants
 

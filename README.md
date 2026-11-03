@@ -101,7 +101,7 @@ creates nothing; a path that cannot be opened exits 1 and leaves DEST untouched)
 when a directory actually spills, and the default locations are found at the first spill. A scratch write error stops
 the whole run (exit 1); it is never reported as one skipped directory.
 
-A pre-existing destination directory of more than 8,192 entries is indexed in the same scratch space (sorted name tables on disk plus a small embedded store), so copying into a very large existing folder does not grow the resident memory with its size. `-vv` shows `destination index spilled` when a directory is indexed that way and `building the identity family` when a case or hard-link alias forces the one-time identity pass.
+A pre-existing destination directory of more than 8,192 entries is indexed in the same scratch space (sorted name tables on disk plus a small embedded store), so copying into a very large existing folder grows the resident memory by only about 3 bytes per entry (measured to 2,000,000 entries; it was about 614 before). `-vv` shows `destination index spilled` when a directory is indexed that way and `building the identity family` when a case or hard-link alias forces the one-time identity pass.
 
 ### Verification
 
