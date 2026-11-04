@@ -1423,12 +1423,17 @@ fn a_300k_entry_destination_is_indexed_with_the_production_constants() {
     assert_eq!(out.status.code(), Some(0), "stderr (head): {:.2000}", stderr(&out));
     let e = stderr(&out);
     assert_eq!(e.matches("destination index spilled").count(), 1);
-    for family in ["names", "inodes"] {
+    // Windows lists no inode hint (`dir_windows.rs`: `ino: None`), so its `inodes` family is empty and logs nothing.
+    let families: &[&str] = if cfg!(windows) { &["names"] } else { &["names", "inodes"] };
+    for family in families {
         let line = e
             .lines()
             .find(|l| l.contains("indexing") && l.contains(family))
             .unwrap_or_else(|| panic!("no indexing line for {family}"));
         assert!(line.contains("runs=2"), "{family}: {line}");
+    }
+    if cfg!(windows) {
+        assert!(!e.lines().any(|l| l.contains("indexing") && l.contains("inodes")), "{e}");
     }
     let report = json(&out);
     assert_eq!(report["files_overwritten"], 300_000, "every destination file replaced");
