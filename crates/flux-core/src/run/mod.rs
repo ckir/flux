@@ -682,6 +682,9 @@ where
         };
         walk(&cx, &mut *place, &mut out, &mut report)
     };
+    // The store's final commit belongs to a walk that ended well; a failed one keeps its own error and skips it.
+    let walked = walked
+        .and_then(|()| scratch.finish_store().map_err(|e| CopyError::at(CopyStep::Resolve, e)));
     // No scratch handle may be open when `finish` removes the workspace (Windows refuses to remove a directory holding
     // a delete-pending file), and the WAL thread ends after this.
     scratch.close();
@@ -1650,6 +1653,9 @@ fn dry_tree<'h, F: DestinationRoot>(
             Err(CopyError::at(CopyStep::Resolve, e))
         }
     };
+    // The store's final commit belongs to a walk that ended well; a failed one keeps its own error and skips it.
+    let walked = walked
+        .and_then(|()| scratch.finish_store().map_err(|e| CopyError::at(CopyStep::Resolve, e)));
     scratch.close();
     // Cut 12: the index file and its private directory go with the slot.
     if let Some(slot) = hardlink_slot {

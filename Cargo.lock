@@ -401,6 +401,7 @@ dependencies = [
  "flux-hash",
  "flux-platform",
  "proptest",
+ "redb",
  "serde",
  "serde_json",
  "tempfile",

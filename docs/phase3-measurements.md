@@ -451,3 +451,69 @@ GATE-X (one `--dry-run` over the flat 10,000,000-entry fixture): peak RSS 29216 
 A first attempt at this run was discarded: it took `ru_maxrss` from `wait4` inside a Python driver, and a forked child's peak includes the driver's own memory (the driver grew while deleting a 2,000,000-entry destination), so its figures climbed with N for a reason unrelated to the program; it also captured `-vv` stderr to a file that exhausted the `/tmp` user quota. The figures above come from `/usr/bin/time -v` around the binary (a small parent process), with stderr counted through a pipe.
 
 Not measured: GATE-B and GATE-D (plan 3 and plan 1), a destination above the threshold (structure B), Windows, any timing. Windows CI has not run (no push without the owner's go-ahead): the Windows branches are compile-checked only.
+
+## Cut 23 plan 3: the destination index
+
+Commits measured: the harness numbers come from `e5bef9a` (plan 3 Tasks 1-10 on `feat/bounded-listing-3`); the first (missed) tier-1 numbers from `e296661`, the intermediate ones from `f0905d3`. Release builds in `~/.cache/flux-c23-target`; scale tests are `index::scale_tests::tier1_criteria` and `store::scale_tests::tier2_criteria` (all `#[ignore]`, `FLUX_SCALE_N`, `FLUX_SCALE_DIR=~/.cache/flux-scale`, run with `cargo nextest run --release -p flux-core --run-ignored only --no-capture`); GATE-B drives the release `flux` over `benches/phase3/make_tree.py flat` sources and `make_dest.sh` destinations with `/proc/PID/smaps_rollup` sampled every 50 ms (`Anonymous` = RssAnon, `Rss - Anonymous` = file-backed) plus `ru_maxrss`. Timing was approved by the owner for this task only (2026-11-02, 2026-11-03).
+
+Machine and what was not controlled: the box of section 4.2 (8 cores, 24 GB, a QEMU virtual disk, `ROTA 0`, ext4 on `/dev/sda1`, `~/.cache` on it). The load average was 0.86-0.98 (one minute) before each timed run, higher between runs and 2-7 during GATE-B (other sessions, tools, an idle peer in `tmux`); the machine was not idle in the sense of the discipline and nothing background was stopped. The idleness probe was proven on a known-busy process (`yes` read `pcpu` 100-101 every time). Each figure was taken twice and the range is quoted. During the final GATE-B re-run light editing and waiting went on, so no wall-clock figure of GATE-B is claimed (RSS is not timing). Page cache: tier-1 files are 0.27 + 0.36 GB at 10M and 2.7 + 3.6 GB at 100M, so at 100M part of the random probes read the page cache and part the device; the latencies are reported, not gated.
+
+### The first measurement missed the build-rate criterion; two fixes were measured
+
+| Binary | Build, 10M (names/s, 2 runs) | Build, 100M | Phase split, 10M (push / finish) |
+|---|---|---|---|
+| `e296661` (first measurement) | 419,306 and 469,707 | 391,748 and 373,932 | 17.1-18.6 s / 3.7-3.8 s of 21-22 s |
+| `f0905d3` (Task 9: runs buffered as encoded bytes, descriptors sorted) | 1,195,624 and 1,097,173 | 891,016 and 921,675 (MISS) | 5.0-5.5 s / 3.4-3.6 s |
+| `e5bef9a` (Task 10: merge feeds the packer encoded records) | 1,242,050 and 1,309,537 | 1,163,568 and 1,128,387 | 5.2-5.9 s / 2.1-2.5 s |
+
+Inside the push loop of the first build (10M, two instrumented runs, 20.1 s each): freeing the per-entry names after a run 7.5-7.9 s, `sort_keyed` over 72-byte values 6.5-7.0 s, `write_run` 4.3-5.1 s, the rest about 1 s; the name generator alone 0.29-0.35 s. `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` changed nothing (push 17.5-18.3 s). The build time of the harness includes the pseudo-random name generator (0.3 s at 10M, 2.8-3.0 s at 100M) and both families.
+
+### Tier 1 (`e5bef9a`), two runs each
+
+| | 10M | 100M |
+|---|---|---|
+| build | 1,242,050 and 1,309,537 names/s (8.05, 7.64 s) | 1,163,568 and 1,128,387 names/s (85.9, 88.6 s) |
+| runs / levels | 39 per family / 3 | 382 per family / 3 (`names`), 4 (`inodes`) |
+| index bytes `names` + `inodes` | 273,825,792 + 357,122,048 | 2,738,180,096 + 3,571,171,328 |
+| peak RSS of the test process (`/usr/bin/time -v`) | 49,480 and 49,240 KiB | 49,460 and 49,360 KiB |
+| `RssAnon` after the build | 3,792 KiB (both) | 25,400 KiB (both) |
+| `names`, walk order: median / p99, misses per probe | 1.7-1.8 us / 4.9-5.2 us, 0.007 | 1.6-1.9 us / 4.2-7.0 us, 0.007 |
+| `names`, random: median / p99, misses per probe | 6.6-6.7 us / 21.8-24.5 us, 1.805 | 8.3-8.5 us / 26.7-27.1 us, 2.082 |
+| `inodes`, random: median / p99, misses per probe | 6.5-7.0 us / 23.4-24.9 us, 1.882 | 7.7-8.3 us / 25.1-26.6 us, 2.346 |
+
+`RssAnon` after the build is read after the builders have freed their buffers, so it does not see the build's peak; the peak is the `ru_maxrss` row (49 MB at both sizes: slope 0), and the `RssAnon` difference 10M to 100M is (25,400 - 3,792) KiB over 90,000,000 entries = 0.25 B/entry. The random-probe latencies depend on the page cache (the second 100M run of the first measurement, `e296661`, showed a p99 of 1.9 ms where the first run showed 38 us, under the same binary); the pre-registered gate is on misses per probe, not on these.
+
+### Tier 2 (`redb`, unchanged by Tasks 9-10; first run, `e296661`), two runs
+
+10,000,000 `ids_row`-shaped inserts in random key order, `publication_commit = 1,024`: 24,671 and 24,442 inserts/s (405 and 409 s); `RssAnon` 19,184 and 19,188 KiB at 5M rows, 19,272 and 19,276 KiB at 10M (slope 0.02 B/row); 1,000 random rows read back; `ids_rows` point lookups after the ingest: median 16.2 and 17.8 us, p99 83.8 and 54.3 us (files in the page cache). The harness's `has_name` probe reads the `names2` table, which `ids_row` never fills, so its 0.9 us figure is not a lookup figure and is not used. Tier 2 was not run at 100M (at 24.5k inserts/s it takes over an hour; the gate needs 10M).
+
+### GATE-B (destination into a pre-existing directory), release `flux` at `e5bef9a`
+
+Overwrite of an old copy (`flux copy -vv SRC DEST` where DEST already holds the same names), peak, KiB, two runs:
+
+| | 500,000 | 1,000,000 | 2,000,000 | Slope 1M to 2M |
+|---|---|---|---|---|
+| `ru_maxrss` | 42,116; 41,684 | 42,368; 42,232 | 45,188; 44,996 | 2.8-2.9 B/entry |
+| `RssAnon` at the sampled peak | 36,456; 36,436 | 36,776; 36,836 | 39,696; 39,700 | 2.9-3.0 B/entry |
+
+Before this plan: 322,224 / 622,268 / 1,221,640 KiB (614 B/entry; table under "Cut 23 baseline"). With the first index build (`e296661`) the same cells read `ru_maxrss` 65,192-65,744 / 70,776-70,880 / 71,052-70,876 KiB and `RssAnon` 60,424 / 65,420 / 65,420 KiB (slope 0 on that binary, the buffers of a 262,144-entry run being the ceiling), and a `--resume` after a finished copy the same to within 1 MiB (66,144 / 65,420 / 65,420 KiB). The resume cells were not re-run on `e5bef9a`. Every run printed one `destination index spilled` line and two `indexing` lines (`entries=2000001 family=names runs=8`, `family=inodes runs=8` at 2M). The spec's criterion (marginal slope at most 5 B/entry) is met with a slope of about 3 B/entry, but the plan added a second pass line, an `RssAnon` slope of at most 1 B/entry, and that is MISSED (2.9-3.0; 500,000 to 1,000,000 is 0.7); it was reported to the owner; why the slope is not zero on the lighter final builder (the ceiling fell by 29 MiB and a growing term shows through) was not investigated and is a TODO row.
+
+### Criteria of spec 6.3, the verdict
+
+| Criterion | Result | |
+|---|---|---|
+| Tier 1 build at least 1,000,000 names/s at 10M and 100M | 1.24-1.31 M and 1.13-1.16 M | PASS (after Tasks 9-10; the first measurement MISSED at 0.37-0.47 M) |
+| Tier 1 `RssAnon` slope at most 1 B/entry | 0.25 B/entry; peak RSS flat at 49 MB | PASS |
+| `names` walk order: median under 5 us, p99 under 20 us | 1.6-1.9 us, 4.2-7.0 us | PASS |
+| Walk-order at most 0.05 misses/probe; random at most 3 | 0.007; 1.8-2.3 | PASS |
+| Tier 2 at least 5,000 inserts/s | 24.4-24.7 k | PASS |
+| Tier 2 `RssAnon` slope at most 1 B/row | 0.02 | PASS |
+| Lookup latencies reported with the page-cache state and the device | above | reported |
+| GATE-B marginal slope 1M to 2M at most 5 B/entry (spec section 7) | `ru_maxrss` 2.8-2.9, `RssAnon` 2.9-3.0 B/entry (614 before) | PASS |
+| GATE-B `RssAnon` slope at most 1 B/entry (the plan's additional pass line, Task 8 Step 4) | 2.9-3.0 B/entry | MISS (spec bar met; reported to the owner, TODO row) |
+
+### Step 5: the bounded-memory argument with the production constants
+
+Constants: `RUN_ENTRIES` 262,144, `MERGE_FAN_IN` 384, `MERGE_BUFFER` 16 KiB, block cache 1 MiB, store cache 16 MiB, inline index `INDEX_INLINE` 8,192 names per directory. Building the two families, a run is the encoded records plus a 24-byte descriptor per entry: `names` 262,144 x (27 + 24) B = 13.4 MB and `inodes` 262,144 x (35 + 24) B = 15.5 MB for 24-byte names (a `Vec` that doubled holds up to twice the record arena), both at once = 28.9 MB; finishing, two families merge at once: `2 * 384 * 16 KiB` = 12 MiB of cursor buffers (a record longer than the buffer grows its cursor's buffer), plus the packer's frame and the level entries held in memory (about 1/100 of level 0); plus 1 MiB of block cache, the store's 16 MiB cache and `256 * 8,192` inline names. The phases do not coexist within a directory (the arenas are cleared at each run's write and the cursors exist only after `into_pending`). Measured against that bound: a test process peak of 49 MB at 10M and at 100M (the harness adds its own probe arrays), and a copy of 2M entries peaking at 45 MB; the bound does not depend on the entry count, and the measured peak does not either to within the 3 B/entry above.
+
+Windows: not run. The owner declined the push on 2026-11-02, so the cut-23 Windows branches (`close()` order, positional I/O, `wtf8` paths of the index) have never executed on Windows CI.

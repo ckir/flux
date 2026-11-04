@@ -6,8 +6,8 @@
 
 //! The ordered directory walk (§7.2, §9, §149.4).
 
-use crate::scratch::{Region, ScratchSpace, Thresholds};
-use crate::spill::{MergeReader, RunSpan, cascade, sort_entries, write_run};
+use crate::scratch::{Lane, Region, ScratchSpace, Thresholds};
+use crate::spill::{Keyed, MergeReader, RunSpan, Sink, cascade, sort_entries, write_run};
 use flux_fs::{
     Code, DirEntry, FileIdentity, FileSystem, FileType, FsError, MountRoot, ObjectId, Result,
     Selection, Verdict,
@@ -123,7 +123,7 @@ impl Iterator for Entries<'_, '_> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Entries::Inline(it) => it.next().map(Ok),
-            Entries::Spilled(m) => m.next(),
+            Entries::Spilled(m) => m.next().map(|r| r.map(|item| item.entry)),
         }
     }
 }
@@ -539,6 +539,11 @@ impl<'a, 'h, F: FileSystem> Walk<'a, 'h, F> {
         self.excluded
     }
 
+    /// The scratch space this walk spills into, if it was given one.
+    pub fn scratch(&self) -> Option<&'a ScratchSpace<'h>> {
+        self.scratch
+    }
+
     /// How many directories this walk spilled to the scratch space.
     pub fn spilled_directories(&self) -> u64 {
         self.spilled
@@ -576,15 +581,19 @@ impl<'a, 'h, F: FileSystem> Walk<'a, 'h, F> {
         listed.map_err(ListError::Listing)?;
         let Some(space) = l.space.filter(|_| !l.runs.is_empty() || l.buf.len() > t.inline_entries)
         else {
-            return Ok(Entries::Inline(sorted(l.buf).into_iter()));
+            return Ok(Entries::Inline(
+                sorted(l.buf.into_iter().map(|item| item.entry).collect()).into_iter(),
+            ));
         };
         l.flush().map_err(ListError::Fatal)?;
         let entries = l.total;
-        let runs = cascade(space, std::mem::take(&mut l.runs), &mut |_| tick())
+        let runs = cascade(space, Lane::Walk, 0, std::mem::take(&mut l.runs), &mut |_| tick())
             .map_err(ListError::Fatal)?;
         tracing::debug!(entries, runs = runs.len(), "listing spilled");
         let region = l.region.take().expect("a spilled listing holds a region");
-        MergeReader::new(space, runs, region).map(Entries::Spilled).map_err(ListError::Fatal)
+        MergeReader::new(space, Lane::Walk, 0, runs, region)
+            .map(Entries::Spilled)
+            .map_err(ListError::Fatal)
     }
 
     /// Descend into `rel`, or refuse it. On `Ok` a frame has been pushed and the
@@ -727,7 +736,7 @@ struct Listing<'a, 'h> {
     space: Option<&'a ScratchSpace<'h>>,
     owner: u64,
     t: Thresholds,
-    buf: Vec<DirEntry>,
+    buf: Vec<Keyed>,
     runs: Vec<RunSpan>,
     region: Option<Region<'a, 'h>>,
     read: usize,
@@ -741,7 +750,7 @@ impl Listing<'_, '_> {
         if self.space.is_some() && self.buf.len() >= self.t.run_entries {
             self.flush()?;
         }
-        self.buf.push(e);
+        self.buf.push(Keyed::plain(e));
         self.read += 1;
         if self.t.tick_entries > 0 && self.read.is_multiple_of(self.t.tick_entries) {
             tick()?;
@@ -756,10 +765,10 @@ impl Listing<'_, '_> {
             return Ok(());
         }
         if self.region.is_none() {
-            self.region = Some(space.begin(self.owner)?);
+            self.region = Some(space.begin(Lane::Walk, self.owner)?);
         }
         sort_entries(&mut self.buf);
-        let run = write_run(space, &self.buf)?;
+        let run = write_run(Sink::Lane(space, Lane::Walk), 0, self.t.merge_buffer, &self.buf)?;
         self.total += run.count;
         self.runs.push(run);
         self.buf.clear();
@@ -1965,6 +1974,16 @@ mod tests {
     }
 
     #[test]
+    fn the_walk_exposes_its_scratch() {
+        let fs = component_order_tree();
+        let space = spilled(&fs, small());
+        let walk = walk_with(&fs, Path::new("/r"), opts(), Some(&space)).unwrap();
+        assert!(std::ptr::eq(walk.scratch().expect("a scratch space"), &space));
+        let bare = walk_with(&fs, Path::new("/r"), opts(), None).unwrap();
+        assert!(bare.scratch().is_none());
+    }
+
+    #[test]
     fn a_spilled_walk_yields_the_same_events_as_an_inline_walk() {
         let fs = component_order_tree();
         for (d, n) in [("/r/d0", 0), ("/r/d9", 9), ("/r/d40", 40)] {
@@ -2004,7 +2023,7 @@ mod tests {
         let want = paths(&fs);
         let space = spilled(&fs, small());
         assert_eq!(spilled_paths(&fs, &space), want);
-        assert_eq!(space.len(), 0);
+        assert_eq!(space.len(Lane::Walk), 0);
     }
 
     #[test]
@@ -2016,15 +2035,15 @@ mod tests {
         files(&fs, "/r", "g", 2);
         let space = spilled(&fs, small());
         let n = spilled_paths(&fs, &space).len();
-        assert_eq!((space.len(), space.physical_len()), (0, 0));
+        assert_eq!((space.len(Lane::Walk), space.physical_len(Lane::Walk)), (0, 0));
         {
             let mut walk = walk_with(&fs, Path::new("/r"), opts(), Some(&space)).unwrap();
             for _ in 0..5 {
                 assert!(walk.next().unwrap().is_ok());
             }
-            assert!(space.len() > 0, "the root's runs are live while the walk is open");
+            assert!(space.len(Lane::Walk) > 0, "the root's runs are live while the walk is open");
         }
-        assert_eq!((space.len(), space.physical_len()), (0, 0));
+        assert_eq!((space.len(Lane::Walk), space.physical_len(Lane::Walk)), (0, 0));
         assert!(n > 5);
     }
 
@@ -2052,7 +2071,7 @@ mod tests {
             assert!(walk.next().is_none());
             assert!(walk.next().is_none());
         }
-        assert_eq!((space.len(), space.physical_len()), (0, 0));
+        assert_eq!((space.len(Lane::Walk), space.physical_len(Lane::Walk)), (0, 0));
     }
 
     fn big_root(n: usize) -> FaultFs {
@@ -2084,7 +2103,7 @@ mod tests {
         assert!(walk.next_with(&mut tick).is_none());
         assert!(walk.next_with(&mut tick).is_none());
         drop(walk);
-        assert_eq!(space.len(), 0);
+        assert_eq!(space.len(Lane::Walk), 0);
     }
 
     #[test]
@@ -2161,7 +2180,7 @@ mod tests {
         assert!(walk.next_with(&mut tick).is_none());
         assert!(walk.next_with(&mut tick).is_none());
         drop(walk);
-        assert_eq!((space.len(), space.physical_len()), (0, 0));
+        assert_eq!((space.len(Lane::Walk), space.physical_len(Lane::Walk)), (0, 0));
         (oks, err)
     }
 
@@ -2215,7 +2234,7 @@ mod tests {
             assert!(walk.next().is_none());
             assert!(walk.next().is_none());
         }
-        assert_eq!((space.len(), space.physical_len()), (0, 0));
+        assert_eq!((space.len(Lane::Walk), space.physical_len(Lane::Walk)), (0, 0));
     }
 
     #[test]
