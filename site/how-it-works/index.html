@@ -1,0 +1,129 @@
+<!doctype html>
+<!--
+ Copyright (c) 2026 Costas Kirgoussios
+
+ This software is licensed under the PolyForm Noncommercial License 1.0.0.
+ You may obtain a copy of the License at:
+ https://polyformproject.org/licenses/noncommercial/1.0.0/
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>How It Works - Flux Architecture &amp; Transfer Pipeline</title>
+  <meta name="description" content="Detailed explanation of Flux's deterministic scanner, bounded discovery streams, advisory checkpoint validation, and kernel acceleration.">
+  <link rel="canonical" href="https://ckir.github.io/flux/how-it-works/">
+  <meta property="og:title" content="How It Works - Flux Architecture &amp; Transfer Pipeline">
+  <meta property="og:description" content="Deterministic scanning, bounded memory queues, and advisory checkpoint validation in Rust.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://ckir.github.io/flux/how-it-works/">
+  <meta property="og:image" content="https://ckir.github.io/flux/assets/og.jpg">
+  <link rel="icon" type="image/svg+xml" href="../assets/flux.svg">
+  <link rel="stylesheet" href="../style.css">
+  <script src="../analytics.js" defer></script>
+  <script src="../script.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <nav class="site-nav" aria-label="Main Navigation">
+    <div class="nav-wrap">
+      <a class="nav-brand" href="../">
+        <img src="../assets/flux.svg" width="28" height="28" alt="Flux">
+        <span>Flux</span>
+      </a>
+      <ul class="nav-links">
+        <li><a href="./" aria-current="page">How It Works</a></li>
+        <li><a href="../products/core/">Crates</a></li>
+        <li><a href="../benchmarks/">Benchmarks</a></li>
+        <li><a href="../docs/">Docs</a></li>
+        <li><a href="../roadmap/">Roadmap</a></li>
+        <li><a href="../community/">Community</a></li>
+        <li><a href="../download/">Download</a></li>
+      </ul>
+      <a class="cta nav-cta" href="../download/" data-analytics-event="download_cta_clicked" data-analytics-props='{"location":"nav"}'>Download Flux</a>
+    </div>
+  </nav>
+
+  <main id="main" class="wrap">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="../">Home</a><span>/</span><span>How It Works</span>
+    </nav>
+
+    <header>
+      <h1>How Flux Architecture Works</h1>
+      <p class="subline">An engineering deep-dive into bounded memory traversal, advisory checkpoint validation, and kernel-accelerated transfers.</p>
+    </header>
+
+    <section>
+      <h2>The Core Dilemma: Memory Exhaustion in Traditional Copiers</h2>
+      <p>Standard filesystem copiers (such as default <code>cp -r</code> or recursive <code>rsync</code>) traverse filesystem trees by loading entire directory hierarchies into heap memory before scheduling transfers. On large enterprise datasets—containing millions of files or deeply nested trees—this approach causes resident RAM to explode proportionally with dataset size, leading to thrashing, out-of-memory (OOM) kills, and non-deterministic ordering.</p>
+      <p>Furthermore, when long-running transfers are interrupted by hardware resets or network disconnects, traditional copiers either recopy entire multi-gigabyte files from scratch or rely on timestamp heuristics that miss corrupted sectors.</p>
+    </section>
+
+    <section>
+      <h2>The Flux Architectural Solution</h2>
+      <p>Flux is designed from the ground up to solve these fundamental flaws through three core architectural tenets:</p>
+      <div class="cards">
+        <div class="card">
+          <h3>1. Bounded Discovery Streams</h3>
+          <p>The scanner runs as an independent generator bounded by backpressure. Directory nodes are discovered, ordered deterministically, filtered, and pushed into a bounded queue. Resident RAM remains strictly capped (typically &lt;64 MiB) whether copying 10 files or 100 million files.</p>
+        </div>
+        <div class="card">
+          <h3>2. Advisory Checkpoint Validation</h3>
+          <p>Large files (64 MiB or greater) are tracked in 64 MiB chunk digests using streaming BLAKE3 hashing. When resuming an interrupted transfer, Flux re-reads the partial file and compares chunk digests against the source. Matching prefixes are preserved; only unverified remainder chunks are recopied.</p>
+        </div>
+        <div class="card">
+          <h3>3. Kernel-Level Zero-Copy Acceleration</h3>
+          <p>Flux detects platform capabilities at runtime and activates direct kernel fastpaths: <code>copy_file_range</code> on modern Linux, <code>clonefile</code> extent cloning on macOS APFS, and ReFS block cloning on Windows, bypassing user-space buffer copies entirely.</p>
+        </div>
+        <div class="card">
+          <h3>4. Hardlink Topology Preservation</h3>
+          <p>Flux discovers inode topologies and replicates hardlink graphs accurately, even when exclusion rules filter out specific branches. Hardlink dependencies are scheduled deterministically so no file is transferred multiple times.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>The 10-Stage Transfer Pipeline</h2>
+      <ol class="pipeline">
+        <li><strong>Source Scanner:</strong> Deterministic lexical directory traversal.</li>
+        <li><strong>Selection &amp; Filtering:</strong> Exclusion patterns, symlink policy evaluation.</li>
+        <li><strong>Bounded Stream:</strong> Backpressured channel with strict memory caps.</li>
+        <li><strong>Topology Planner:</strong> Hardlink graph tracking and inode clustering.</li>
+        <li><strong>Bounded Transfer Queue:</strong> Work-stealing worker queue.</li>
+        <li><strong>Parallel Workers:</strong> Multi-threaded I/O with platform fastpaths.</li>
+        <li><strong>Streaming Hasher:</strong> Incremental BLAKE3 cryptographic verification.</li>
+        <li><strong>Advisory Checkpointer:</strong> 64 MiB chunk validation for resumability.</li>
+        <li><strong>Atomic Committer:</strong> Rename-into-place publication on target filesystems.</li>
+        <li><strong>Reporter:</strong> Structured NDJSON telemetry and terminal progress.</li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>Specifications and Guarantees</h2>
+      <p>For the complete mathematical formalization, read the authoritative design document: <a href="https://github.com/ckir/flux/blob/main/FLUX_FULL_UPDATED_SPEC_V16.md">FLUX_FULL_UPDATED_SPEC_V16.md</a>.</p>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap footer-grid">
+      <img src="../assets/profile.png" width="72" height="72" alt="Flux emblem">
+      <div>
+        <p>Flux &middot; Licensed under <a href="https://github.com/ckir/flux/blob/main/LICENSE">PolyForm Noncommercial 1.0.0</a>.</p>
+        <nav aria-label="Project links">
+          <a href="../">Home</a> | 
+          <a href="../about/">About</a> | 
+          <a href="../pricing/">Pricing</a> | 
+          <a href="../roadmap/">Roadmap</a> | 
+          <a href="../changelog/">Changelog</a> | 
+          <a href="https://github.com/ckir/flux">Repository</a> | 
+          <a href="https://github.com/ckir/flux/issues">Issues</a>
+        </nav>
+        <p class="fine">FastCopy is a trademark of SHIROUZU Hiroaki. Linux is a registered trademark of Linus Torvalds. macOS is a trademark of Apple Inc. Windows is a trademark of Microsoft Corporation. This is an independent open-source project.</p>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

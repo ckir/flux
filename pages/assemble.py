@@ -88,9 +88,6 @@ def assemble(doc: Path, site: Path, template: Path, work: Path) -> None:
     if not site.is_dir():
         raise AssembleError(f"site directory not found: {site}")
     entries = sorted(site.iterdir())
-    for entry in entries:
-        if entry.is_dir():
-            raise AssembleError(f"site must be flat, found directory: {entry.name}")
     if not (site / "index.html").is_file():
         raise AssembleError("site has no index.html")
     doc_names = {p.name for p in doc.iterdir()}
@@ -120,7 +117,13 @@ def assemble(doc: Path, site: Path, template: Path, work: Path) -> None:
             stub.write_text(stub_html(path), encoding="utf-8")
 
     for entry in entries:
-        shutil.copyfile(entry, doc / entry.name)
+        target = doc / entry.name
+        if entry.is_dir():
+            if target.exists():
+                shutil.rmtree(target)
+            shutil.copytree(entry, target)
+        else:
+            shutil.copyfile(entry, target)
 
 
 def verify(doc: Path, site: Path, work: Path) -> list[str]:
@@ -155,13 +158,25 @@ def verify(doc: Path, site: Path, work: Path) -> list[str]:
     if (api / "bench").exists():
         problems.append("unexpected: api/bench must not exist (benchmarks belong at /bench/)")
 
-    for entry in sorted(site.iterdir()) if site.is_dir() else []:
-        label = "landing page" if entry.name == "index.html" else f"site file: {entry.name}"
-        try:
-            if (doc / entry.name).read_bytes() != entry.read_bytes():
-                problems.append(f"{label}: {entry.name} differs from site/{entry.name}")
-        except OSError as e:
-            problems.append(f"{label}: cannot compare {entry.name}: {e}")
+    def _verify_site_entries(site_dir: Path, doc_dir: Path) -> None:
+        for entry in sorted(site_dir.iterdir()):
+            target = doc_dir / entry.name
+            if entry.is_dir():
+                if not target.is_dir():
+                    problems.append(f"site directory missing: {target.relative_to(doc)}")
+                else:
+                    _verify_site_entries(entry, target)
+            else:
+                rel = entry.relative_to(site)
+                label = "landing page" if rel.as_posix() == "index.html" else f"site file: {rel}"
+                try:
+                    if not target.is_file() or target.read_bytes() != entry.read_bytes():
+                        problems.append(f"{label}: {rel} differs from site/{rel}")
+                except OSError as e:
+                    problems.append(f"{label}: cannot compare {rel}: {e}")
+
+    if site.is_dir():
+        _verify_site_entries(site, doc)
     if not (site / "index.html").is_file():
         problems.append("landing page: site/index.html is missing")
     return problems

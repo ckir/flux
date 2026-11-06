@@ -1,0 +1,125 @@
+<!doctype html>
+<!--
+ Copyright (c) 2026 Costas Kirgoussios
+
+ This software is licensed under the PolyForm Noncommercial License 1.0.0.
+ You may obtain a copy of the License at:
+ https://polyformproject.org/licenses/noncommercial/1.0.0/
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Roadmap - Flux Development Milestones</title>
+  <meta name="description" content="Development roadmap, phase progression, completed cuts, and future milestones for the Flux filesystem transfer engine.">
+  <link rel="canonical" href="https://ckir.github.io/flux/roadmap/">
+  <meta property="og:title" content="Roadmap - Flux Development Milestones">
+  <meta property="og:description" content="Phased development roadmap and milestones for Flux.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://ckir.github.io/flux/roadmap/">
+  <meta property="og:image" content="https://ckir.github.io/flux/assets/og.jpg">
+  <link rel="icon" type="image/svg+xml" href="../assets/flux.svg">
+  <link rel="stylesheet" href="../style.css">
+  <script src="../analytics.js" defer></script>
+  <script src="../script.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <nav class="site-nav" aria-label="Main Navigation">
+    <div class="nav-wrap">
+      <a class="nav-brand" href="../">
+        <img src="../assets/flux.svg" width="28" height="28" alt="Flux">
+        <span>Flux</span>
+      </a>
+      <ul class="nav-links">
+        <li><a href="../how-it-works/">How It Works</a></li>
+        <li><a href="../products/core/">Crates</a></li>
+        <li><a href="../benchmarks/">Benchmarks</a></li>
+        <li><a href="../docs/">Docs</a></li>
+        <li><a href="./" aria-current="page">Roadmap</a></li>
+        <li><a href="../community/">Community</a></li>
+        <li><a href="../download/">Download</a></li>
+      </ul>
+      <a class="cta nav-cta" href="../download/" data-analytics-event="download_cta_clicked" data-analytics-props='{"location":"nav"}'>Download Flux</a>
+    </div>
+  </nav>
+
+  <main id="main" class="wrap">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="../">Home</a><span>/</span><span>Roadmap</span>
+    </nav>
+
+    <header>
+      <h1>Flux Development Roadmap</h1>
+      <p class="subline">Structured multi-phase engineering plan delivering correctness-first file transfers.</p>
+    </header>
+
+    <section>
+      <h2>Phase Progression</h2>
+      <div class="cards">
+        <div class="card">
+          <span class="tag">Phase 1 &mdash; Completed</span>
+          <h3>Foundation &amp; Scaffolding</h3>
+          <p>Workspace architecture, 6 decoupled crates, GitHub Actions CI matrix on Linux, macOS, and Windows, cargo test harnesses, and automated release pipeline.</p>
+        </div>
+
+        <div class="card">
+          <span class="tag">Phase 2 &mdash; Completed</span>
+          <h3>Scanner &amp; Bounded Discovery</h3>
+          <p>Deterministic directory traversal, lexically ordered streams, bounded heap resident memory, and exclusion pattern matchers.</p>
+        </div>
+
+        <div class="card">
+          <span class="tag">Phase 3 &mdash; Completed</span>
+          <h3>Topology &amp; Hardlink Planning</h3>
+          <p>Inode graph discovery, hardlink clustering, cycle detection, exclusion-aware topology preservation, and symlink evaluation.</p>
+        </div>
+
+        <div class="card">
+          <span class="tag">Phase 4 &mdash; Completed</span>
+          <h3>Transfer Engine &amp; Fastpaths</h3>
+          <p>Multi-threaded worker pool, Linux <code>copy_file_range</code>, macOS <code>clonefile</code>, Windows ReFS block cloning, and atomic publication.</p>
+        </div>
+
+        <div class="card">
+          <span class="tag">Phase 5 &mdash; Completed</span>
+          <h3>Crash Resiliency &amp; Resumability</h3>
+          <p>Advisory checkpoint validation, BLAKE3 64 MiB chunk hashing, destination locking, partial file prefix re-validation, and safe cleanup.</p>
+        </div>
+
+        <div class="card">
+          <span class="tag">Phase 6 &mdash; Active Development</span>
+          <h3>Verification &amp; Benchmarking</h3>
+          <p><code>flux verify</code> completed; remaining milestones include <code>flux benchmark</code>, multi-source verification, and expanded platform capability matrices.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Cut Ledger and Detailed Milestones</h2>
+      <p>Consult the authoritative cut tracking ledger in the repository: <a href="https://github.com/ckir/flux/blob/main/ROADMAP.md">ROADMAP.md</a>.</p>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap footer-grid">
+      <img src="../assets/profile.png" width="72" height="72" alt="Flux emblem">
+      <div>
+        <p>Flux &middot; Licensed under <a href="https://github.com/ckir/flux/blob/main/LICENSE">PolyForm Noncommercial 1.0.0</a>.</p>
+        <nav aria-label="Project links">
+          <a href="../">Home</a> | 
+          <a href="../about/">About</a> | 
+          <a href="../pricing/">Pricing</a> | 
+          <a href="./">Roadmap</a> | 
+          <a href="../changelog/">Changelog</a> | 
+          <a href="https://github.com/ckir/flux">Repository</a> | 
+          <a href="https://github.com/ckir/flux/issues">Issues</a>
+        </nav>
+        <p class="fine">FastCopy is a trademark of SHIROUZU Hiroaki. Linux is a registered trademark of Linus Torvalds. macOS is a trademark of Apple Inc. Windows is a trademark of Microsoft Corporation. This is an independent open-source project.</p>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

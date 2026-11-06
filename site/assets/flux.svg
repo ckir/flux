@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Flux Logo">
+  <defs>
+    <linearGradient id="flux-cyan" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00f0ff"/>
+      <stop offset="100%" stop-color="#3b82f6"/>
+    </linearGradient>
+    <linearGradient id="flux-glow" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#7000ff" stop-opacity="0.8"/>
+      <stop offset="50%" stop-color="#00f0ff" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#3b82f6" stop-opacity="0.8"/>
+    </linearGradient>
+    <filter id="neon-glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="12" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="soft-glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="24" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect width="512" height="512" rx="96" fill="#05060b"/>
+  <rect width="510" height="510" x="1" y="1" rx="95" fill="none" stroke="#1a1e33" stroke-width="2"/>
+
+  <!-- Background ambient glow -->
+  <circle cx="256" cy="256" r="140" fill="#00f0ff" opacity="0.08" filter="url(#soft-glow)"/>
+  <circle cx="256" cy="256" r="90" fill="#7000ff" opacity="0.1" filter="url(#soft-glow)"/>
+
+  <!-- Topological Flux Loop -->
+  <g filter="url(#neon-glow)" fill="none" stroke-linecap="round">
+    <!-- Outer flow rings -->
+    <path d="M 128,256 C 128,170 180,118 256,118 C 340,118 392,180 392,256 C 392,340 332,394 256,394 C 172,394 128,334 128,256 Z" 
+          stroke="url(#flux-glow)" stroke-width="8" opacity="0.4"/>
+    
+    <!-- Dynamic Infinity / Flow Lines -->
+    <path d="M 150,330 C 200,330 230,190 280,180 C 330,170 360,210 360,260 C 360,310 320,340 275,330 C 220,320 190,180 150,180 C 110,180 100,220 100,256 C 100,295 120,330 150,330 Z" 
+          stroke="url(#flux-cyan)" stroke-width="14" stroke-linejoin="round"/>
+    
+    <!-- Central Verification Core -->
+    <circle cx="256" cy="256" r="16" fill="#00f0ff"/>
+    <circle cx="256" cy="256" r="28" stroke="#3b82f6" stroke-width="3" stroke-dasharray="6,4"/>
+  </g>
+</svg>

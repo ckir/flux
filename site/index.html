@@ -1,22 +1,204 @@
 <!DOCTYPE html>
+<!--
+ Copyright (c) 2026 Costas Kirgoussios
+
+ This software is licensed under the PolyForm Noncommercial License 1.0.0.
+ You may obtain a copy of the License at:
+ https://polyformproject.org/licenses/noncommercial/1.0.0/
+-->
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
   <title>Flux - a safe, topology-aware file copier</title>
   <meta name="description" content="Flux is a filesystem transfer engine written in Rust, built around correctness, bounded memory and resumable copies.">
-  <meta name="color-scheme" content="dark">
+  <link rel="canonical" href="https://ckir.github.io/flux/">
+  <meta property="og:title" content="Flux - a safe, topology-aware file copier">
+  <meta property="og:description" content="High-performance, safe, topology-aware filesystem transfer engine written in Rust. Bounded resident memory and crash-resilient resumability.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://ckir.github.io/flux/">
+  <meta property="og:image" content="https://ckir.github.io/flux/assets/og.jpg">
+  <link rel="icon" type="image/svg+xml" href="./assets/flux.svg">
   <link rel="stylesheet" href="style.css">
+  <script src="analytics.js" defer></script>
+  <script src="script.js" defer></script>
+  <script src="flux-field.js" defer></script>
 </head>
 <body>
   <a class="skip" href="#main">Skip to content</a>
+
+  <nav class="site-nav" aria-label="Main Navigation">
+    <div class="nav-wrap">
+      <a class="nav-brand" href="./">
+        <img src="./assets/flux.svg" width="28" height="28" alt="Flux">
+        <span>Flux</span>
+      </a>
+      <ul class="nav-links">
+        <li><a href="./how-it-works/">How It Works</a></li>
+        <li><a href="./products/core/">Crates</a></li>
+        <li><a href="./benchmarks/">Benchmarks</a></li>
+        <li><a href="./docs/">Docs</a></li>
+        <li><a href="./roadmap/">Roadmap</a></li>
+        <li><a href="./community/">Community</a></li>
+        <li><a href="./download/">Download</a></li>
+      </ul>
+      <a class="cta nav-cta" href="./download/" data-analytics-event="download_cta_clicked" data-analytics-props='{"location":"nav"}'>Download Flux</a>
+    </div>
+  </nav>
+
   <header class="hero">
     <canvas id="flux-field" aria-hidden="true"></canvas>
     <div class="wrap hero-inner">
       <p class="brand">Flux</p>
       <p class="promise"><strong>Correctness before performance.</strong></p>
-      <h1>See how Flux compares with <code>cp</code> and <code>rsync</code></h1>
-      <p class="lead">A safe, topology-aware filesystem transfer engine written in Rust, designed around correctness, bounded resident memory, resumability and atomic publication where the filesystem allows it.</p>
+      <h1>A safe, topology-aware filesystem transfer engine</h1>
+      <p class="subline">High throughput, bounded resident memory, and crash-resilient resumability in Rust.</p>
+      <p class="lead">Designed around deterministic traversal, hardlink topology preservation, advisory checkpoint validation, and atomic publication where the filesystem allows it.</p>
+
+      <ol class="stages" aria-label="Transfer pipeline stages">
+        <li class="engine-stage"><span class="stage">1. Scan</span><span class="role">Deterministic Traversal</span><code>flux-core</code></li>
+        <li class="engine-stage"><span class="stage">2. Plan</span><span class="role">Topology &amp; Hardlinks</span><code>flux-core</code></li>
+        <li class="engine-stage"><span class="stage">3. Stream</span><span class="role">Bounded Queue</span><code>flux-core</code></li>
+        <li class="worker-stage"><span class="stage">4. Transfer</span><span class="role">OS Kernel Fastpaths</span><code>flux-platform</code></li>
+        <li class="worker-stage"><span class="stage">5. Hash</span><span class="role">BLAKE3 64 MiB Checkpoints</span><code>flux-hash</code></li>
+        <li class="engine-stage"><span class="stage">6. Commit</span><span class="role">Atomic Publication</span><code>flux-fs</code></li>
+      </ol>
+      <p class="legend">Cyan highlights deterministic traversal, topology planning and verification; blue highlights parallel kernel workers and streaming hashing.</p>
+
+      <div class="hero-actions">
+        <a class="button" href="#download" data-analytics-event="download_cta_clicked" data-analytics-props='{"location":"hero"}'>Download Flux</a>
+        <a class="cta-secondary" href="#quickstart">Quickstart</a>
+        <a class="cta-secondary" href="#benchmarks">View Benchmarks</a>
+      </div>
+    </div>
+  </header>
+
+  <main id="main" class="wrap">
+    <section id="demo" aria-label="Terminal Transfer Demo">
+      <div class="demo-window">
+        <div class="demo-header">
+          <span class="demo-dot red"></span>
+          <span class="demo-dot yellow"></span>
+          <span class="demo-dot green"></span>
+          <span class="demo-title">flux transfer engine — bounded memory &amp; crash resiliency</span>
+        </div>
+        <div class="demo-grid">
+          <div class="demo-pane primary-pane">
+            <span class="pane-title">Live Copy: 1.4M Files / 2.4 TB Transfer</span>
+            <code>$ flux copy ./production-dataset /mnt/backup --resume</code><br>
+            <code>[SCAN] 1,482,910 files discovered (2.4 TB) | RAM: 58.2 MB (bounded)</code><br>
+            <code>[TOPOLOGY] Preserved 14,208 hardlink inodes, 0 duplicate transfers</code><br>
+            <code>[WORKERS] 16 workers | copy_file_range (Linux fastpath active)</code><br>
+            <code>[HASH] BLAKE3 streaming verification: 1,482,910/1,482,910 valid</code><br>
+            <code>[COMMIT] Atomic publication complete | 0 errors | Peak RAM: 62.4 MB</code>
+          </div>
+          <div class="demo-pane secondary-pane">
+            <span class="pane-title">Crash Recovery: Advisory Checkpoint Validation</span>
+            <code>$ flux copy --resume ./production-dataset /mnt/backup</code><br>
+            <code>[LOCK] Acquired exclusive destination lock (stale cleanup OK)</code><br>
+            <code>[RESUME] Interrupted run detected at 1.8 TB / 2.4 TB</code><br>
+            <code>[CHECKPOINT] Validating advisory 64 MiB chunk digests against source...</code><br>
+            <code>[CHECKPOINT] 1,120,400 matching chunks confirmed -&gt; 0 recopied</code><br>
+            <code>[DONE] 100% integrity verified. Publication committed atomically.</code>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="values" aria-labelledby="values-h">
+      <h2 id="values-h">Why Flux?</h2>
+      <ul class="value-grid">
+        <li class="value-card">
+          <h3>Correctness Before Performance</h3>
+          <p>Files are never silently corrupted or half-written. Destination locking, streaming BLAKE3 verification, and atomic publication guarantee absolute data integrity.</p>
+        </li>
+        <li class="value-card">
+          <h3>Strict Bounded Resident RAM</h3>
+          <p>Traditional copiers blow up resident memory when scanning millions of files or deep trees. Flux guarantees an O(1) resident RAM footprint with bounded discovery streams.</p>
+        </li>
+        <li class="value-card">
+          <h3>Topology-Aware &amp; Resumable</h3>
+          <p>Preserves hardlink topologies accurately, even across filtered subsets. If interrupted, 64 MiB advisory checkpoints continue from proven prefixes without recopying matching data.</p>
+        </li>
+      </ul>
+    </section>
+
+    <section id="how" aria-labelledby="how-h">
+      <h2 id="how-h">How it works</h2>
+      <p>Flux is inspired by FastCopy, but engineered on a modern Rust architecture designed around correctness, bounded resident memory, persistent operation state, deterministic traversal, resumability, and filesystem-native acceleration.</p>
+      <p>Traditional file copy tools recursively load entire directory hierarchies into RAM, creating unbounded memory consumption and unpredictable behavior when traversing millions of files. Flux replaces this with bounded streams and backpressured worker queues, maintaining a steady, bounded memory envelope regardless of dataset size.</p>
+      <p>When transferring large files or interrupted workloads, Flux protects your data with cryptographic checkpoints:</p>
+      <blockquote data-spec-quote="resume-spec">
+        <p>in a tree copy, a file of 64 MiB or more continues after the longest leading run of chunks whose digests match on both the source and the destination, and everything else is recopied; a single-file copy of 64 MiB or more continues a half-copied file from its proven prefix (the partial is re-read and hashed against the source); under --durability=normal a checkpoint is advisory and is validated against the data before it is trusted</p>
+      </blockquote>
+      <p>For an in-depth stage-by-stage architecture breakdown, explore <a href="./how-it-works/">How Flux Architecture Works</a> or read the authoritative specification in the repository: <a href="https://github.com/ckir/flux/blob/main/FLUX_FULL_UPDATED_SPEC_V16.md">FLUX_FULL_UPDATED_SPEC_V16.md</a>.</p>
+      <img class="banner" src="./assets/banner.webp" width="1670" height="941" alt="Flux high-throughput topology-aware transfer streams" loading="lazy">
+    </section>
+
+    <section id="pipeline" aria-labelledby="pipe-h">
+      <h2 id="pipe-h">The Transfer Pipeline</h2>
+      <p>Every transfer operation flows through a 10-stage bounded pipeline that decouples directory scanning from physical I/O workers:</p>
+      <ol class="pipeline">
+        <li>Source</li>
+        <li>Deterministic scanner</li>
+        <li>Selection / filtering</li>
+        <li>Bounded discovery stream</li>
+        <li>Topology + planning state</li>
+        <li>Bounded transfer queue</li>
+        <li>Parallel workers</li>
+        <li>Streaming hash / verification</li>
+        <li>Commit / atomic rename</li>
+        <li>Report</li>
+      </ol>
+    </section>
+
+    <section id="products" aria-labelledby="products-h">
+      <h2 id="products-h">Workspace Crates</h2>
+      <p>Flux is composed of six modular, decoupled Rust crates in a single cargo workspace:</p>
+      <ul class="cards three-col">
+        <li class="card">
+          <h3>flux-core</h3>
+          <p class="tag">Engine Core</p>
+          <p>Deterministic scanner, selection filtering, bounded discovery stream, topology planner, scheduler, transfer queue, parallel workers, and resume engine.</p>
+          <p><a href="./products/core/">Crate details</a> | <a href="api/flux_core/index.html">API rustdoc</a></p>
+        </li>
+        <li class="card">
+          <h3>flux-fs</h3>
+          <p class="tag">Filesystem Layer</p>
+          <p>Portable filesystem abstractions, destination locking, atomic directory publication, and capability detection.</p>
+          <p><a href="./products/core/">Crate details</a> | <a href="api/flux_fs/index.html">API rustdoc</a></p>
+        </li>
+        <li class="card">
+          <h3>flux-platform</h3>
+          <p class="tag">OS Fastpaths</p>
+          <p>Kernel-level copy acceleration: Linux <code>copy_file_range</code> and <code>splice</code>, macOS <code>clonefile</code>, Windows ReFS block cloning.</p>
+          <p><a href="./products/core/">Crate details</a> | <a href="api/flux_platform/index.html">API rustdoc</a></p>
+        </li>
+        <li class="card">
+          <h3>flux-hash</h3>
+          <p class="tag">Cryptographic Hash</p>
+          <p>High-throughput BLAKE3 streaming verification and chunk-level advisory checkpoint digests.</p>
+          <p><a href="./products/core/">Crate details</a> | <a href="api/flux_hash/index.html">API rustdoc</a></p>
+        </li>
+        <li class="card">
+          <h3>flux-ui</h3>
+          <p class="tag">Terminal Presentation</p>
+          <p>Responsive terminal progress bars, human-readable status, and machine-readable NDJSON streaming output.</p>
+          <p><a href="./products/core/">Crate details</a> | <a href="api/flux_ui/index.html">API rustdoc</a></p>
+        </li>
+        <li class="card">
+          <h3>flux-cli</h3>
+          <p class="tag">CLI Dispatcher</p>
+          <p>Command-line argument parsing and command dispatch; produces the unified <code>flux</code> binary.</p>
+          <p><a href="./products/core/">Crate details</a> | <a href="api/flux/index.html">API rustdoc</a></p>
+        </li>
+      </ul>
+    </section>
+
+    <section id="benchmarks" aria-labelledby="benchmarks-h">
+      <h2 id="benchmarks-h">Performance &amp; Benchmarks</h2>
+      <p>See how Flux compares with <code>cp</code> and <code>rsync</code> on Linux and macOS, and <code>robocopy</code> on Windows.</p>
 
       <figure class="card chart-card">
         <div class="chart-scroll" tabindex="0" role="region" aria-label="Latest benchmark chart">
@@ -28,14 +210,9 @@
         </figcaption>
       </figure>
 
-      <div class="cta">
-        <a class="button" href="#download">Download Flux</a>
-        <p class="cta-note">Licensed under <a href="https://github.com/ckir/flux/blob/main/LICENSE">PolyForm Noncommercial 1.0.0</a>. Free for noncommercial use only.</p>
-      </div>
-    </div>
-  </header>
+      <p>Explore comprehensive methodology, test environments, and historical charts on our dedicated <a href="./benchmarks/">Benchmarks Portal</a>.</p>
+    </section>
 
-  <main id="main" class="wrap">
     <section id="download" aria-labelledby="download-h">
       <h2 id="download-h">Download</h2>
       <p>Pick the build for your system. Each link fetches the asset from the latest GitHub release.</p>
@@ -74,6 +251,17 @@ Expand-Archive flux-x86_64-pc-windows-msvc.zip . # Windows (PowerShell); or: unz
       <pre class="code" tabindex="0" aria-label="Resume command for Windows"><code>.\flux.exe copy --resume .\photos D:\backup</code></pre>
     </section>
 
+    <section id="install" aria-labelledby="install-h">
+      <h2 id="install-h">Install Commands</h2>
+      <p>Install Flux via terminal package fetch or build from source using Cargo:</p>
+      <ul class="commands">
+        <li><code data-cmd>curl -fsSL https://github.com/ckir/flux/releases/latest/download/flux-x86_64-unknown-linux-gnu.tar.gz | tar -xz</code> <button type="button" data-copy="curl -fsSL https://github.com/ckir/flux/releases/latest/download/flux-x86_64-unknown-linux-gnu.tar.gz | tar -xz" aria-label="Copy command: download Linux binary">Copy</button></li>
+        <li><code data-cmd>cargo install --git https://github.com/ckir/flux flux-cli</code> <button type="button" data-copy="cargo install --git https://github.com/ckir/flux flux-cli" aria-label="Copy command: install with cargo">Copy</button></li>
+      </ul>
+      <p id="copy-status" class="sr-only" role="status"></p>
+      <p>These commands work on Linux, macOS and Windows (via PowerShell or WSL).</p>
+    </section>
+
     <section id="goals" aria-labelledby="goals-h">
       <h2 id="goals-h">Goals</h2>
       <ul class="goals">
@@ -87,22 +275,6 @@ Expand-Archive flux-x86_64-pc-windows-msvc.zip . # Windows (PowerShell); or: unz
         <li>Clear human and machine-readable (<code>--json</code>) reporting</li>
         <li>Cross-platform behaviour on Linux, macOS and Windows with explicit capability detection</li>
       </ul>
-    </section>
-
-    <section id="pipeline" aria-labelledby="pipe-h">
-      <h2 id="pipe-h">Pipeline</h2>
-      <ol class="pipeline">
-        <li>Source</li>
-        <li>Deterministic scanner</li>
-        <li>Selection / filtering</li>
-        <li>Bounded discovery stream</li>
-        <li>Topology + planning state</li>
-        <li>Bounded transfer queue</li>
-        <li>Parallel workers</li>
-        <li>Streaming hash / verification</li>
-        <li>Commit / atomic rename</li>
-        <li>Report</li>
-      </ol>
     </section>
 
     <section id="trend" aria-labelledby="trend-h">
@@ -123,6 +295,17 @@ Expand-Archive flux-x86_64-pc-windows-msvc.zip . # Windows (PowerShell); or: unz
       </ul>
     </section>
 
+    <section id="guides" aria-labelledby="guides-h">
+      <h2 id="guides-h">Guides &amp; Resources</h2>
+      <p>Explore comprehensive technical documentation in our <a href="./docs/">Documentation Portal</a> or access authoritative repository references:</p>
+      <ul>
+        <li><a href="https://github.com/ckir/flux/blob/main/FLUX_FULL_UPDATED_SPEC_V16.md">Authoritative Architectural Specification (V16)</a></li>
+        <li><a href="https://github.com/ckir/flux/blob/main/ROADMAP.md">Development Roadmap &amp; Cut Ledger</a></li>
+        <li><a href="https://github.com/ckir/flux/blob/main/LICENSE">PolyForm Noncommercial License 1.0.0</a></li>
+        <li><a href="./docs/">Full Documentation Index</a></li>
+      </ul>
+    </section>
+
     <section id="status" aria-labelledby="status-h">
       <h2 id="status-h">Status</h2>
       <div class="card">
@@ -131,11 +314,31 @@ Expand-Archive flux-x86_64-pc-windows-msvc.zip . # Windows (PowerShell); or: unz
         <p>Read the <a href="https://github.com/ckir/flux/blob/main/ROADMAP.md">roadmap</a>, the <a href="https://github.com/ckir/flux/blob/main/FLUX_FULL_UPDATED_SPEC_V16.md">specification</a> and the <a href="https://github.com/ckir/flux/blob/main/LICENSE">licence</a>, or browse the <a href="https://github.com/ckir/flux">source on GitHub</a>.</p>
       </div>
     </section>
+
+    <section id="eval-invite" aria-labelledby="eval-h">
+      <h2 id="eval-h">Join the Evaluation</h2>
+      <p>Flux is free for personal, academic, and noncommercial evaluation under the PolyForm Noncommercial 1.0.0 license. Evaluate the transfer engine on your datasets or request commercial pilot information.</p>
+      <p><a class="cta" href="./download/" data-analytics-event="eval_cta_clicked" data-analytics-props='{"location":"eval_section"}'>Explore Download &amp; Evaluation</a></p>
+    </section>
   </main>
 
-  <footer class="wrap">
-    <p>Flux &middot; PolyForm Noncommercial 1.0.0</p>
+  <footer>
+    <div class="wrap footer-grid">
+      <img src="./assets/profile.png" width="72" height="72" alt="Flux emblem">
+      <div>
+        <p>Flux &middot; Licensed under <a href="https://github.com/ckir/flux/blob/main/LICENSE">PolyForm Noncommercial 1.0.0</a>.</p>
+        <nav aria-label="Project links">
+          <a href="./">Home</a> | 
+          <a href="./about/">About</a> | 
+          <a href="./pricing/">Pricing</a> | 
+          <a href="./roadmap/">Roadmap</a> | 
+          <a href="./changelog/">Changelog</a> | 
+          <a href="https://github.com/ckir/flux">Repository</a> | 
+          <a href="https://github.com/ckir/flux/issues">Issues</a>
+        </nav>
+        <p class="fine">FastCopy is a trademark of SHIROUZU Hiroaki. Linux is a registered trademark of Linus Torvalds. macOS is a trademark of Apple Inc. Windows is a trademark of Microsoft Corporation. This is an independent open-source project, not affiliated with, endorsed by, or sponsored by Linus Torvalds, Apple, Microsoft, or the FastCopy project.</p>
+      </div>
+    </div>
   </footer>
-  <script src="flux-field.js" defer></script>
 </body>
 </html>

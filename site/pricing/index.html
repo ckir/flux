@@ -1,0 +1,128 @@
+<!doctype html>
+<!--
+ Copyright (c) 2026 Costas Kirgoussios
+
+ This software is licensed under the PolyForm Noncommercial License 1.0.0.
+ You may obtain a copy of the License at:
+ https://polyformproject.org/licenses/noncommercial/1.0.0/
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Pricing &amp; Licensing - Flux Dual-Edition Strategy</title>
+  <meta name="description" content="Overview of Flux's Community and Commercial editions. Free noncommercial evaluation under PolyForm Noncommercial 1.0.0.">
+  <link rel="canonical" href="https://ckir.github.io/flux/pricing/">
+  <meta property="og:title" content="Pricing &amp; Licensing - Flux Dual-Edition Strategy">
+  <meta property="og:description" content="Community vs Commercial licensing for Flux.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://ckir.github.io/flux/pricing/">
+  <meta property="og:image" content="https://ckir.github.io/flux/assets/og.jpg">
+  <link rel="icon" type="image/svg+xml" href="../assets/flux.svg">
+  <link rel="stylesheet" href="../style.css">
+  <script src="../analytics.js" defer></script>
+  <script src="../script.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <nav class="site-nav" aria-label="Main Navigation">
+    <div class="nav-wrap">
+      <a class="nav-brand" href="../">
+        <img src="../assets/flux.svg" width="28" height="28" alt="Flux">
+        <span>Flux</span>
+      </a>
+      <ul class="nav-links">
+        <li><a href="../how-it-works/">How It Works</a></li>
+        <li><a href="../products/core/">Crates</a></li>
+        <li><a href="../benchmarks/">Benchmarks</a></li>
+        <li><a href="../docs/">Docs</a></li>
+        <li><a href="../roadmap/">Roadmap</a></li>
+        <li><a href="../community/">Community</a></li>
+        <li><a href="../download/">Download</a></li>
+      </ul>
+      <a class="cta nav-cta" href="../download/" data-analytics-event="download_cta_clicked" data-analytics-props='{"location":"nav"}'>Download Flux</a>
+    </div>
+  </nav>
+
+  <main id="main" class="wrap">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="../">Home</a><span>/</span><span>Pricing</span>
+    </nav>
+
+    <header>
+      <h1>Licensing &amp; Editions</h1>
+      <p class="subline">Sustainable open-core engineering with transparent, noncommercial community access.</p>
+    </header>
+
+    <section>
+      <div class="note">
+        <p><strong>Licensing Notice:</strong> Flux is licensed under the <a href="https://github.com/ckir/flux/blob/main/LICENSE">PolyForm Noncommercial License 1.0.0</a>. Free for noncommercial evaluation, personal use, and open-source development. Commercial use is not permitted without a commercial license.</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>Editions Comparison</h2>
+      <div class="cards">
+        <div class="card">
+          <span class="tag">Community Edition</span>
+          <h3>Noncommercial / Open Evaluation</h3>
+          <p>Built for individual engineers, researchers, students, and open-source contributors.</p>
+          <ul>
+            <li>Full transfer engine (<code>flux copy</code>, <code>flux verify</code>, <code>flux cleanup</code>).</li>
+            <li>Kernel fastpaths (<code>copy_file_range</code>, <code>clonefile</code>, ReFS cloning).</li>
+            <li>Advisory checkpointing &amp; 64 MiB resume verification.</li>
+            <li>Hardlink topology preservation.</li>
+            <li>Structured NDJSON machine reporting.</li>
+            <li>Free for noncommercial use under PolyForm Noncommercial 1.0.0.</li>
+          </ul>
+          <p><a class="button" href="../download/">Download Community Binary</a></p>
+        </div>
+
+        <div class="card">
+          <span class="tag">Commercial Edition</span>
+          <h3>Enterprise / Commercial Pilot</h3>
+          <p>Designed for production infrastructure, enterprise backup systems, and commercial data migration.</p>
+          <ul>
+            <li>Commercial deployment rights (exempt from noncommercial restriction).</li>
+            <li>Priority engineering support &amp; kernel optimization consulting.</li>
+            <li>Custom platform capability integrations &amp; storage appliances.</li>
+            <li>Signed binary distributions &amp; verified SBOMs.</li>
+            <li>Enterprise SLA &amp; regression guarantees.</li>
+          </ul>
+          <p><a class="cta-secondary" href="../download/">Register for Commercial Pilot</a></p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Frequently Asked Questions</h2>
+      <h3>Can I use Flux to back up my personal computer?</h3>
+      <p>Yes. Personal backups, non-profit academic research, and hobbyist projects are fully permitted under PolyForm Noncommercial 1.0.0.</p>
+
+      <h3>Can our company evaluate Flux on internal test datasets?</h3>
+      <p>Evaluation is permitted for testing and benchmarking purposes. Production deployments for commercial operations require a commercial license agreement.</p>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap footer-grid">
+      <img src="../assets/profile.png" width="72" height="72" alt="Flux emblem">
+      <div>
+        <p>Flux &middot; Licensed under <a href="https://github.com/ckir/flux/blob/main/LICENSE">PolyForm Noncommercial 1.0.0</a>.</p>
+        <nav aria-label="Project links">
+          <a href="../">Home</a> | 
+          <a href="../about/">About</a> | 
+          <a href="./" aria-current="page">Pricing</a> | 
+          <a href="../roadmap/">Roadmap</a> | 
+          <a href="../changelog/">Changelog</a> | 
+          <a href="https://github.com/ckir/flux">Repository</a> | 
+          <a href="https://github.com/ckir/flux/issues">Issues</a>
+        </nav>
+        <p class="fine">FastCopy is a trademark of SHIROUZU Hiroaki. Linux is a registered trademark of Linus Torvalds. macOS is a trademark of Apple Inc. Windows is a trademark of Microsoft Corporation. This is an independent open-source project.</p>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

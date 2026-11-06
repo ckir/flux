@@ -1,0 +1,141 @@
+<!doctype html>
+<!--
+ Copyright (c) 2026 Costas Kirgoussios
+
+ This software is licensed under the PolyForm Noncommercial License 1.0.0.
+ You may obtain a copy of the License at:
+ https://polyformproject.org/licenses/noncommercial/1.0.0/
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Workspace Crates - Flux Architecture Modules</title>
+  <meta name="description" content="Technical overview of the 6 core Rust crates comprising Flux: flux-core, flux-fs, flux-platform, flux-hash, flux-ui, and flux-cli.">
+  <link rel="canonical" href="https://ckir.github.io/flux/products/core/">
+  <meta property="og:title" content="Workspace Crates - Flux Architecture Modules">
+  <meta property="og:description" content="Modular Rust crates powering Flux's bounded-memory filesystem transfer engine.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://ckir.github.io/flux/products/core/">
+  <meta property="og:image" content="https://ckir.github.io/flux/assets/og.jpg">
+  <link rel="icon" type="image/svg+xml" href="../../assets/flux.svg">
+  <link rel="stylesheet" href="../../style.css">
+  <script src="../../analytics.js" defer></script>
+  <script src="../../script.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <nav class="site-nav" aria-label="Main Navigation">
+    <div class="nav-wrap">
+      <a class="nav-brand" href="../../">
+        <img src="../../assets/flux.svg" width="28" height="28" alt="Flux">
+        <span>Flux</span>
+      </a>
+      <ul class="nav-links">
+        <li><a href="../../how-it-works/">How It Works</a></li>
+        <li><a href="./" aria-current="page">Crates</a></li>
+        <li><a href="../../benchmarks/">Benchmarks</a></li>
+        <li><a href="../../docs/">Docs</a></li>
+        <li><a href="../../roadmap/">Roadmap</a></li>
+        <li><a href="../../community/">Community</a></li>
+        <li><a href="../../download/">Download</a></li>
+      </ul>
+      <a class="cta nav-cta" href="../../download/" data-analytics-event="download_cta_clicked" data-analytics-props='{"location":"nav"}'>Download Flux</a>
+    </div>
+  </nav>
+
+  <main id="main" class="wrap">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="../../">Home</a><span>/</span><span>Products</span><span>/</span><span>Workspace Crates</span>
+    </nav>
+
+    <header>
+      <h1>Flux Workspace Crates</h1>
+      <p class="subline">A clean, decoupled Rust architecture engineered for modularity, strict bounds, and zero unnecessary dependencies.</p>
+    </header>
+
+    <section>
+      <h2>Architecture &amp; Crate Boundaries</h2>
+      <p>Flux is organized into six purpose-built crates. Every crate enforces strict separation of concerns, ensuring high testability and deterministic runtime behavior.</p>
+
+      <div class="cards">
+        <div class="card">
+          <span class="tag">Engine Core</span>
+          <h3>flux-core</h3>
+          <p>The central orchestration engine. Implements the deterministic directory scanner, selection and exclusion filters, bounded discovery stream, topology planner, scheduler, transfer queue, parallel workers, and the advisory resume engine.</p>
+          <p><a href="../../api/flux_core/index.html">flux-core Rustdoc</a></p>
+        </div>
+
+        <div class="card">
+          <span class="tag">Filesystem Layer</span>
+          <h3>flux-fs</h3>
+          <p>Portable filesystem abstractions. Provides destination directory locking, atomic file and directory replacement, capability detection (sparse files, extended attributes), and safe directory cleanup.</p>
+          <p><a href="../../api/flux_fs/index.html">flux-fs Rustdoc</a></p>
+        </div>
+
+        <div class="card">
+          <span class="tag">Platform Acceleration</span>
+          <h3>flux-platform</h3>
+          <p>OS-specific kernel syscall interfaces and zero-copy fastpaths. Implements <code>copy_file_range</code> and <code>splice</code> on Linux, <code>clonefile</code> and APFS extent cloning on macOS, and ReFS block cloning on Windows.</p>
+          <p><a href="../../api/flux_platform/index.html">flux-platform Rustdoc</a></p>
+        </div>
+
+        <div class="card">
+          <span class="tag">Cryptographic Hash</span>
+          <h3>flux-hash</h3>
+          <p>Streaming cryptographic integrity engine powered by BLAKE3. Manages chunk-level advisory checkpoint digests, incremental stream hashing, and verification audits.</p>
+          <p><a href="../../api/flux_hash/index.html">flux-hash Rustdoc</a></p>
+        </div>
+
+        <div class="card">
+          <span class="tag">User Interface</span>
+          <h3>flux-ui</h3>
+          <p>Interactive terminal progress and output formatting. Provides smooth, high-fps terminal progress bars, human-readable status summaries, and machine-readable structured NDJSON output streams.</p>
+          <p><a href="../../api/flux_ui/index.html">flux-ui Rustdoc</a></p>
+        </div>
+
+        <div class="card">
+          <span class="tag">CLI Dispatcher</span>
+          <h3>flux-cli</h3>
+          <p>Command-line driver and entrypoint. Parses user CLI flags, runs capability probes, dispatches <code>flux copy</code>, <code>flux verify</code>, and <code>flux cleanup</code> commands, and manages process exit codes.</p>
+          <p><a href="../../api/flux/index.html">flux-cli Rustdoc</a></p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Contributor API Documentation</h2>
+      <p>Rustdoc documentation for each crate includes private items to support open-source contributors and security auditors:</p>
+      <ul>
+        <li><a href="../../api/flux_core/index.html"><code>flux-core</code> API Documentation</a></li>
+        <li><a href="../../api/flux_fs/index.html"><code>flux-fs</code> API Documentation</a></li>
+        <li><a href="../../api/flux_platform/index.html"><code>flux-platform</code> API Documentation</a></li>
+        <li><a href="../../api/flux_hash/index.html"><code>flux-hash</code> API Documentation</a></li>
+        <li><a href="../../api/flux_ui/index.html"><code>flux-ui</code> API Documentation</a></li>
+        <li><a href="../../api/flux/index.html"><code>flux-cli</code> API Documentation</a></li>
+      </ul>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap footer-grid">
+      <img src="../../assets/profile.png" width="72" height="72" alt="Flux emblem">
+      <div>
+        <p>Flux &middot; Licensed under <a href="https://github.com/ckir/flux/blob/main/LICENSE">PolyForm Noncommercial 1.0.0</a>.</p>
+        <nav aria-label="Project links">
+          <a href="../../">Home</a> | 
+          <a href="../../about/">About</a> | 
+          <a href="../../pricing/">Pricing</a> | 
+          <a href="../../roadmap/">Roadmap</a> | 
+          <a href="../../changelog/">Changelog</a> | 
+          <a href="https://github.com/ckir/flux">Repository</a> | 
+          <a href="https://github.com/ckir/flux/issues">Issues</a>
+        </nav>
+        <p class="fine">FastCopy is a trademark of SHIROUZU Hiroaki. Linux is a registered trademark of Linus Torvalds. macOS is a trademark of Apple Inc. Windows is a trademark of Microsoft Corporation. This is an independent open-source project.</p>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

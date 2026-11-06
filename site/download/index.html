@@ -1,0 +1,163 @@
+<!doctype html>
+<!--
+ Copyright (c) 2026 Costas Kirgoussios
+
+ This software is licensed under the PolyForm Noncommercial License 1.0.0.
+ You may obtain a copy of the License at:
+ https://polyformproject.org/licenses/noncommercial/1.0.0/
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Download &amp; Evaluation - Flux Official Releases</title>
+  <meta name="description" content="Download Flux pre-compiled binaries for Linux, macOS, and Windows. Checksum verification and evaluation registration.">
+  <link rel="canonical" href="https://ckir.github.io/flux/download/">
+  <meta property="og:title" content="Download &amp; Evaluation - Flux Official Releases">
+  <meta property="og:description" content="Official Flux release binaries and evaluation registration.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://ckir.github.io/flux/download/">
+  <meta property="og:image" content="https://ckir.github.io/flux/assets/og.jpg">
+  <link rel="icon" type="image/svg+xml" href="../assets/flux.svg">
+  <link rel="stylesheet" href="../style.css">
+  <script src="../analytics.js" defer></script>
+  <script src="../script.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <nav class="site-nav" aria-label="Main Navigation">
+    <div class="nav-wrap">
+      <a class="nav-brand" href="../">
+        <img src="../assets/flux.svg" width="28" height="28" alt="Flux">
+        <span>Flux</span>
+      </a>
+      <ul class="nav-links">
+        <li><a href="../how-it-works/">How It Works</a></li>
+        <li><a href="../products/core/">Crates</a></li>
+        <li><a href="../benchmarks/">Benchmarks</a></li>
+        <li><a href="../docs/">Docs</a></li>
+        <li><a href="../roadmap/">Roadmap</a></li>
+        <li><a href="../community/">Community</a></li>
+        <li><a href="./" aria-current="page">Download</a></li>
+      </ul>
+      <a class="cta nav-cta" href="./" data-analytics-event="download_cta_clicked" data-analytics-props='{"location":"nav"}'>Download Flux</a>
+    </div>
+  </nav>
+
+  <main id="main" class="wrap">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="../">Home</a><span>/</span><span>Download</span>
+    </nav>
+
+    <header>
+      <h1>Download &amp; Evaluation</h1>
+      <p class="subline">Pre-compiled standalone binaries for Linux, macOS, and Windows.</p>
+    </header>
+
+    <section>
+      <h2>Official Release Binaries</h2>
+      <p>Pick the package for your architecture. Every release asset is built in clean GitHub Actions runners and cryptographically hashed:</p>
+
+      <div class="card table-scroll" tabindex="0" role="region" aria-label="Download matrix">
+        <table>
+          <thead>
+            <tr><th scope="col">Operating System</th><th scope="col">Architecture</th><th scope="col">Release Package</th></tr>
+          </thead>
+          <tbody>
+            <tr><th scope="row">Linux</th><td>x86_64</td><td><a href="https://github.com/ckir/flux/releases/latest/download/flux-x86_64-unknown-linux-gnu.tar.gz">flux-x86_64-unknown-linux-gnu.tar.gz</a></td></tr>
+            <tr><th scope="row">Linux</th><td>aarch64</td><td><a href="https://github.com/ckir/flux/releases/latest/download/flux-aarch64-unknown-linux-gnu.tar.gz">flux-aarch64-unknown-linux-gnu.tar.gz</a></td></tr>
+            <tr><th scope="row">macOS</th><td>Intel (x86_64)</td><td><a href="https://github.com/ckir/flux/releases/latest/download/flux-x86_64-apple-darwin.tar.gz">flux-x86_64-apple-darwin.tar.gz</a></td></tr>
+            <tr><th scope="row">macOS</th><td>Apple silicon (aarch64)</td><td><a href="https://github.com/ckir/flux/releases/latest/download/flux-aarch64-apple-darwin.tar.gz">flux-aarch64-apple-darwin.tar.gz</a></td></tr>
+            <tr><th scope="row">Windows</th><td>x86_64</td><td><a href="https://github.com/ckir/flux/releases/latest/download/flux-x86_64-pc-windows-msvc.zip">flux-x86_64-pc-windows-msvc.zip</a></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>View all past releases and release notes on <a href="https://github.com/ckir/flux/releases/latest">GitHub Releases</a>.</p>
+    </section>
+
+    <section>
+      <h2>Installation &amp; Extraction</h2>
+      <h3>Linux &amp; macOS</h3>
+      <pre class="code" tabindex="0" aria-label="Extract on Linux and macOS"><code>tar -xzf flux-x86_64-unknown-linux-gnu.tar.gz
+chmod +x flux
+./flux --version</code></pre>
+
+      <h3>Windows (PowerShell)</h3>
+      <pre class="code" tabindex="0" aria-label="Extract on Windows"><code>Expand-Archive flux-x86_64-pc-windows-msvc.zip .
+.\flux.exe --version</code></pre>
+      <p class="note">The binaries are not code-signed, so macOS Gatekeeper or Windows SmartScreen may warn the first time you run one.</p>
+    </section>
+
+    <section>
+      <h2>Evaluation &amp; Pilot Registration</h2>
+      <p>Register your developer or team profile to receive benchmark dataset updates and commercial pilot notifications:</p>
+
+      <div class="form-card">
+        <form id="eval-intake-form" novalidate>
+          <div class="form-group">
+            <label class="form-label" for="email">Work or Developer Email</label>
+            <input class="form-input" type="email" id="email" required placeholder="developer@example.com">
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="role">User Profile</label>
+            <select class="form-select" id="role" required>
+              <option value="">Select profile...</option>
+              <option value="individual">Individual Developer / Researcher</option>
+              <option value="opensource">Open Source Maintainer</option>
+              <option value="enterprise">Enterprise Engineering Team</option>
+              <option value="sysadmin">Systems Administrator / DevOps</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="os">Primary Evaluation Platform</label>
+            <select class="form-select" id="os">
+              <option value="linux">Linux (x86_64 or aarch64)</option>
+              <option value="macos">macOS (Apple Silicon or Intel)</option>
+              <option value="windows">Windows 11 / Server</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <div class="checkbox-group">
+              <label class="checkbox-item" for="commercial-interest">
+                <input type="checkbox" id="commercial-interest">
+                <span>Our team is interested in commercial licensing / enterprise rights.</span>
+              </label>
+              <label class="checkbox-item" for="privacy">
+                <input type="checkbox" id="privacy" required>
+                <span>I acknowledge that Flux is licensed under PolyForm Noncommercial 1.0.0 for noncommercial evaluation.</span>
+              </label>
+            </div>
+          </div>
+
+          <button class="button" id="form-submit-btn" type="submit">Submit Registration</button>
+          <div id="form-status" class="status-msg" role="status"></div>
+        </form>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap footer-grid">
+      <img src="../assets/profile.png" width="72" height="72" alt="Flux emblem">
+      <div>
+        <p>Flux &middot; Licensed under <a href="https://github.com/ckir/flux/blob/main/LICENSE">PolyForm Noncommercial 1.0.0</a>.</p>
+        <nav aria-label="Project links">
+          <a href="../">Home</a> | 
+          <a href="../about/">About</a> | 
+          <a href="../pricing/">Pricing</a> | 
+          <a href="../roadmap/">Roadmap</a> | 
+          <a href="../changelog/">Changelog</a> | 
+          <a href="https://github.com/ckir/flux">Repository</a> | 
+          <a href="https://github.com/ckir/flux/issues">Issues</a>
+        </nav>
+        <p class="fine">FastCopy is a trademark of SHIROUZU Hiroaki. Linux is a registered trademark of Linus Torvalds. macOS is a trademark of Apple Inc. Windows is a trademark of Microsoft Corporation. This is an independent open-source project.</p>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

@@ -1,0 +1,104 @@
+<!doctype html>
+<!--
+ Copyright (c) 2026 Costas Kirgoussios
+
+ This software is licensed under the PolyForm Noncommercial License 1.0.0.
+ You may obtain a copy of the License at:
+ https://polyformproject.org/licenses/noncommercial/1.0.0/
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>About Flux - Origins, Philosophy &amp; Authors</title>
+  <meta name="description" content="Learn about Flux's origins, engineering principles, inspiration from FastCopy, and open-source licensing.">
+  <link rel="canonical" href="https://ckir.github.io/flux/about/">
+  <meta property="og:title" content="About Flux - Origins, Philosophy &amp; Authors">
+  <meta property="og:description" content="The engineering principles, origins, and author philosophy behind Flux.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://ckir.github.io/flux/about/">
+  <meta property="og:image" content="https://ckir.github.io/flux/assets/og.jpg">
+  <link rel="icon" type="image/svg+xml" href="../assets/flux.svg">
+  <link rel="stylesheet" href="../style.css">
+  <script src="../analytics.js" defer></script>
+  <script src="../script.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <nav class="site-nav" aria-label="Main Navigation">
+    <div class="nav-wrap">
+      <a class="nav-brand" href="../">
+        <img src="../assets/flux.svg" width="28" height="28" alt="Flux">
+        <span>Flux</span>
+      </a>
+      <ul class="nav-links">
+        <li><a href="../how-it-works/">How It Works</a></li>
+        <li><a href="../products/core/">Crates</a></li>
+        <li><a href="../benchmarks/">Benchmarks</a></li>
+        <li><a href="../docs/">Docs</a></li>
+        <li><a href="../roadmap/">Roadmap</a></li>
+        <li><a href="../community/">Community</a></li>
+        <li><a href="../download/">Download</a></li>
+      </ul>
+      <a class="cta nav-cta" href="../download/" data-analytics-event="download_cta_clicked" data-analytics-props='{"location":"nav"}'>Download Flux</a>
+    </div>
+  </nav>
+
+  <main id="main" class="wrap">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="../">Home</a><span>/</span><span>About</span>
+    </nav>
+
+    <header>
+      <h1>About Flux</h1>
+      <p class="subline">Reimagining filesystem replication with mathematical rigor and bounded resident memory.</p>
+    </header>
+
+    <section>
+      <h2>Origins &amp; Inspiration</h2>
+      <p>Flux was created by Costas Kirgoussios to address a recurring failure point in systems administration: existing command-line copiers treat memory as an infinite resource and treat file verification as an afterthought.</p>
+      <p>While inspired by the speed and buffer management of FastCopy on Windows, Flux was built on an entirely new architecture written in Rust. Flux guarantees bounded resident memory regardless of dataset scale, enforces deterministic traversal ordering, protects destination directories with atomic locks, and cryptographically proves data integrity with BLAKE3 advisory checkpoints.</p>
+    </section>
+
+    <section>
+      <h2>Core Engineering Tenets</h2>
+      <ul>
+        <li><strong>Correctness Before Performance:</strong> High throughput is meaningless if bits are flipped, inodes are corrupted, or half-copied files masquerade as complete transfers.</li>
+        <li><strong>Deterministic Traversal:</strong> Traversal order is strictly defined and repeatable, eliminating intermittent ordering bugs and ensuring identical results across runs.</li>
+        <li><strong>Bounded Resource Footprint:</strong> Heap memory and open file descriptors are strictly bounded by design. Backpressure ensures discovery never outpaces consumer capacity.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Licensing &amp; Legal Notices</h2>
+      <p>Flux is licensed under the <a href="https://github.com/ckir/flux/blob/main/LICENSE">PolyForm Noncommercial License 1.0.0</a>. Free evaluation, modification, and deployment are permitted for noncommercial, research, and open-source use. Commercial licensing options are available for enterprise deployments.</p>
+    </section>
+
+    <section>
+      <h2>Trademarks</h2>
+      <p class="fine">"FastCopy" is a trademark of SHIROUZU Hiroaki. "Linux" is a registered trademark of Linus Torvalds. "macOS" and "APFS" are trademarks of Apple Inc. "Windows" is a trademark of Microsoft Corporation. Flux is an independent project and is not affiliated with, endorsed by, or sponsored by Linus Torvalds, Apple, Microsoft, or the FastCopy project.</p>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap footer-grid">
+      <img src="../assets/profile.png" width="72" height="72" alt="Flux emblem">
+      <div>
+        <p>Flux &middot; Licensed under <a href="https://github.com/ckir/flux/blob/main/LICENSE">PolyForm Noncommercial 1.0.0</a>.</p>
+        <nav aria-label="Project links">
+          <a href="../">Home</a> | 
+          <a href="./" aria-current="page">About</a> | 
+          <a href="../pricing/">Pricing</a> | 
+          <a href="../roadmap/">Roadmap</a> | 
+          <a href="../changelog/">Changelog</a> | 
+          <a href="https://github.com/ckir/flux">Repository</a> | 
+          <a href="https://github.com/ckir/flux/issues">Issues</a>
+        </nav>
+        <p class="fine">FastCopy is a trademark of SHIROUZU Hiroaki. Linux is a registered trademark of Linus Torvalds. macOS is a trademark of Apple Inc. Windows is a trademark of Microsoft Corporation. This is an independent open-source project.</p>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

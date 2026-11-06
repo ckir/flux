@@ -1,0 +1,113 @@
+<!doctype html>
+<!--
+ Copyright (c) 2026 Costas Kirgoussios
+
+ This software is licensed under the PolyForm Noncommercial License 1.0.0.
+ You may obtain a copy of the License at:
+ https://polyformproject.org/licenses/noncommercial/1.0.0/
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Changelog - Flux Release History &amp; Cut Log</title>
+  <meta name="description" content="Release notes, development cut progression, and architectural milestones for Flux.">
+  <link rel="canonical" href="https://ckir.github.io/flux/changelog/">
+  <meta property="og:title" content="Changelog - Flux Release History &amp; Cut Log">
+  <meta property="og:description" content="Detailed cut ledger and release history for Flux.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://ckir.github.io/flux/changelog/">
+  <meta property="og:image" content="https://ckir.github.io/flux/assets/og.jpg">
+  <link rel="icon" type="image/svg+xml" href="../assets/flux.svg">
+  <link rel="stylesheet" href="../style.css">
+  <script src="../analytics.js" defer></script>
+  <script src="../script.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <nav class="site-nav" aria-label="Main Navigation">
+    <div class="nav-wrap">
+      <a class="nav-brand" href="../">
+        <img src="../assets/flux.svg" width="28" height="28" alt="Flux">
+        <span>Flux</span>
+      </a>
+      <ul class="nav-links">
+        <li><a href="../how-it-works/">How It Works</a></li>
+        <li><a href="../products/core/">Crates</a></li>
+        <li><a href="../benchmarks/">Benchmarks</a></li>
+        <li><a href="../docs/">Docs</a></li>
+        <li><a href="../roadmap/">Roadmap</a></li>
+        <li><a href="../community/">Community</a></li>
+        <li><a href="../download/">Download</a></li>
+      </ul>
+      <a class="cta nav-cta" href="../download/" data-analytics-event="download_cta_clicked" data-analytics-props='{"location":"nav"}'>Download Flux</a>
+    </div>
+  </nav>
+
+  <main id="main" class="wrap">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="../">Home</a><span>/</span><span>Changelog</span>
+    </nav>
+
+    <header>
+      <h1>Flux Release History</h1>
+      <p class="subline">Comprehensive audit trail of architectural cuts, features, and performance fixes.</p>
+    </header>
+
+    <section>
+      <h2>Recent Cuts &amp; Milestones</h2>
+      <div class="cards">
+        <div class="card">
+          <span class="tag">Cut 23</span>
+          <h3>Bounded Destination Index &amp; Hardlink Audit</h3>
+          <p>Streamlined 300k destination inode lookup performance without heap growth; verified zero-inode Windows family handling.</p>
+        </div>
+
+        <div class="card">
+          <span class="tag">Cut 22</span>
+          <h3>Advisory Checkpoint Validation</h3>
+          <p>Implemented BLAKE3 streaming prefix validation for large file resumes (≥64 MiB); zero recopying of verified chunks.</p>
+        </div>
+
+        <div class="card">
+          <span class="tag">Cut 14</span>
+          <h3>flux verify Command</h3>
+          <p>Implemented standalone filesystem verification with BLAKE3 hash checks, cross-filesystem traversal guards, and structured NDJSON reporting.</p>
+        </div>
+
+        <div class="card">
+          <span class="tag">Cut 12</span>
+          <h3>Destination Locking &amp; Cleanup</h3>
+          <p>Exclusive lock acquisition on target roots, atomic temporary file replacement, and <code>flux cleanup</code> recovery command.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Full Changelog Ledger</h2>
+      <p>For the complete commit history and diff records, browse the <a href="https://github.com/ckir/flux/blob/main/CHANGELOG.md">CHANGELOG.md</a> or inspect the <a href="https://github.com/ckir/flux">repository commit tree</a>.</p>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap footer-grid">
+      <img src="../assets/profile.png" width="72" height="72" alt="Flux emblem">
+      <div>
+        <p>Flux &middot; Licensed under <a href="https://github.com/ckir/flux/blob/main/LICENSE">PolyForm Noncommercial 1.0.0</a>.</p>
+        <nav aria-label="Project links">
+          <a href="../">Home</a> | 
+          <a href="../about/">About</a> | 
+          <a href="../pricing/">Pricing</a> | 
+          <a href="../roadmap/">Roadmap</a> | 
+          <a href="./" aria-current="page">Changelog</a> | 
+          <a href="https://github.com/ckir/flux">Repository</a> | 
+          <a href="https://github.com/ckir/flux/issues">Issues</a>
+        </nav>
+        <p class="fine">FastCopy is a trademark of SHIROUZU Hiroaki. Linux is a registered trademark of Linus Torvalds. macOS is a trademark of Apple Inc. Windows is a trademark of Microsoft Corporation. This is an independent open-source project.</p>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

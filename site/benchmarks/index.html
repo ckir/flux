@@ -1,0 +1,107 @@
+<!doctype html>
+<!--
+ Copyright (c) 2026 Costas Kirgoussios
+
+ This software is licensed under the PolyForm Noncommercial License 1.0.0.
+ You may obtain a copy of the License at:
+ https://polyformproject.org/licenses/noncommercial/1.0.0/
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Benchmarks &amp; Performance - Flux Compared to cp, rsync, and robocopy</title>
+  <meta name="description" content="Official performance benchmarks comparing Flux with cp, rsync, and robocopy across Linux, macOS, and Windows.">
+  <link rel="canonical" href="https://ckir.github.io/flux/benchmarks/">
+  <meta property="og:title" content="Benchmarks &amp; Performance - Flux Compared to cp, rsync, and robocopy">
+  <meta property="og:description" content="Rigorous benchmark methodologies and comparative charts across Linux, macOS, and Windows.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://ckir.github.io/flux/benchmarks/">
+  <meta property="og:image" content="https://ckir.github.io/flux/assets/og.jpg">
+  <link rel="icon" type="image/svg+xml" href="../assets/flux.svg">
+  <link rel="stylesheet" href="../style.css">
+  <script src="../analytics.js" defer></script>
+  <script src="../script.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <nav class="site-nav" aria-label="Main Navigation">
+    <div class="nav-wrap">
+      <a class="nav-brand" href="../">
+        <img src="../assets/flux.svg" width="28" height="28" alt="Flux">
+        <span>Flux</span>
+      </a>
+      <ul class="nav-links">
+        <li><a href="../how-it-works/">How It Works</a></li>
+        <li><a href="../products/core/">Crates</a></li>
+        <li><a href="./" aria-current="page">Benchmarks</a></li>
+        <li><a href="../docs/">Docs</a></li>
+        <li><a href="../roadmap/">Roadmap</a></li>
+        <li><a href="../community/">Community</a></li>
+        <li><a href="../download/">Download</a></li>
+      </ul>
+      <a class="cta nav-cta" href="../download/" data-analytics-event="download_cta_clicked" data-analytics-props='{"location":"nav"}'>Download Flux</a>
+    </div>
+  </nav>
+
+  <main id="main" class="wrap">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="../">Home</a><span>/</span><span>Benchmarks</span>
+    </nav>
+
+    <header>
+      <h1>Performance &amp; Benchmarks</h1>
+      <p class="subline">Empirical evaluation comparing Flux against standard operating system transfer utilities.</p>
+    </header>
+
+    <section>
+      <h2>Comparative Benchmark Chart</h2>
+      <figure class="card chart-card">
+        <div class="chart-scroll" tabindex="0" role="region" aria-label="Latest benchmark chart">
+          <object data="../bench/latest.svg" type="image/svg+xml" width="720" height="560" aria-label="Latest benchmark chart">The chart is published by CI from the latest run of <code>main</code>. Until the first benchmark has run there is nothing here yet.</object>
+        </div>
+        <figcaption>
+          Each figure is Flux's median time divided by another copier's, measured in the same GitHub Actions job: below 1.0, Flux is faster.
+          A pair appears only once its ratio is steady. Linux and macOS are compared with <code>cp</code> and <code>rsync</code>; Windows is compared with <code>robocopy</code>.
+        </figcaption>
+      </figure>
+    </section>
+
+    <section>
+      <h2>Measurement Methodology</h2>
+      <p>Benchmarking file copiers reliably requires strict cache hygiene and steady-ratio calibration:</p>
+      <ul>
+        <li><strong>Cold vs. Warm Cache:</strong> Linux and macOS benchmarks run with an explicit cold cache to measure physical I/O throughput and scanning performance without OS page cache distortion. Windows benchmarks run with a warm cache to reflect standard workstation operating conditions.</li>
+        <li><strong>Steady Calibration:</strong> A comparison pair appears on the published chart only after calibration runs demonstrate that variance across multiple executions has stabilized.</li>
+        <li><strong>Identical Job Isolation:</strong> Every measurement runs in the exact same runner job, comparing Flux directly against the host platform's native tools (<code>cp</code>, <code>rsync</code>, and <code>robocopy</code>) under identical disk and CPU allocations.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Trend Tracking Over Time</h2>
+      <p>Continuous integration captures benchmark histories across commits to guard against performance regressions. To explore historical data, inspect the automated CI benchmark output at <a href="../bench/">bench/</a>.</p>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap footer-grid">
+      <img src="../assets/profile.png" width="72" height="72" alt="Flux emblem">
+      <div>
+        <p>Flux &middot; Licensed under <a href="https://github.com/ckir/flux/blob/main/LICENSE">PolyForm Noncommercial 1.0.0</a>.</p>
+        <nav aria-label="Project links">
+          <a href="../">Home</a> | 
+          <a href="../about/">About</a> | 
+          <a href="../pricing/">Pricing</a> | 
+          <a href="../roadmap/">Roadmap</a> | 
+          <a href="../changelog/">Changelog</a> | 
+          <a href="https://github.com/ckir/flux">Repository</a> | 
+          <a href="https://github.com/ckir/flux/issues">Issues</a>
+        </nav>
+        <p class="fine">FastCopy is a trademark of SHIROUZU Hiroaki. Linux is a registered trademark of Linus Torvalds. macOS is a trademark of Apple Inc. Windows is a trademark of Microsoft Corporation. This is an independent open-source project.</p>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

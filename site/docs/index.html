@@ -1,0 +1,121 @@
+<!doctype html>
+<!--
+ Copyright (c) 2026 Costas Kirgoussios
+
+ This software is licensed under the PolyForm Noncommercial License 1.0.0.
+ You may obtain a copy of the License at:
+ https://polyformproject.org/licenses/noncommercial/1.0.0/
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Documentation - Flux Command Reference &amp; Specifications</title>
+  <meta name="description" content="Official documentation, command syntax, CLI flags, JSON output specifications, and recovery runbooks for Flux.">
+  <link rel="canonical" href="https://ckir.github.io/flux/docs/">
+  <meta property="og:title" content="Documentation - Flux Command Reference &amp; Specifications">
+  <meta property="og:description" content="Technical documentation, CLI manual, and operator runbooks for Flux.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://ckir.github.io/flux/docs/">
+  <meta property="og:image" content="https://ckir.github.io/flux/assets/og.jpg">
+  <link rel="icon" type="image/svg+xml" href="../assets/flux.svg">
+  <link rel="stylesheet" href="../style.css">
+  <script src="../analytics.js" defer></script>
+  <script src="../script.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <nav class="site-nav" aria-label="Main Navigation">
+    <div class="nav-wrap">
+      <a class="nav-brand" href="../">
+        <img src="../assets/flux.svg" width="28" height="28" alt="Flux">
+        <span>Flux</span>
+      </a>
+      <ul class="nav-links">
+        <li><a href="../how-it-works/">How It Works</a></li>
+        <li><a href="../products/core/">Crates</a></li>
+        <li><a href="../benchmarks/">Benchmarks</a></li>
+        <li><a href="./" aria-current="page">Docs</a></li>
+        <li><a href="../roadmap/">Roadmap</a></li>
+        <li><a href="../community/">Community</a></li>
+        <li><a href="../download/">Download</a></li>
+      </ul>
+      <a class="cta nav-cta" href="../download/" data-analytics-event="download_cta_clicked" data-analytics-props='{"location":"nav"}'>Download Flux</a>
+    </div>
+  </nav>
+
+  <main id="main" class="wrap">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="../">Home</a><span>/</span><span>Docs</span>
+    </nav>
+
+    <header>
+      <h1>Flux Documentation Portal</h1>
+      <p class="subline">Comprehensive command references, runtime options, and architectural specifications.</p>
+    </header>
+
+    <section>
+      <h2>CLI Command Reference</h2>
+      <p>Flux provides three primary operational commands:</p>
+      <div class="cards">
+        <div class="card">
+          <h3>flux copy</h3>
+          <p>Transfers files and directories with destination locking, hardlink preservation, and atomic publication.</p>
+          <pre class="code" tabindex="0" aria-label="Flux copy command syntax"><code>flux copy SOURCE DEST [--resume] [--restart] [--links=copy|skip] [--durability=normal|sync] [--json]</code></pre>
+        </div>
+
+        <div class="card">
+          <h3>flux verify</h3>
+          <p>Audits destination files against source trees using BLAKE3 streaming hashes without performing transfers.</p>
+          <pre class="code" tabindex="0" aria-label="Flux verify command syntax"><code>flux verify SOURCE DEST [--links=copy|skip] [--cross-filesystems] [--hash=blake3] [--json] [--verbose]</code></pre>
+        </div>
+
+        <div class="card">
+          <h3>flux cleanup</h3>
+          <p>Safely cleans destination lock files and removes half-copied temporary artifacts left by interrupted processes.</p>
+          <pre class="code" tabindex="0" aria-label="Flux cleanup command syntax"><code>flux cleanup DEST [--force] [--json]</code></pre>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Machine-Readable Output (--json)</h2>
+      <p>All Flux commands accept <code>--json</code>, outputting structured NDJSON (Newline Delimited JSON) streams suitable for automation, monitoring, and GUI wrappers:</p>
+      <pre class="code" tabindex="0" aria-label="NDJSON event example"><code>{"type":"progress","bytes_transferred":104857600,"files_transferred":1420,"current_file":"data/archive.tar"}
+{"type":"checkpoint","file":"data/archive.tar","chunk":1,"digest":"f2d5a8..."}
+{"type":"summary","status":"completed","duration_ms":4210,"total_bytes":2400000000,"errors":0}</code></pre>
+    </section>
+
+    <section>
+      <h2>Authoritative Specifications</h2>
+      <p>Explore the complete mathematical models and formal specifications:</p>
+      <ul>
+        <li><a href="https://github.com/ckir/flux/blob/main/FLUX_FULL_UPDATED_SPEC_V16.md">FLUX_FULL_UPDATED_SPEC_V16.md</a> &mdash; Full architectural specification.</li>
+        <li><a href="https://github.com/ckir/flux/blob/main/ROADMAP.md">ROADMAP.md</a> &mdash; Development phases and ledger.</li>
+        <li><a href="https://github.com/ckir/flux/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a> &mdash; Contributor setup and test harness.</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap footer-grid">
+      <img src="../assets/profile.png" width="72" height="72" alt="Flux emblem">
+      <div>
+        <p>Flux &middot; Licensed under <a href="https://github.com/ckir/flux/blob/main/LICENSE">PolyForm Noncommercial 1.0.0</a>.</p>
+        <nav aria-label="Project links">
+          <a href="../">Home</a> | 
+          <a href="../about/">About</a> | 
+          <a href="../pricing/">Pricing</a> | 
+          <a href="../roadmap/">Roadmap</a> | 
+          <a href="../changelog/">Changelog</a> | 
+          <a href="https://github.com/ckir/flux">Repository</a> | 
+          <a href="https://github.com/ckir/flux/issues">Issues</a>
+        </nav>
+        <p class="fine">FastCopy is a trademark of SHIROUZU Hiroaki. Linux is a registered trademark of Linus Torvalds. macOS is a trademark of Apple Inc. Windows is a trademark of Microsoft Corporation. This is an independent open-source project.</p>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

@@ -1,0 +1,109 @@
+<!doctype html>
+<!--
+ Copyright (c) 2026 Costas Kirgoussios
+
+ This software is licensed under the PolyForm Noncommercial License 1.0.0.
+ You may obtain a copy of the License at:
+ https://polyformproject.org/licenses/noncommercial/1.0.0/
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Community - Flux Developer Guidelines &amp; Contributing</title>
+  <meta name="description" content="Join the Flux community, contribute code, report issues, and participate in technical design discussions.">
+  <link rel="canonical" href="https://ckir.github.io/flux/community/">
+  <meta property="og:title" content="Community - Flux Developer Guidelines &amp; Contributing">
+  <meta property="og:description" content="Contributing guidelines, code of conduct, and development resources for Flux.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://ckir.github.io/flux/community/">
+  <meta property="og:image" content="https://ckir.github.io/flux/assets/og.jpg">
+  <link rel="icon" type="image/svg+xml" href="../assets/flux.svg">
+  <link rel="stylesheet" href="../style.css">
+  <script src="../analytics.js" defer></script>
+  <script src="../script.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <nav class="site-nav" aria-label="Main Navigation">
+    <div class="nav-wrap">
+      <a class="nav-brand" href="../">
+        <img src="../assets/flux.svg" width="28" height="28" alt="Flux">
+        <span>Flux</span>
+      </a>
+      <ul class="nav-links">
+        <li><a href="../how-it-works/">How It Works</a></li>
+        <li><a href="../products/core/">Crates</a></li>
+        <li><a href="../benchmarks/">Benchmarks</a></li>
+        <li><a href="../docs/">Docs</a></li>
+        <li><a href="../roadmap/">Roadmap</a></li>
+        <li><a href="./" aria-current="page">Community</a></li>
+        <li><a href="../download/">Download</a></li>
+      </ul>
+      <a class="cta nav-cta" href="../download/" data-analytics-event="download_cta_clicked" data-analytics-props='{"location":"nav"}'>Download Flux</a>
+    </div>
+  </nav>
+
+  <main id="main" class="wrap">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="../">Home</a><span>/</span><span>Community</span>
+    </nav>
+
+    <header>
+      <h1>Flux Community &amp; Contributing</h1>
+      <p class="subline">An open engineering culture prioritizing correctness, deterministic testing, and high-performance Rust.</p>
+    </header>
+
+    <section>
+      <h2>Contributing to Flux</h2>
+      <p>Flux welcomes contributions from systems engineers, performance enthusiasts, and filesystem specialists. All contributions must adhere to our core principle: <strong>correctness before performance</strong>.</p>
+      <ul>
+        <li><a href="https://github.com/ckir/flux/blob/main/CONTRIBUTING.md">Contributing Guide</a> &mdash; Prerequisites, Justfile recipes, and testing conventions.</li>
+        <li><a href="https://github.com/ckir/flux/blob/main/CODE_OF_CONDUCT.md">Code of Conduct</a> &mdash; Community behavioral standards.</li>
+        <li><a href="https://github.com/ckir/flux/blob/main/SECURITY.md">Security Policy</a> &mdash; Responsible vulnerability disclosure protocol.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Developer Workflow &amp; Testing</h2>
+      <p>Flux uses <code>just</code> as a command runner for reproducible builds and automated quality gates:</p>
+      <ul class="commands">
+        <li><code data-cmd>just test</code> <small># Run the entire workspace test suite</small> <button type="button" data-copy="just test" aria-label="Copy command: run tests">Copy</button></li>
+        <li><code data-cmd>just check-all</code> <small># Run linters, cargo deny, and doc checks</small> <button type="button" data-copy="just check-all" aria-label="Copy command: run check-all">Copy</button></li>
+        <li><code data-cmd>just pages-preview</code> <small># Build docs and preview site locally</small> <button type="button" data-copy="just pages-preview" aria-label="Copy command: preview site">Copy</button></li>
+      </ul>
+      <p id="copy-status" class="sr-only" role="status"></p>
+    </section>
+
+    <section>
+      <h2>Discussions &amp; Issue Tracking</h2>
+      <p>To report defects, propose kernel fastpaths, or suggest platform optimizations, use our GitHub issue tracker:</p>
+      <ul>
+        <li><a href="https://github.com/ckir/flux/issues">GitHub Issues</a> &mdash; Defect reports and reproducer datasets.</li>
+        <li><a href="https://github.com/ckir/flux">GitHub Repository</a> &mdash; Source code and commit tree.</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap footer-grid">
+      <img src="../assets/profile.png" width="72" height="72" alt="Flux emblem">
+      <div>
+        <p>Flux &middot; Licensed under <a href="https://github.com/ckir/flux/blob/main/LICENSE">PolyForm Noncommercial 1.0.0</a>.</p>
+        <nav aria-label="Project links">
+          <a href="../">Home</a> | 
+          <a href="../about/">About</a> | 
+          <a href="../pricing/">Pricing</a> | 
+          <a href="../roadmap/">Roadmap</a> | 
+          <a href="../changelog/">Changelog</a> | 
+          <a href="https://github.com/ckir/flux">Repository</a> | 
+          <a href="https://github.com/ckir/flux/issues">Issues</a>
+        </nav>
+        <p class="fine">FastCopy is a trademark of SHIROUZU Hiroaki. Linux is a registered trademark of Linus Torvalds. macOS is a trademark of Apple Inc. Windows is a trademark of Microsoft Corporation. This is an independent open-source project.</p>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

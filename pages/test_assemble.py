@@ -189,13 +189,17 @@ class AssembleTests(unittest.TestCase):
                 finally:
                     target.unlink()
 
-    def test_site_must_be_flat_and_have_index(self):
+    def test_site_supports_directories_and_requires_index(self):
         before = list_files(self.doc)
-        (self.site / "sub").mkdir()
-        with self.assertRaises(AssembleError):
-            self.run_assemble()
-        self.assert_failed_before_move(before)
-        (self.site / "sub").rmdir()
+        put(self.site / "sub" / "page.html", "subpage")
+        self.run_assemble()
+        self.assertEqual(verify(self.doc, self.site, self.work), [])
+        self.assertEqual((self.doc / "sub" / "page.html").read_text(encoding="utf-8"), "subpage")
+        shutil.rmtree(self.site / "sub")
+        shutil.rmtree(self.doc)
+        if self.work.exists():
+            shutil.rmtree(self.work)
+        self.doc = make_doc(self.root)
         (self.site / "index.html").unlink()
         with self.assertRaises(AssembleError):
             self.run_assemble()

@@ -24,7 +24,11 @@ RELEASE_ASSETS = (
     "flux-aarch64-apple-darwin.tar.gz",
     "flux-x86_64-pc-windows-msvc.zip",
 )
-EXPECTED_FILES = {"index.html", "style.css", "flux-field.js"}
+EXPECTED_ROOT_FILES = {"index.html", "style.css", "flux-field.js", "script.js", "analytics.js"}
+EXPECTED_SUBDIRS = {
+    "assets", "how-it-works", "products", "benchmarks", "docs",
+    "roadmap", "community", "download", "about", "pricing", "changelog",
+}
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".svg", ".webp", ".gif", ".ico"}
 
 
@@ -38,6 +42,11 @@ ALLOWED_ABSOLUTE = {f"{RELEASE_BASE}/download/{asset}" for asset in RELEASE_ASSE
     "https://github.com/ckir/flux/blob/main/FLUX_FULL_UPDATED_SPEC_V16.md",
     "https://github.com/ckir/flux/blob/main/LICENSE",
     "https://github.com/ckir/flux",
+    "https://github.com/ckir/flux/issues",
+    "https://github.com/ckir/flux/blob/main/CONTRIBUTING.md",
+    "https://github.com/ckir/flux/blob/main/CODE_OF_CONDUCT.md",
+    "https://github.com/ckir/flux/blob/main/SECURITY.md",
+    "https://github.com/ckir/flux/blob/main/CHANGELOG.md",
 }
 API_HREFS = tuple(
     f"api/{crate}/index.html"
@@ -124,6 +133,8 @@ ALLOWED_SPEED_SENTENCES = {
     "Each figure is Flux's median time divided by another copier's, measured in the same GitHub "
     "Actions job: below 1.0, Flux is faster",
     "High throughput, but correctness before performance",
+    "High throughput, bounded resident memory, and crash-resilient resumability in Rust",
+    "High-throughput BLAKE3 streaming verification and chunk-level advisory checkpoint digests",
 }
 
 
@@ -172,16 +183,30 @@ def is_external(value: str) -> bool:
 
 
 class SiteTests(unittest.TestCase):
-    def test_site_dir_is_flat_and_has_only_expected_files(self) -> None:
+    def test_site_dir_has_expected_structure(self) -> None:
         entries = list(SITE.iterdir())
         self.assertTrue(entries, "site/ is missing or empty")
+        root_files = {e.name for e in entries if e.is_file()}
+        root_dirs = {e.name for e in entries if e.is_dir()}
+        self.assertTrue(EXPECTED_ROOT_FILES <= root_files, f"missing root files: {EXPECTED_ROOT_FILES - root_files}")
+        self.assertTrue(EXPECTED_SUBDIRS <= root_dirs, f"missing subdirs: {EXPECTED_SUBDIRS - root_dirs}")
         for entry in entries:
-            self.assertTrue(entry.is_file(), f"{entry.name} is not a plain file")
-            self.assertTrue(
-                entry.name in EXPECTED_FILES or entry.suffix.lower() in IMAGE_SUFFIXES,
-                f"unexpected entry {entry.name}",
-            )
-        self.assertTrue(EXPECTED_FILES <= {e.name for e in entries})
+            if entry.is_file():
+                self.assertTrue(
+                    entry.name in EXPECTED_ROOT_FILES or entry.suffix.lower() in IMAGE_SUFFIXES,
+                    f"unexpected root file {entry.name}",
+                )
+        # every sub-page directory (except assets) must contain index.html
+        for d in root_dirs:
+            if d == "assets":
+                assets = list((SITE / d).iterdir())
+                self.assertTrue(assets, "assets/ is empty")
+                for f in assets:
+                    self.assertTrue(f.suffix.lower() in IMAGE_SUFFIXES, f"unexpected asset {f.name}")
+            else:
+                # index.html may be directly in the subdir or in a nested subdir (e.g. products/core/)
+                html_files = list((SITE / d).rglob("index.html"))
+                self.assertTrue(html_files, f"{d}/ has no index.html")
 
     def test_no_external_resources(self) -> None:
         parsed = page()
@@ -190,6 +215,10 @@ class SiteTests(unittest.TestCase):
             for name in URL_ATTRS:
                 if tag == "a" and name == "href":
                     continue  # anchors are checked against the allow-list in the links test
+                if tag == "link" and name == "href" and attrs.get("rel", "") in ("canonical", "icon"):
+                    continue  # canonical URLs and favicons are not resource loads
+                if tag == "meta":
+                    continue  # OG/Twitter meta tags reference URLs but do not load resources
                 self.assertFalse(is_external(attrs.get(name, "")), f"<{tag} {name}> is external")
             self.assertIsNone(
                 re.search(r"url\(\s*[\"']?\s*(?:[a-z][a-z0-9+.-]*:|//)", attrs.get("style", ""), re.I),
