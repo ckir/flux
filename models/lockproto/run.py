@@ -23,6 +23,7 @@ if sys.version_info < (3, 11):
 
 import argparse  # noqa: E402
 import hashlib  # noqa: E402
+import http.client  # noqa: E402
 import json  # noqa: E402
 import re  # noqa: E402
 import shutil  # noqa: E402
@@ -1442,7 +1443,10 @@ def download(url: str, dest: Path) -> None:
         with urllib.request.urlopen(url, timeout=120) as response, tmp.open("wb") as out:
             shutil.copyfileobj(response, out)
         tmp.replace(dest)
-    except OSError as err:
+    except (OSError, http.client.HTTPException) as err:
+        # HTTPException covers a body cut short mid-stream (IncompleteRead), which is not an OSError;
+        # either way the caller's retry loop must see a ToolingError, never a traceback.
+        tmp.unlink(missing_ok=True)
         raise ToolingError(f"cannot download {url} to {dest}: {err}") from err
 
 

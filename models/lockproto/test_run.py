@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import contextlib
+import http.client
 import dataclasses
 import io
 import json
@@ -875,6 +876,37 @@ class ExitCodeTests(unittest.TestCase):
         self.assertEqual(run.exit_code([]), 0)
 
 
+class DownloadTests(unittest.TestCase):
+    """download() with urlopen replaced, so no network is touched."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dest = Path(self._tmp.name) / "tla2tools.jar"
+
+    def response_raising(self, err: Exception):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.side_effect = err
+        return response
+
+    def test_mid_stream_protocol_error_is_a_tooling_error(self) -> None:
+        # http.client.IncompleteRead is an HTTPException, not an OSError: a connection dropped mid-body
+        # must still surface as the ToolingError that ensure_jar() retries, never as a traceback.
+        err = http.client.IncompleteRead(b"partial")
+        with mock.patch.object(run.urllib.request, "urlopen", return_value=self.response_raising(err)):
+            with self.assertRaises(run.ToolingError) as ctx:
+                run.download("https://example.invalid/tla2tools.jar", self.dest)
+        self.assertIn("cannot download", str(ctx.exception))
+        self.assertFalse(self.dest.with_suffix(".part").exists())
+
+    def test_socket_error_is_a_tooling_error(self) -> None:
+        with mock.patch.object(run.urllib.request, "urlopen", side_effect=OSError("connection reset")):
+            with self.assertRaises(run.ToolingError) as ctx:
+                run.download("https://example.invalid/tla2tools.jar", self.dest)
+        self.assertIn("connection reset", str(ctx.exception))
+
+
 class EnsureJarTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -940,7 +972,7 @@ class EnsureJarTests(unittest.TestCase):
     def test_retry_is_announced_on_stderr_with_its_cause(self) -> None:
         self.ensure(self.failing_then(self.good))
         text = self.stderr.getvalue()
-        self.assertIn("connection reset", text)
+        self.assertIn(f"download attempt 1 of {self.attempts} failed (connection reset)", text)
         self.assertIn(f"retrying in {run.RETRY_DELAYS[0]:g} s", text)
 
     def test_success_without_retry_is_silent(self) -> None:
