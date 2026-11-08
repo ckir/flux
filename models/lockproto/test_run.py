@@ -890,6 +890,15 @@ class DownloadTests(unittest.TestCase):
         response.read.side_effect = err
         return response
 
+    def test_successful_download_lands_atomically(self) -> None:
+        payload = b"jar bytes"
+        response = mock.MagicMock()
+        response.__enter__.return_value = io.BytesIO(payload)
+        with mock.patch.object(run.urllib.request, "urlopen", return_value=response):
+            run.download("https://example.invalid/tla2tools.jar", self.dest)
+        self.assertEqual(self.dest.read_bytes(), payload)
+        self.assertFalse(self.dest.with_suffix(".part").exists())
+
     def test_mid_stream_protocol_error_is_a_tooling_error(self) -> None:
         # http.client.IncompleteRead is an HTTPException, not an OSError: a connection dropped mid-body
         # must still surface as the ToolingError that ensure_jar() retries, never as a traceback.
@@ -915,6 +924,7 @@ class EnsureJarTests(unittest.TestCase):
         self.good = b"good jar"
         self.good_sha = run.hashlib.sha256(self.good).hexdigest()
         self.calls = 0
+        self.urls: list[str] = []
         self.sleeps: list[float] = []
         self.stderr = io.StringIO()
         self.attempts = len(run.RETRY_DELAYS) + 1
@@ -926,8 +936,16 @@ class EnsureJarTests(unittest.TestCase):
 
     def fetch_returning(self, *payloads: bytes):
         def fetch(url: str, dest: Path) -> None:
+            self.urls.append(url)
             dest.write_bytes(payloads[min(self.calls, len(payloads) - 1)])
             self.calls += 1
+        return fetch
+
+    def fetch_writing_nothing_then(self, payload: bytes):
+        def fetch(url: str, dest: Path) -> None:
+            self.calls += 1
+            if self.calls > 1:
+                dest.write_bytes(payload)
         return fetch
 
     def failing_then(self, payload: bytes | None):
@@ -946,7 +964,8 @@ class EnsureJarTests(unittest.TestCase):
 
     def test_cached_good_jar_is_not_downloaded(self) -> None:
         (self.target / "tla2tools.jar").write_bytes(self.good)
-        self.ensure(self.fetch_returning(b"unused"))
+        jar = self.ensure(self.fetch_returning(b"unused"))
+        self.assertEqual(jar, self.target / "tla2tools.jar")
         self.assertEqual(self.calls, 0)
         self.assertEqual(self.sleeps, [])
 
@@ -956,6 +975,17 @@ class EnsureJarTests(unittest.TestCase):
         self.assertEqual(jar.read_bytes(), self.good)
         self.assertEqual(self.calls, 1)
         self.assertEqual(self.sleeps, [])
+
+    def test_fetch_is_given_the_pinned_url(self) -> None:
+        self.ensure(self.fetch_returning(self.good))
+        self.assertEqual(self.urls, [run.TLA_URL])
+
+    def test_fetch_leaving_no_file_is_a_failed_attempt(self) -> None:
+        jar = self.ensure(self.fetch_writing_nothing_then(self.good))
+        self.assertEqual(jar.read_bytes(), self.good)
+        self.assertEqual(self.calls, 2)
+        self.assertEqual(self.sleeps, [run.RETRY_DELAYS[0]])
+        self.assertIn("got no file", self.stderr.getvalue())
 
     def test_bad_download_is_retried_after_the_first_delay(self) -> None:
         jar = self.ensure(self.fetch_returning(b"bad", self.good))
