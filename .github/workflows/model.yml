@@ -133,7 +133,10 @@ jobs:
     needs: plan
     if: needs.plan.outputs.matrix != '[]'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # The translation itself takes seconds; the budget is for the jar supply. run.py makes five download
+    # attempts with 5+15+45+120 s of waits and a 120 s socket timeout each, so a hanging upstream costs
+    # about 13 minutes before the clean exit-2 message; 10 minutes would kill the job first.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-java@v6
