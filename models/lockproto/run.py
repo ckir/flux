@@ -40,6 +40,11 @@ from typing import Callable  # noqa: E402
 TLA_TAG = "v1.7.4"
 TLA_SHA256 = "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 TLA_URL = f"https://github.com/tlaplus/tlaplus/releases/download/{TLA_TAG}/tla2tools.jar"
+# Seconds to wait before each retry of the jar download, so one attempt more than there are delays.
+# GitHub releases answered 504 to three cold CI jobs in the same minute (run 42471474857) and two
+# back-to-back attempts did not ride it out; this schedule spreads five attempts over about three
+# minutes at no happy-path cost. ensure_jar() still SHA-256 gates every attempt.
+RETRY_DELAYS: tuple[float, ...] = (5, 15, 45, 120)
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
@@ -1442,17 +1447,24 @@ def download(url: str, dest: Path) -> None:
 
 
 def ensure_jar(target: Path = TARGET, fetch: Callable[[str, Path], None] = download,
-               expected_sha: str = TLA_SHA256) -> Path:
-    """Return a tla2tools.jar whose SHA-256 matches the pin, downloading at most twice.
+               expected_sha: str = TLA_SHA256, sleep: Callable[[float], None] = time.sleep) -> Path:
+    """Return a tla2tools.jar whose SHA-256 matches the pin, downloading at most len(RETRY_DELAYS) + 1 times.
 
-    A download that fails, or that yields the wrong hash, uses up one of the two attempts."""
+    A download that fails, or that yields the wrong hash, uses up one attempt; each retry waits the next
+    RETRY_DELAYS entry first and says so on stderr. A good cached jar costs no download and no wait."""
     target.mkdir(parents=True, exist_ok=True)
     jar = target / "tla2tools.jar"
     if jar.is_file() and sha256(jar) == expected_sha:
         return jar
     mismatch = f"tla2tools.jar {TLA_TAG} does not match its pinned SHA-256"
     failure = mismatch
-    for _ in range(2):
+    attempts = len(RETRY_DELAYS) + 1
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            delay = RETRY_DELAYS[attempt - 2]
+            print(f"run.py: download attempt {attempt - 1} of {attempts} failed ({failure}); "
+                  f"retrying in {delay:g} s", file=sys.stderr)
+            sleep(delay)
         jar.unlink(missing_ok=True)
         try:
             fetch(TLA_URL, jar)
@@ -1464,7 +1476,7 @@ def ensure_jar(target: Path = TARGET, fetch: Callable[[str, Path], None] = downl
             return jar
         failure = f"{mismatch} (expected {expected_sha}, got {got})"
     jar.unlink(missing_ok=True)
-    raise ToolingError(f"{failure} (after two download attempts)")
+    raise ToolingError(f"{failure} (after {attempts} download attempts)")
 
 
 # ---------------------------------------------------------------------------------------
