@@ -15,6 +15,7 @@ use flux_fs::{
     ClaimKey, ClaimOutcome, ClaimRecord, ClaimStatus, ClaimStore, Code, Durability, FluxPathKey,
     FsError, ObjectId, PreparedRecord, RecoveryOp, Result,
 };
+use redb::backends::FileBackend;
 use redb::{
     Builder, Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
 };
@@ -107,8 +108,10 @@ impl RedbClaimStore {
                 io::Error::other("zero-length claim store"),
             ));
         }
-        let db =
-            Builder::new().set_cache_size(cache_bytes).create_file(file).map_err(database_err)?;
+        let db = Builder::new()
+            .set_cache_size(cache_bytes)
+            .create_with_backend(FileBackend::new(file).map_err(database_err)?)
+            .map_err(database_err)?;
         let format;
         {
             let tx = db.begin_read().map_err(transaction_err)?;
@@ -139,7 +142,10 @@ impl RedbClaimStore {
     }
 
     fn with_cache_size(file: File, durability: Durability, cache_bytes: usize) -> Result<Self> {
-        let db = Builder::new().set_cache_size(cache_bytes).create_file(file).map_err(io_err)?;
+        let db = Builder::new()
+            .set_cache_size(cache_bytes)
+            .create_with_backend(FileBackend::new(file).map_err(io_err)?)
+            .map_err(io_err)?;
         let mut tx = db.begin_write().map_err(io_err)?;
         tx.set_durability(redb::Durability::Immediate).map_err(io_err)?;
         {

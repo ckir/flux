@@ -103,6 +103,7 @@ fn the_cap_syncs_every_1000_unsynced_commits() {
 
 mod open {
     use super::*;
+    use redb::backends::FileBackend;
     use redb::{Builder, TableDefinition};
 
     fn rec() -> ClaimRecord {
@@ -168,7 +169,7 @@ mod open {
 
     fn build(path: &std::path::Path, format: u64, with_prepared: bool) {
         let file = OpenOptions::new().read(true).write(true).create_new(true).open(path).unwrap();
-        let db = Builder::new().create_file(file).unwrap();
+        let db = Builder::new().create_with_backend(FileBackend::new(file).unwrap()).unwrap();
         let tx = db.begin_write().unwrap();
         {
             tx.open_table(CLAIMS).unwrap();
@@ -240,7 +241,7 @@ mod open {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
         let file = OpenOptions::new().read(true).write(true).create_new(true).open(&path).unwrap();
-        let db = Builder::new().create_file(file).unwrap();
+        let db = Builder::new().create_with_backend(FileBackend::new(file).unwrap()).unwrap();
         let tx = db.begin_write().unwrap();
         {
             tx.open_table(CLAIMS).unwrap();
@@ -255,7 +256,7 @@ mod open {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
         let file = OpenOptions::new().read(true).write(true).create_new(true).open(&path).unwrap();
-        let db = Builder::new().create_file(file).unwrap();
+        let db = Builder::new().create_with_backend(FileBackend::new(file).unwrap()).unwrap();
         let tx = db.begin_write().unwrap();
         {
             let mut meta = tx.open_table(META).unwrap();
