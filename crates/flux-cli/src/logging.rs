@@ -45,6 +45,19 @@ pub fn has_display_sink() -> bool {
     SINK.lock().map(|g| g.is_some()).unwrap_or(false)
 }
 
+/// Test-only: serialises the tests that read or write [`SINK`] (and install the global
+/// subscriber), which would otherwise race under plain `cargo test`. Under `cargo nextest`
+/// (the justfile's and CI's runner) each test is its own process, so the guard never contends.
+#[cfg(test)]
+static SINK_TEST: Mutex<()> = Mutex::new(());
+
+/// The lock a test holds for its whole body while it touches [`SINK`]. A poison left by an
+/// earlier panic is ignored, so one failure does not cascade into every later test.
+#[cfg(test)]
+pub(crate) fn sink_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    SINK_TEST.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// `s` with every control character (ESC, CR, LF, DEL, ...) written as `\u{..}`; printable
 /// Unicode is kept.
 #[must_use]
@@ -288,8 +301,9 @@ pub fn install(v: Verbosity) {
 
 #[cfg(test)]
 mod tests {
-    // The tests that touch the process-global display sink (and `install`) assume `cargo nextest`'s
-    // one-process-per-test isolation and would race under plain `cargo test` (the justfile and CI run nextest).
+    // The tests that touch the process-global display sink (and `install`) hold `sink_test_guard()`
+    // for their whole body: plain `cargo test` runs them in parallel threads, while the justfile
+    // and CI run `cargo nextest`, whose one-process-per-test isolation leaves the guard uncontended.
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -370,6 +384,7 @@ mod tests {
 
     #[test]
     fn line_writer_hands_whole_lines_to_the_sink() {
+        let _guard = sink_test_guard();
         let (got, sink) = collecting_sink();
         set_display_sink(Some(sink));
         let mut w = LineWriter::new().make_writer();
@@ -398,6 +413,7 @@ mod tests {
 
     #[test]
     fn line_writer_to_a_closed_stderr_does_not_panic() {
+        let _guard = sink_test_guard();
         write_line_to(&mut Failing, "a line");
         write_line_to(&mut Failing, "x\u{1b}y");
         // No sink: the fallback path runs with a writer that always fails.
@@ -409,6 +425,7 @@ mod tests {
 
     #[test]
     fn sink_swap_during_finish_loses_no_line() {
+        let _guard = sink_test_guard();
         if let Ok(mut g) = FALLBACK.lock() {
             g.clear();
         }
@@ -464,6 +481,7 @@ mod tests {
 
     #[test]
     fn a_hostile_name_reaches_the_sink_escaped() {
+        let _guard = sink_test_guard();
         let (got, sink) = collecting_sink();
         set_display_sink(Some(sink));
         tracing::subscriber::with_default(build(v(1, false), LineWriter::new()), || {
@@ -530,6 +548,7 @@ mod tests {
 
     #[test]
     fn a_write_with_several_lines_delivers_each_whole_line_once_in_order() {
+        let _guard = sink_test_guard();
         let (got, sink) = collecting_sink();
         set_display_sink(Some(sink));
         let mut w = LineWriter::new().make_writer();
@@ -549,6 +568,7 @@ mod tests {
 
     #[test]
     fn install_twice_does_not_panic() {
+        let _guard = sink_test_guard();
         install(v(0, false));
         install(v(3, false));
     }

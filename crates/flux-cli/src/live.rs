@@ -218,6 +218,7 @@ mod tests {
     #[test]
     fn finish_takes_the_log_route_back_from_the_display() {
         // `has_display_sink` is the route `deliver` takes: a sink registered sends log lines to the bar, none to stderr.
+        let _guard = crate::logging::sink_test_guard();
         let term = InMemoryTerm::new(20, 80);
         let mut progress = None;
         let live = Live::for_copy(false, false, false, target(&term), plain, &mut progress);
@@ -275,6 +276,7 @@ mod tests {
 
     #[test]
     fn for_copy_hands_the_handle_to_the_config_only_when_wanted() {
+        let _guard = crate::logging::sink_test_guard();
         for (dry_run, json, quiet, wanted) in [
             (false, false, false, true),
             (true, false, false, false),
@@ -293,6 +295,9 @@ mod tests {
             if let (Some(a), Some(b)) = (&slot, live.progress()) {
                 assert!(Arc::ptr_eq(a, &b));
             }
+            // Finish, not a bare drop: `finish` is what clears the display sink this Live set,
+            // and a stale sink would outlive the test into every other test in the process.
+            live.finish();
         }
     }
 
@@ -312,6 +317,7 @@ mod tests {
     #[test]
     fn for_copy_fills_and_finish_clears_the_display_sink() {
         use std::io::Write as _;
+        let _guard = crate::logging::sink_test_guard();
         let term = InMemoryTerm::new(20, 80);
         let mut slot = None;
         let live = Live::for_copy(false, false, false, target(&term), plain, &mut slot);
