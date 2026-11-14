@@ -13,6 +13,7 @@ use std::process::{Command, Stdio};
 
 use flux_fs::{ClaimKey, ClaimRecord, ClaimStatus, ClaimStore, Durability, FluxPathKey, ObjectId};
 use flux_platform::{RedbClaimStore, SYNC_CAP};
+use redb::backends::FileBackend;
 use redb::{Builder, ReadableDatabase, ReadableTable, TableDefinition};
 
 const CLAIMS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("claims");
@@ -108,7 +109,9 @@ fn killed_mid_stream_the_store_reopens_with_a_prefix() {
             assert_eq!(c_count, threshold, "{mode}/{threshold}: child ended early");
 
             let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
-            let db = Builder::new().create_file(file).expect("the file must open after a kill");
+            let db = Builder::new()
+                .create_with_backend(FileBackend::new(file).unwrap())
+                .expect("the file must open after a kill");
             let tx = db.begin_read().unwrap();
             let table = tx.open_table(CLAIMS).unwrap();
             let mut present = Vec::new();

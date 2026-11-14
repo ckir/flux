@@ -12,6 +12,7 @@ use std::io;
 
 use crate::claims::{CACHE_BYTES, io_err, storage_err, table_err, transaction_err};
 use flux_fs::{Code, FsError, HardlinkEntry, HardlinkIndex, ObjectId, Result, encode_object};
+use redb::backends::FileBackend;
 use redb::{Builder, Database, ReadableDatabase, ReadableTableMetadata, TableDefinition};
 
 const ANCHORS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("anchors");
@@ -28,7 +29,10 @@ impl RedbHardlinkIndex {
 
     /// As `create_file` with `redb`'s page cache bounded to `cache_bytes`.
     pub fn with_cache_size(file: File, cache_bytes: usize) -> Result<Self> {
-        let db = Builder::new().set_cache_size(cache_bytes).create_file(file).map_err(io_err)?;
+        let db = Builder::new()
+            .set_cache_size(cache_bytes)
+            .create_with_backend(FileBackend::new(file).map_err(io_err)?)
+            .map_err(io_err)?;
         let mut tx = db.begin_write().map_err(io_err)?;
         tx.set_durability(redb::Durability::None).map_err(io_err)?;
         tx.open_table(ANCHORS).map_err(io_err)?;
