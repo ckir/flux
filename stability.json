@@ -57,50 +57,50 @@
    "stable": false
   },
   "macos/mixed/cp": {
-   "calibrated": "2026-11-14T04:07:31Z",
-   "cv": 0.2169,
+   "calibrated": "2026-11-14T06:39:40Z",
+   "cv": 0.1168,
    "image": "20261102.0473.1",
    "source": "calibration",
    "stable": false
   },
   "macos/mixed/rsync": {
-   "calibrated": "2026-11-14T04:07:31Z",
-   "cv": 0.2351,
+   "calibrated": "2026-11-14T06:39:40Z",
+   "cv": 0.2097,
    "image": "20261102.0473.1",
    "source": "calibration",
    "stable": false
   },
   "macos/small/cp": {
-   "calibrated": "2026-11-14T04:07:31Z",
-   "cv": 0.1019,
+   "calibrated": "2026-11-14T06:39:40Z",
+   "cv": 0.0833,
    "image": "20261102.0473.1",
    "source": "calibration",
    "stable": false
   },
   "macos/small/rsync": {
-   "calibrated": "2026-11-14T04:07:31Z",
-   "cv": 0.1119,
+   "calibrated": "2026-11-14T06:39:40Z",
+   "cv": 0.1178,
    "image": "20261102.0473.1",
    "source": "calibration",
    "stable": false
   },
   "windows/large/robocopy": {
-   "calibrated": "2026-11-14T04:07:31Z",
-   "cv": 0.0616,
+   "calibrated": "2026-11-14T06:39:40Z",
+   "cv": 0.048,
    "image": "20261103.298.1",
    "source": "calibration",
    "stable": false
   },
   "windows/mixed/robocopy": {
-   "calibrated": "2026-11-14T04:07:31Z",
-   "cv": 0.0497,
+   "calibrated": "2026-11-14T06:39:40Z",
+   "cv": 0.0594,
    "image": "20261103.298.1",
    "source": "calibration",
    "stable": false
   },
   "windows/small/robocopy": {
-   "calibrated": "2026-11-14T04:07:31Z",
-   "cv": 0.0349,
+   "calibrated": "2026-11-14T06:39:40Z",
+   "cv": 0.1376,
    "image": "20261103.298.1",
    "source": "calibration",
    "stable": false
